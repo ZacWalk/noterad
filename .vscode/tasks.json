@@ -2,11 +2,11 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build Rethinkify",
+            "label": "Build Noterad",
             "type": "process",
             "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
-                "${workspaceFolder}/rethinkify.sln",
+                "${workspaceFolder}/noterad.sln",
                 "/p:Configuration=Debug",
                 "/p:Platform=x64",
                 "/m"
@@ -18,11 +18,11 @@
             "problemMatcher": "$msCompile"
         },
         {
-            "label": "Build Rethinkify (Release)",
+            "label": "Build Noterad (Release)",
             "type": "process",
             "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe",
             "args": [
-                "${workspaceFolder}/rethinkify.sln",
+                "${workspaceFolder}/noterad.sln",
                 "/p:Configuration=Release",
                 "/p:Platform=x64",
                 "/m"

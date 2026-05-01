@@ -2,7 +2,7 @@
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
   <assemblyIdentity
       type="win32"
-      name="rethinkify.exe"
+      name="noterad.exe"
       version="0.0.0.0"
       processorArchitecture="*"
     />
@@ -15,7 +15,7 @@
           <heapType xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">SegmentHeap</heapType>
 	  </asmv3:windowsSettings>
   </asmv3:application>
-  <description>Rethinkify.</description>
+  <description>Noterad.</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity language="*" name="Microsoft.Windows.Common-Controls" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" type="win32" version="6.0.0.0"/>

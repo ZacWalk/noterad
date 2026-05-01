@@ -1,24 +1,23 @@
-Rethinkify is a lightweight AI agent enabled text editor with multi-file search, markdown, csv and other features, written in C++. It is intended to enable research using various text files.
+Noterad is a lightweight AI agent enabled text editor with multi-file search, markdown, csv and other features, written in C++. It is intended to enable research using various text files.
 
-All Windows-specific code should be abstracted into platform_win.cpp / platform_win_web.cpp and accessed via platform-independent abstractions declared in platform.h.
+All Windows-specific code should be abstracted into platform_win.cpp and accessed via platform-independent abstractions declared in platform.h.
 
 When updating high level behaviour of the app, specification.md should be updated.
 
 Place temporary files in a tmp/ folder (test output etc.)
 
-Always build using rethinkify.sln
+Always build using noterad.sln
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `specification.md` | Detailed specification of all features and behaviors |
-| `agent.h` / `agent.cpp` | Agent integration: environment parsing, prompt execution, tool dispatch, model responses |
 | `app.h` | Application types: event interfaces, search results, index items, app_events |
 | `app.cpp` | Application logic: main window, menus, splitter, file I/O commands |
 | `app_commands.cpp` | Command definitions: console and menu commands wired to app_state |
 | `app_state.h` | Application state: document collection, file operations, testable app logic |
-| `command_calc.h` | Calculator expression parser used by console math commands |
+| `calc.h` | Calculator expression parser used by console math commands |
 | `platform.h` | Platform-independent types, constants, window/draw abstractions, API declarations |
 | `platform_win.cpp` | Win32 platform layer: entry point, windowing, timers, menus, file dialogs, spell check |
 | `document.h` / `document.cpp` | Text document model: lines, selections, undo/redo, syntax highlighting, JSON reformat, sort |
@@ -32,7 +31,6 @@ Always build using rethinkify.sln
 | `view_list.h` | Base class for panel views: scrolling, selection, keyboard navigation, collapsible items |
 | `view_list_files.h` | Folder browser panel: tree navigation, expand/collapse, item rendering |
 | `view_list_search.h` | Search panel: text input, result display, navigation |
-| `view_console.h` | Console view: command input, scrollable history, output display (operates on commands state, not a document) |
 | `document_syntax.cpp` | Syntax highlighting parsers (C++, plain text, hex, markdown) |
 | `util.h` / `util.cpp` | Core utilities: string ops, geometry types, AES-256, SHA-256, base64/hex, URL encoding |
 | `ui.h` | UI types: color constants, edit_box, caret_blinker, splitter, custom_scrollbar |
@@ -51,5 +49,5 @@ Multiple documents can be open simultaneously within the current folder. Each do
 
 command-line options for testing:
 
- - rethinkify64d.exe /test     — Run unit tests and print results to stdout
- - rethinkify64d.exe /download:<url>      — Download URL contents and print to stdout
+ - noterad64d.exe /test            — Run unit tests and print results to stdout
+ - noterad64d.exe /spell:<word>    — Print spell-checker diagnostics and suggestions for <word>

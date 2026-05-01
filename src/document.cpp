@@ -691,7 +691,8 @@ void document::move_word_left(const bool selecting)
 		nPos--;
 		if (iswalnum(static_cast<unsigned char>(line_view[nPos])) || line_view[nPos] == '_')
 		{
-			while (nPos > 0 && (iswalnum(static_cast<unsigned char>(line_view[nPos - 1])) || line_view[nPos - 1] == '_'))
+			while (nPos > 0 && (iswalnum(static_cast<unsigned char>(line_view[nPos - 1])) || line_view[nPos - 1] ==
+				'_'))
 				nPos--;
 		}
 		else
@@ -1419,7 +1420,7 @@ file_lines_info iterate_file_lines(const pf::file_handle_ptr& handle,
 
 static std::string temp_file_path()
 {
-	return pf::platform_temp_file_path("rethinkify.");
+	return pf::platform_temp_file_path("noterad.");
 }
 
 static std::string last_error_message()

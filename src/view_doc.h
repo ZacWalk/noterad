@@ -93,7 +93,11 @@ public:
 
 	// --- Text selection overrides (coordinate with document) ---
 
-	[[nodiscard]] text_selection current_selection() const override { return _doc ? _doc->selection() : text_selection{}; }
+	[[nodiscard]] text_selection current_selection() const override
+	{
+		return _doc ? _doc->selection() : text_selection{};
+	}
+
 	void set_selection(const text_selection& sel) override { if (_doc) _doc->select(sel); }
 	[[nodiscard]] bool has_current_selection() const override { return _doc && _doc->has_selection(); }
 

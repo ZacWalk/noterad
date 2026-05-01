@@ -18,7 +18,7 @@
 #include "app_state.h"
 #include "test.h"
 
-std::string g_app_name = "Rethinkify";
+std::string g_app_name = "Noterad";
 
 extern std::string run_all_tests();
 extern tests::run_result run_all_tests_result();
@@ -82,7 +82,7 @@ pf::color_t style_to_color(const style style_index)
 static std::string make_about_text(const commands& cmds)
 {
 	std::string text =
-		"# Rethinkify\n"
+		"# Noterad\n"
 		"\n"
 		"*A lightweight text editor written in C++ by Zac Walker*\n"
 		"\n"

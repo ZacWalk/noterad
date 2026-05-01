@@ -258,10 +258,12 @@ aes256::aes256(const std::span<const uint8_t> k)
 
 aes256::~aes256()
 {
-	volatile uint8_t* p;
-	p = key; for (size_t i = 0; i < sizeof(key); ++i) p[i] = 0;
-	p = enckey; for (size_t i = 0; i < sizeof(enckey); ++i) p[i] = 0;
-	p = deckey; for (size_t i = 0; i < sizeof(deckey); ++i) p[i] = 0;
+	volatile uint8_t* p = key;
+	for (size_t i = 0; i < sizeof(key); ++i) p[i] = 0;
+	p = enckey;
+	for (size_t i = 0; i < sizeof(enckey); ++i) p[i] = 0;
+	p = deckey;
+	for (size_t i = 0; i < sizeof(deckey); ++i) p[i] = 0;
 } /* aes256_done */
 
 void aes256::encrypt_ecb(uint8_t* buf)

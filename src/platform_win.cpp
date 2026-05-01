@@ -1391,7 +1391,7 @@ void pf::platform_show_error(const std::string_view message, const std::string_v
 void pf::debug_trace(const std::string& msg)
 {
 #ifdef _DEBUG
-	const auto wmsg = pf::utf8_to_utf16(msg);
+	const auto wmsg = utf8_to_utf16(msg);
 	OutputDebugStringW(wmsg.c_str());
 	struct log_file
 	{
@@ -1834,7 +1834,7 @@ static pf::file_path get_config_path()
 	wchar_t w_exe_path[MAX_PATH];
 	GetModuleFileNameW(nullptr, w_exe_path, MAX_PATH);
 	const auto exe_path = pf::utf16_to_utf8(w_exe_path);
-	auto ini_path = pf::file_path(pf::file_path(exe_path).folder()).combine("rethinkify", "ini");
+	auto ini_path = pf::file_path(pf::file_path(exe_path).folder()).combine("noterad", "ini");
 
 	// Test if we can write to the exe directory
 	const auto h = CreateFileW(pf::utf8_to_utf16(ini_path.view()).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
@@ -1846,7 +1846,7 @@ static pf::file_path get_config_path()
 	}
 
 	// Fall back to AppData\Local
-	return tmp_folder().combine("rethinkify", "ini");
+	return tmp_folder().combine("noterad", "ini");
 }
 
 std::string pf::config_read(const std::string_view section, const std::string_view key,
@@ -2029,7 +2029,7 @@ public:
 		if (_diagnostics.empty())
 			_diagnostics = "Spell checker initialized.";
 
-		_custom_dic_path = tmp_folder().combine("rethinkify.dic").view();
+		_custom_dic_path = tmp_folder().combine("noterad.dic").view();
 
 		// Load custom dictionary words
 		std::ifstream f(pf::utf8_to_utf16(_custom_dic_path));
@@ -2254,7 +2254,7 @@ INT WINAPI WinMain(const HINSTANCE hInstance, HINSTANCE, LPSTR, const int nCmdSh
 
 	pf::debug_trace("WinMain: before create\n");
 
-	app_statedow->create_window(L"RethinkifyWnd", nullptr, {},
+	app_statedow->create_window(L"NoteradWnd", nullptr, {},
 	                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN);
 
 	pf::debug_trace("WinMain: after create\n");

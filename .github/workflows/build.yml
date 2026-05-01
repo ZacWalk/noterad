@@ -22,12 +22,12 @@ jobs:
           msbuild-architecture: x64
 
       - name: Build solution
-        run: msbuild rethinkify.sln /p:Configuration=Debug /p:Platform=x64 /m
+        run: msbuild noterad.sln /p:Configuration=Debug /p:Platform=x64 /m
 
       - name: Run unit tests
         shell: pwsh
         run: |
-          & .\exe\rethinkify64d.exe /test
+          & .\exe\noterad64d.exe /test
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

@@ -138,7 +138,7 @@ namespace
 		if (!result.has_value())
 			return {"Invalid expression: " + parser.error(), false};
 
-		auto value = result.value();
+		const auto value = result.value();
 		std::string result_text;
 		if (std::isfinite(value)
 			&& value >= static_cast<double>(std::numeric_limits<int64_t>::min())
