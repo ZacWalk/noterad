@@ -514,6 +514,8 @@ public:
 
 	using search_results_map = std::unordered_map<pf::file_path, std::vector<search_result>, pf::ihash>;
 
+	static constexpr int max_search_results = 5000;
+
 	void execute_search(const std::string& text, std::function<void()> on_complete = {});
 	static search_results_map perform_search(const std::vector<search_input>& inputs, const std::string& text);
 
@@ -580,8 +582,6 @@ private:
 		}
 		return nullptr;
 	}
-
-	static constexpr int max_search_results = 5000;
 
 	static void collect_search_inputs(const std::vector<index_item_ptr>& items, std::vector<search_input>& inputs)
 	{

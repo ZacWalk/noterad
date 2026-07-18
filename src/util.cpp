@@ -593,9 +593,17 @@ std::string combine(const std::vector<std::string>& lines, const std::string_vie
 	return join(lines, [](const std::string& s) -> std::string_view { return s; }, endl);
 }
 
+std::string combine(const std::vector<std::string_view>& lines, const std::string_view endl)
+{
+	return join(lines, [](const std::string_view& s) -> std::string_view { return s; }, endl);
+}
+
 std::string replace(const std::string_view s, const std::string_view find,
                     const std::string_view replacement)
 {
+	if (find.empty())
+		return std::string(s);
+
 	std::string result(s);
 	size_t pos = 0;
 	const auto findLength = find.size();
@@ -615,7 +623,7 @@ std::string replace(const std::string_view s, const std::string_view find,
 
 std::string to_base64(const std::span<const uint8_t> input)
 {
-	static const std::string base64_chars =
+	static constexpr std::string_view base64_chars =
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 		"abcdefghijklmnopqrstuvwxyz"
 		"0123456789+/";

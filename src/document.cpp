@@ -1878,6 +1878,8 @@ void document::reformat_json()
 	std::string line_text;
 
 	int tabs = 0, tokens = -1;
+	bool in_string = false;
+	bool escaped = false;
 
 	for (const auto& line : _lines)
 	{
@@ -1885,7 +1887,26 @@ void document::reformat_json()
 
 		for (const auto ch : line_text)
 		{
-			if (ch == u8'{')
+			if (in_string)
+			{
+				result += ch;
+
+				if (escaped)
+					escaped = false;
+				else if (ch == u8'\\')
+					escaped = true;
+				else if (ch == u8'"')
+					in_string = false;
+
+				continue;
+			}
+
+			if (ch == u8'"')
+			{
+				in_string = true;
+				result += ch;
+			}
+			else if (ch == u8'{')
 			{
 				tokens++;
 				tabs = tokens;

@@ -1,4 +1,4 @@
-Noterad is a lightweight AI agent enabled text editor with multi-file search, markdown, csv and other features, written in C++. It is intended to enable research using various text files.
+Noterad is a lightweight text editor with multi-file search, markdown, csv and other features, written in C++. It is intended to enable research using various text files.
 
 All Windows-specific code should be abstracted into platform_win.cpp and accessed via platform-independent abstractions declared in platform.h.
 

@@ -371,6 +371,7 @@ public:
 			_fill_brush = CreateSolidBrush(c);
 			_fill_color = c;
 		}
+		if (!_fill_brush) return;
 		FillRect(_hdc, &as_rect(rc), _fill_brush);
 	}
 
@@ -403,6 +404,7 @@ public:
 	{
 		if (points.size() < 2) return;
 		const auto pen = CreatePen(PS_SOLID, 1, color.rgb());
+		if (!pen) return;
 		const auto old_pen = SelectObject(_hdc, pen);
 		MoveToEx(_hdc, points[0].x, points[0].y, nullptr);
 		for (size_t i = 1; i < points.size(); ++i)
@@ -503,6 +505,14 @@ class win_impl final : public win, public pf::window_frame
 
 		_hdc_back = CreateCompatibleDC(hdc);
 		_hbm_back = CreateCompatibleBitmap(hdc, cx, cy);
+
+		if (!_hdc_back || !_hbm_back)
+		{
+			if (_hbm_back) { DeleteObject(_hbm_back); _hbm_back = nullptr; }
+			if (_hdc_back) { DeleteDC(_hdc_back); _hdc_back = nullptr; }
+			return;
+		}
+
 		_hbm_back_old = SelectObject(_hdc_back, _hbm_back);
 		_back_cx = cx;
 		_back_cy = cy;
@@ -893,13 +903,18 @@ public:
 
 			ensure_back_buffer(hdc, cx, cy);
 
+			// Fall back to painting directly to the window DC if the offscreen
+			// buffer could not be allocated (GDI exhaustion).
+			const HDC target = _hdc_back ? _hdc_back : hdc;
+
 			{
-				win_draw_context draw_ctx(_hdc_back, clip);
+				win_draw_context draw_ctx(target, clip);
 				auto self = _self_ref;
 				_reactor->handle_paint(self, draw_ctx);
 			}
 
-			BitBlt(hdc, 0, 0, cx, cy, _hdc_back, 0, 0, SRCCOPY);
+			if (_hdc_back)
+				BitBlt(hdc, 0, 0, cx, cy, _hdc_back, 0, 0, SRCCOPY);
 
 			EndPaint(m_hWnd, &ps);
 			return 0;
@@ -2778,7 +2793,7 @@ pf::web_response pf::send_request(const web_host_ptr& host, const web_request& r
 	}
 	else if (!req.form_data.empty())
 	{
-		const std::string boundary = "54B8723DE6044695A68C838E8BF0CB00";
+		constexpr std::string_view boundary = "54B8723DE6044695A68C838E8BF0CB00";
 
 		for (const auto& f : req.form_data)
 		{

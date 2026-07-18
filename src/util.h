@@ -133,6 +133,7 @@ std::string join(const std::vector<T>& items, Fn text_of, const std::string_view
 }
 
 [[nodiscard]] std::string combine(const std::vector<std::string>& lines, std::string_view endl = "\n");
+[[nodiscard]] std::string combine(const std::vector<std::string_view>& lines, std::string_view endl = "\n");
 
 [[nodiscard]] std::string replace(std::string_view s, std::string_view find, std::string_view replacement);
 

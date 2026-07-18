@@ -254,6 +254,21 @@ static void should_cut_and_paste()
 	                    });
 }
 
+static void should_reformat_json_preserves_strings()
+{
+	// Structural characters ({ } : ,) that appear inside string literals must be
+	// emitted verbatim and not treated as JSON structure.
+	const auto doc = std::make_shared<document>(
+		null_ev, "{\"url\":\"http://example.com\",\"note\":\"a, b {x}\"}");
+	doc->reformat_json();
+	const auto result = doc->str();
+
+	should::is_equal_true(result.find("http://example.com") != std::string::npos,
+	                      "colon/slashes inside string preserved");
+	should::is_equal_true(result.find("a, b {x}") != std::string::npos,
+	                      "comma and braces inside string preserved");
+}
+
 static void should_calc_sha256()
 {
 	const auto text = "hello world";
@@ -305,11 +320,11 @@ static void should_find_in_text()
 
 static void should_combine_lines()
 {
-	const std::vector<std::string> lines = {"one", "two", "three"};
+	std::vector<std::string_view> lines = {"one", "two", "three"};
 	should::is_equal("one\ntwo\nthree", combine(lines));
 	should::is_equal("one, two, three", combine(lines, ", "));
 
-	const std::vector<std::string> single = {"only"};
+	std::vector<std::string_view> single = {"only"};
 	should::is_equal("only", combine(single));
 }
 
@@ -318,6 +333,7 @@ static void should_replace_string()
 	should::is_equal("hello world", replace("hello there", "there", "world"));
 	should::is_equal("aXbXc", replace("a.b.c", ".", "X"));
 	should::is_equal("unchanged", replace("unchanged", "xyz", "abc"));
+	should::is_equal("abc", replace("abc", "", "X")); // empty find must not loop forever
 }
 
 static void should_last_char()
@@ -388,7 +404,7 @@ static void should_irect_ops()
 
 static void should_hex_roundtrip()
 {
-	const std::vector<uint8_t> data = {0xDE, 0xAD, 0xBE, 0xEF};
+	std::vector<uint8_t> data = {0xDE, 0xAD, 0xBE, 0xEF};
 	const auto hex = to_hex(data);
 	should::is_equal("deadbeef", hex);
 
@@ -802,6 +818,27 @@ static void should_app_state_is_markdown_path()
 	should::is_equal_true(is_markdown_path(pf::file_path{"DOC.MARKDOWN"}));
 	should::is_equal(false, is_markdown_path(pf::file_path{"code.cpp"}));
 	should::is_equal(false, is_markdown_path(pf::file_path{"noext"}));
+}
+
+static void should_cap_search_results()
+{
+	// First file alone produces more matches than the cap; the second file must
+	// not push the total above max_search_results.
+	std::string many_lines;
+	for (int i = 0; i < app_state::max_search_results + 50; i++)
+		many_lines += "x\n";
+
+	std::vector<app_state::search_input> inputs;
+	inputs.push_back({pf::file_path{"c:\\folder\\a.txt"}, std::make_shared<document>(null_ev, many_lines)});
+	inputs.push_back({pf::file_path{"c:\\folder\\b.txt"}, std::make_shared<document>(null_ev, "x\nx\nx")});
+
+	const auto results = app_state::perform_search(inputs, "x");
+
+	int total = 0;
+	for (const auto& entry : results)
+		total += static_cast<int>(entry.second.size());
+
+	should::is_equal(app_state::max_search_results, total, "search results capped");
 }
 
 static void should_create_new_file_with_content()
@@ -1245,6 +1282,7 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should insert crlf text", should_insert_crlf_text);
 	tests.register_test("should return selection", should_return_selection);
 	tests.register_test("should cut and paste", should_cut_and_paste);
+	tests.register_test("should reformat json preserves strings", should_reformat_json_preserves_strings);
 	tests.register_test("should calc pf::sha256", should_calc_sha256);
 
 	// String utility tests
@@ -1307,6 +1345,7 @@ tests::run_result run_all_tests_result()
 	// App state tests
 	tests.register_test("should app_state new_doc is markdown", should_app_state_new_doc_is_markdown);
 	tests.register_test("should app_state is_markdown_path", should_app_state_is_markdown_path);
+	tests.register_test("should cap search results", should_cap_search_results);
 	tests.register_test("should create_new_file with content", should_create_new_file_with_content);
 	tests.register_test("should create_new_file added to tree", should_create_new_file_added_to_tree);
 	tests.register_test("should create_new_file with unique name", should_create_new_file_with_unique_name);

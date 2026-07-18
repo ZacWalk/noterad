@@ -878,6 +878,10 @@ app_state::search_results_map app_state::perform_search(const std::vector<search
 		if (total >= max_search_results) break;
 
 		auto file_results = search_file_results(input.path, input.doc, text);
+
+		if (total + static_cast<int>(file_results.size()) > max_search_results)
+			file_results.resize(max_search_results - total);
+
 		total += static_cast<int>(file_results.size());
 
 		if (!file_results.empty())
