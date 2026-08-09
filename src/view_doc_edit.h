@@ -74,50 +74,6 @@ public:
 		return items;
 	}
 
-	void drop_text(const std::string& text, const pf::ipoint& client_pt)
-	{
-		const auto drop_loc = client_to_text(client_pt);
-
-		if (_dragging_text && _doc->is_inside_selection(drop_loc))
-			return;
-
-		undo_group ug(_doc);
-		_doc->select(_doc->insert_text(ug, drop_loc, text));
-	}
-
-	void show_drop_indicator(const pf::ipoint& point)
-	{
-		if (!_drop_pos_visible)
-		{
-			_saved_caret_pos = _doc->cursor_pos();
-			_drop_pos_visible = true;
-		}
-		_pt_drop_pos = client_to_text(point);
-		_events.invalidate(invalid::windows);
-	}
-
-	void hide_drop_indicator()
-	{
-		if (_drop_pos_visible)
-		{
-			_doc->cursor_pos(_saved_caret_pos);
-			_drop_pos_visible = false;
-			_events.invalidate(invalid::windows);
-		}
-	}
-
-	std::string prepare_drag_text()
-	{
-		const auto sel = _doc->selection();
-
-		if (sel.empty())
-			return {};
-
-		_dragged_text_selection = sel;
-		_dragging_text = true;
-		return combine(_doc->text(sel));
-	}
-
 protected:
 	[[nodiscard]] bool can_cut_text() const override
 	{
@@ -157,56 +113,30 @@ protected:
 		return true;
 	}
 
-	void on_char(pf::window_frame_ptr& window, const char c) override
+	void on_char(pf::window_frame_ptr& window, const char32_t c) override
 	{
 		if (window->is_key_down_async(pf::platform_key::LButton) ||
 			window->is_key_down_async(pf::platform_key::RButton))
 			return;
 
+		if (!_doc->query_editable())
+			return;
+
 		if (c == pf::platform_key::Return)
 		{
-			if (_doc->query_editable())
-			{
-				undo_group ug(_doc);
-				const auto pos = _doc->delete_text(ug, _doc->selection());
-				_doc->select(_doc->insert_text(ug, pos, u8'\n'));
-			}
+			undo_group ug(_doc);
+			const auto pos = _doc->delete_text(ug, _doc->selection());
+			_doc->select(_doc->insert_text(ug, pos, u8'\n'));
 		}
-		else if (c > 31)
+		else if (c > 31 && c != 0x7F)
 		{
-			if (_doc->query_editable())
-			{
-				undo_group ug(_doc);
-				const auto pos = _doc->delete_text(ug, _doc->selection());
-				_doc->select(_doc->insert_text(ug, pos, static_cast<char>(c)));
-			}
+			undo_group ug(_doc);
+			const auto pos = _doc->delete_text(ug, _doc->selection());
+			_doc->select(_doc->insert_text(ug, pos, pf::utf8_encode(c)));
 		}
-	}
-
-	void draw_caret(pf::draw_context& draw) const override
-	{
-		if (_drop_pos_visible)
-		{
-			if (_pt_drop_pos.x >= scroll_char())
-			{
-				const auto pt = text_to_client(_pt_drop_pos);
-				const auto rc = client_rect();
-				const auto caret_rect = pf::irect(pt.x, pt.y, pt.x + 2, pt.y + _font_extent.cy);
-				if (caret_rect.top < rc.bottom && caret_rect.bottom > rc.top)
-					draw.fill_solid_rect(caret_rect, pf::color_t(128, 128, 128));
-			}
-			return;
-		}
-		doc_view::draw_caret(draw);
 	}
 
 private:
-	text_location _pt_drop_pos;
-	bool _drop_pos_visible = false;
-	bool _dragging_text = false;
-	text_location _saved_caret_pos;
-	text_selection _dragged_text_selection;
-
 	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
 	{
 		namespace pk = pf::platform_key;
@@ -283,13 +213,6 @@ private:
 				_doc->edit_redo();
 				return true;
 			}
-		}
-
-		// View toggles
-		if (vk == 'Z' && alt && !ctrl)
-		{
-			toggle_word_wrap();
-			return true;
 		}
 
 		return doc_view::on_key_down(window, vk);

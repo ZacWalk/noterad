@@ -6,10 +6,9 @@
 // Windows Header Files:
 #define NOMINMAX
 #include <windows.h>
+#include <KnownFolders.h>
+#include <shlobj_core.h>
 #include <spellcheck.h>
-#include <WinInet.h>
-
-#pragma comment(lib, "wininet.lib")
 
 #include <functional>
 #include <map>
@@ -19,16 +18,9 @@
 
 #include "platform.h"
 
-using namespace std::string_view_literals;
-
 // pf::irect and RECT have identical binary layout (4 x int32_t)
 inline RECT& as_rect(pf::irect& r) { return reinterpret_cast<RECT&>(r); }
 inline const RECT& as_rect(const pf::irect& r) { return reinterpret_cast<const RECT&>(r); }
-
-constexpr uint32_t xrgb(const uint32_t r, const uint32_t g, const uint32_t b)
-{
-	return (r & 0xff) | ((g & 0xff) << 8) | ((b & 0xff) << 16) | 0xff000000;
-}
 
 
 bool pf::file_path::exists() const
@@ -38,28 +30,34 @@ bool pf::file_path::exists() const
 		(attribs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-pf::file_path pf::file_path::module_folder()
+// GetModuleFileNameW truncates silently, so grow the buffer until it fits.
+static std::wstring module_file_name()
 {
-	wchar_t raw_path[MAX_PATH];
-	GetModuleFileNameW(nullptr, raw_path, MAX_PATH);
-	return file_path(utf16_to_utf8(raw_path)).folder();
+	std::wstring buf(MAX_PATH, L'\0');
+
+	for (;;)
+	{
+		const auto len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+		if (len == 0) return {};
+		if (len < buf.size())
+		{
+			buf.resize(len);
+			return buf;
+		}
+		if (buf.size() >= 0x8000) return {};
+		buf.resize(buf.size() * 2);
+	}
 }
 
-pf::file_path tmp_folder()
+pf::file_path pf::file_path::module_folder()
 {
-	wchar_t raw_path[MAX_PATH];
-	//SHGetSpecialFolderPathW(GetActiveWindow(), raw_path, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, TRUE);
-	GetTempPathW(MAX_PATH, raw_path);
-	const auto result = pf::utf16_to_utf8(raw_path);
-	return pf::file_path{result};
+	return file_path(utf16_to_utf8(module_file_name())).folder();
 }
 
 // ── Globals ────────────────────────────────────────────────────────────────────
 
 static HINSTANCE resource_instance = nullptr;
 static HWND g_hWnd = nullptr;
-static LARGE_INTEGER g_perfFreq;
-static LARGE_INTEGER g_perfStart;
 static HMENU g_hMenu = nullptr;
 static HACCEL g_hAccel = nullptr;
 static std::vector<pf::menu_command> g_menuDef;
@@ -113,7 +111,9 @@ static void apply_menu_state(const HMENU hMenu)
 		if (const auto* cmd = find_menu_command(g_menuDef, static_cast<int>(id)))
 		{
 			if (cmd->is_enabled)
-				EnableMenuItem(hMenu, i, MF_BYPOSITION | (cmd->is_enabled() ? MF_ENABLED : MF_DISABLED));
+				EnableMenuItem(hMenu, i, MF_BYPOSITION | (cmd->is_enabled()
+					                                          ? MF_ENABLED
+					                                          : MF_DISABLED | MF_GRAYED));
 			if (cmd->is_checked)
 				CheckMenuItem(hMenu, i, MF_BYPOSITION | (cmd->is_checked() ? MF_CHECKED : MF_UNCHECKED));
 		}
@@ -128,19 +128,24 @@ static void build_runtime_accelerators()
 	std::function<void(const std::vector<pf::menu_command>&)> collect;
 	collect = [&](const std::vector<pf::menu_command>& items)
 	{
+		const auto add = [&](const pf::key_binding& kb, const int id)
+		{
+			if (kb.empty() || id == 0) return;
+			ACCEL a = {};
+			a.cmd = static_cast<WORD>(id);
+			a.fVirt = FVIRTKEY | FNOINVERT;
+			if (kb.modifiers & pf::key_mod::ctrl) a.fVirt |= FCONTROL;
+			if (kb.modifiers & pf::key_mod::shift) a.fVirt |= FSHIFT;
+			if (kb.modifiers & pf::key_mod::alt) a.fVirt |= FALT;
+			a.key = static_cast<WORD>(kb.key);
+			accels.push_back(a);
+		};
+
 		for (const auto& item : items)
 		{
-			if (!item.accel.empty() && item.id != 0)
-			{
-				ACCEL a = {};
-				a.cmd = static_cast<WORD>(item.id);
-				a.fVirt = FVIRTKEY | FNOINVERT;
-				if (item.accel.modifiers & pf::key_mod::ctrl) a.fVirt |= FCONTROL;
-				if (item.accel.modifiers & pf::key_mod::shift) a.fVirt |= FSHIFT;
-				if (item.accel.modifiers & pf::key_mod::alt) a.fVirt |= FALT;
-				a.key = static_cast<WORD>(item.accel.key);
-				accels.push_back(a);
-			}
+			add(item.accel, item.id);
+			add(item.accel_alt, item.id);
+
 			if (!item.children.empty())
 				collect(item.children);
 		}
@@ -173,23 +178,6 @@ public:
 	void move_window(const pf::irect& bounds) const
 	{
 		MoveWindow(m_hWnd, bounds.left, bounds.top, bounds.width(), bounds.height(), TRUE);
-	}
-
-
-	void create_control(const LPCWSTR class_name, const HWND parent, const uint32_t style,
-	                    const uint32_t exstyle = 0,
-	                    const uintptr_t id = 0)
-	{
-		m_hWnd = CreateWindowEx(
-			exstyle,
-			class_name,
-			nullptr,
-			style,
-			0, 0, 0, 0,
-			parent,
-			std::bit_cast<HMENU>(id),
-			resource_instance,
-			this);
 	}
 };
 
@@ -296,6 +284,30 @@ static HFONT get_cached_font(const pf::font& f)
 	return hfont;
 }
 
+// Brush and pen caches — keyed on colour, live until process exit like the fonts
+static std::map<uint32_t, HBRUSH> s_brush_cache;
+static std::map<uint32_t, HPEN> s_pen_cache;
+
+static HBRUSH get_cached_brush(const uint32_t color)
+{
+	const auto it = s_brush_cache.find(color);
+	if (it != s_brush_cache.end())
+		return it->second;
+	const auto brush = CreateSolidBrush(color);
+	s_brush_cache[color] = brush;
+	return brush;
+}
+
+static HPEN get_cached_pen(const uint32_t color)
+{
+	const auto it = s_pen_cache.find(color);
+	if (it != s_pen_cache.end())
+		return it->second;
+	const auto pen = CreatePen(PS_SOLID, 1, color);
+	s_pen_cache[color] = pen;
+	return pen;
+}
+
 // Win32 draw_context implementation
 // Caches fonts and DC state — only issues GDI calls when values actually change.
 // Original DC state is restored in the destructor.
@@ -310,6 +322,8 @@ class win_draw_context final : public pf::draw_context
 	mutable HFONT _font = nullptr;
 	HBRUSH _fill_brush = nullptr;
 	uint32_t _fill_color = 0;
+
+	mutable std::wstring _scratch; // reused by draw_text/measure_text
 
 	// Original DC state (restored in destructor)
 	COLORREF _orig_text_color;
@@ -354,7 +368,6 @@ public:
 
 	~win_draw_context() override
 	{
-		if (_fill_brush) DeleteObject(_fill_brush);
 		if (_text_color != _orig_text_color) SetTextColor(_hdc, _orig_text_color);
 		if (_bk_color != _orig_bk_color) SetBkColor(_hdc, _orig_bk_color);
 		if (_font != _orig_font) SelectObject(_hdc, _orig_font);
@@ -367,8 +380,7 @@ public:
 		const auto c = color.rgb();
 		if (!_fill_brush || c != _fill_color)
 		{
-			if (_fill_brush) DeleteObject(_fill_brush);
-			_fill_brush = CreateSolidBrush(c);
+			_fill_brush = get_cached_brush(c);
 			_fill_color = c;
 		}
 		if (!_fill_brush) return;
@@ -387,23 +399,24 @@ public:
 		select_text_color(text_color.rgb());
 		select_bk_color(bg_color.rgb());
 		const RECT rc = {clip.left, clip.top, clip.right, clip.bottom};
-		const auto wtext = pf::utf8_to_utf16(text);
-		ExtTextOutW(_hdc, x, y, ETO_CLIPPED | ETO_OPAQUE, &rc, wtext.c_str(), static_cast<UINT>(wtext.size()), nullptr);
+		pf::utf8_to_utf16(text, _scratch);
+		ExtTextOutW(_hdc, x, y, ETO_CLIPPED | ETO_OPAQUE, &rc, _scratch.c_str(),
+		            static_cast<UINT>(_scratch.size()), nullptr);
 	}
 
 	pf::isize measure_text(const std::string_view text, const pf::font& f) const override
 	{
 		select_font(f);
-		const auto wtext = pf::utf8_to_utf16(text);
+		pf::utf8_to_utf16(text, _scratch);
 		SIZE sz;
-		GetTextExtentPoint32W(_hdc, wtext.c_str(), static_cast<int>(wtext.size()), &sz);
+		GetTextExtentPoint32W(_hdc, _scratch.c_str(), static_cast<int>(_scratch.size()), &sz);
 		return {sz.cx, sz.cy};
 	}
 
 	void draw_lines(const std::span<const pf::ipoint> points, const pf::color_t color) override
 	{
 		if (points.size() < 2) return;
-		const auto pen = CreatePen(PS_SOLID, 1, color.rgb());
+		const auto pen = get_cached_pen(color.rgb());
 		if (!pen) return;
 		const auto old_pen = SelectObject(_hdc, pen);
 		MoveToEx(_hdc, points[0].x, points[0].y, nullptr);
@@ -412,7 +425,6 @@ public:
 			LineTo(_hdc, points[i].x, points[i].y);
 		}
 		SelectObject(_hdc, old_pen);
-		DeleteObject(pen);
 	}
 };
 
@@ -422,6 +434,7 @@ class win_measure_context : public pf::measure_context
 	HDC _hdc;
 	mutable HFONT _font = nullptr;
 	HFONT _orig_font;
+	mutable std::wstring _scratch; // reused by measure_text
 
 	void select_font(const pf::font& f) const
 	{
@@ -447,9 +460,9 @@ public:
 	pf::isize measure_text(const std::string_view text, const pf::font& f) const override
 	{
 		select_font(f);
-		const auto wtext = pf::utf8_to_utf16(text);
+		pf::utf8_to_utf16(text, _scratch);
 		SIZE sz;
-		GetTextExtentPoint32W(_hdc, wtext.c_str(), static_cast<int>(wtext.size()), &sz);
+		GetTextExtentPoint32W(_hdc, _scratch.c_str(), static_cast<int>(_scratch.size()), &sz);
 		return {sz.cx, sz.cy};
 	}
 
@@ -488,6 +501,10 @@ class win_impl final : public win, public pf::window_frame
 {
 	pf::frame_reactor_ptr _reactor;
 	pf::window_frame_ptr _self_ref; // cleared on WM_DESTROY
+
+	bool _placement_applied = false;
+	bool _placement_maximized = false;
+	uint16_t _pending_lead = 0; // held between the two WM_CHAR halves of a surrogate pair
 
 	// Cached back buffer for flicker-free painting
 	HDC _hdc_back = nullptr;
@@ -657,49 +674,6 @@ public:
 		SetWindowTextW(m_hWnd, pf::utf8_to_utf16(text).c_str());
 	}
 
-	std::string text_from_clipboard() override
-	{
-		std::string result;
-		if (OpenClipboard(m_hWnd))
-		{
-			const auto hData = GetClipboardData(CF_UNICODETEXT);
-			if (hData)
-			{
-				const auto pszData = static_cast<const wchar_t*>(GlobalLock(hData));
-				if (pszData)
-				{
-					result = pf::utf16_to_utf8(pszData);
-					GlobalUnlock(hData);
-				}
-			}
-			CloseClipboard();
-		}
-		return result;
-	}
-
-	bool text_to_clipboard(const std::string_view text) override
-	{
-		bool success = false;
-		if (OpenClipboard(m_hWnd))
-		{
-			EmptyClipboard();
-			const auto wtext = pf::utf8_to_utf16(text);
-			const auto len = wtext.size() + 1;
-			const auto hData = GlobalAlloc(GMEM_MOVEABLE | GMEM_DDESHARE, len * sizeof(wchar_t));
-			if (hData)
-			{
-				const auto pszData = static_cast<wchar_t*>(GlobalLock(hData));
-				wcsncpy_s(pszData, len, wtext.c_str(), wtext.size());
-				GlobalUnlock(hData);
-				success = SetClipboardData(CF_UNICODETEXT, hData) != nullptr;
-				if (!success)
-					GlobalFree(hData);
-			}
-			CloseClipboard();
-		}
-		return success;
-	}
-
 	placement get_placement() const override
 	{
 		WINDOWPLACEMENT wp = {};
@@ -718,7 +692,13 @@ public:
 		wp.showCmd = p.maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
 		std::memcpy(&wp.rcNormalPosition, &p.normal_bounds, sizeof(RECT));
 		SetWindowPlacement(m_hWnd, &wp);
+		_placement_applied = true;
+		_placement_maximized = p.maximized;
 	}
+
+	// A placement restored during window creation must survive the initial ShowWindow
+	bool placement_applied() const { return _placement_applied; }
+	bool placement_maximized() const { return _placement_maximized; }
 
 	void track_mouse_leave() override
 	{
@@ -846,89 +826,193 @@ public:
 
 	// ── Win32 message handling ──
 
-	virtual LRESULT handle_message(const HWND hWnd, const UINT uMsg, const WPARAM wParam, const LPARAM lParam)
+private:
+	// Expand the resize border so the window frame is easier to grab
+	LRESULT nc_hit_test(const HWND hWnd, const UINT uMsg, const WPARAM wParam, const LPARAM lParam) const
 	{
-		if (!_reactor)
+		const auto result = DefWindowProc(hWnd, uMsg, wParam, lParam);
+		if (result != HTCLIENT)
+			return result;
+
+		RECT rc;
+		GetWindowRect(hWnd, &rc);
+		const int x = GET_X_LPARAM(lParam);
+		const int y = GET_Y_LPARAM(lParam);
+		constexpr int border = 6;
+
+		const bool near_left = x < rc.left + border;
+		const bool near_right = x >= rc.right - border;
+		const bool near_top = y < rc.top + border;
+		const bool near_bottom = y >= rc.bottom - border;
+
+		if (near_top && near_left) return HTTOPLEFT;
+		if (near_top && near_right) return HTTOPRIGHT;
+		if (near_bottom && near_left) return HTBOTTOMLEFT;
+		if (near_bottom && near_right) return HTBOTTOMRIGHT;
+		if (near_left) return HTLEFT;
+		if (near_right) return HTRIGHT;
+		if (near_top) return HTTOP;
+		if (near_bottom) return HTBOTTOM;
+		return result;
+	}
+
+	// Double-buffered paint via the cached offscreen bitmap
+	void paint()
+	{
+		PAINTSTRUCT ps;
+		const HDC hdc = BeginPaint(m_hWnd, &ps);
+
+		RECT rc;
+		GetClientRect(m_hWnd, &rc);
+		const int cx = rc.right - rc.left;
+		const int cy = rc.bottom - rc.top;
+
+		const pf::irect clip(ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
+
+		ensure_back_buffer(hdc, cx, cy);
+
+		// Fall back to painting directly to the window DC if the offscreen
+		// buffer could not be allocated (GDI exhaustion).
+		const HDC target = _hdc_back ? _hdc_back : hdc;
+
+		{
+			win_draw_context draw_ctx(target, clip);
+			auto self = _self_ref;
+			_reactor->handle_paint(self, draw_ctx);
+		}
+
+		if (_hdc_back)
+			BitBlt(hdc, clip.left, clip.top, clip.width(), clip.height(),
+			       _hdc_back, clip.left, clip.top, SRCCOPY);
+
+		EndPaint(m_hWnd, &ps);
+	}
+
+	void resize(const HWND hWnd, const LPARAM lParam)
+	{
+		const pf::isize extent(LOWORD(lParam), HIWORD(lParam));
+		const auto hdc = GetDC(hWnd);
+		win_measure_context measure_ctx(hdc);
+		auto self = _self_ref;
+		_reactor->handle_size(self, extent, measure_ctx);
+		ReleaseDC(hWnd, hdc);
+	}
+
+	// Break the self-reference cycle established by set_self_ref
+	void release_self_ref(const HWND hWnd)
+	{
+		if (!_self_ref) return;
+		_self_ref.reset();
+		if (GetParent(hWnd) == nullptr)
+			PostQuitMessage(0);
+	}
+
+	LRESULT dispatch_to_reactor(const HWND hWnd, const UINT uMsg, const WPARAM wParam, const LPARAM lParam)
+	{
+		const auto self = _self_ref;
+		if (!self)
 			return DefWindowProc(hWnd, uMsg, wParam, lParam);
 
-		// Special-case WM_NCHITTEST: expand resize border for easier grabbing
-		if (uMsg == WM_NCHITTEST && GetWindowLong(hWnd, GWL_STYLE) & WS_THICKFRAME)
+		if (const auto mt = map_message(uMsg))
 		{
-			const auto result = DefWindowProc(hWnd, uMsg, wParam, lParam);
-			if (result == HTCLIENT)
-			{
-				RECT rc;
-				GetWindowRect(hWnd, &rc);
-				const int x = GET_X_LPARAM(lParam);
-				const int y = GET_Y_LPARAM(lParam);
-				constexpr int border = 6;
+			const auto result = _reactor->handle_message(self, *mt, wParam, lParam);
 
-				const bool near_left = x < rc.left + border;
-				const bool near_right = x >= rc.right - border;
-				const bool near_top = y < rc.top + border;
-				const bool near_bottom = y >= rc.bottom - border;
+			if (uMsg == WM_DESTROY)
+				release_self_ref(hWnd);
 
-				if (near_top && near_left) return HTTOPLEFT;
-				if (near_top && near_right) return HTTOPRIGHT;
-				if (near_bottom && near_left) return HTBOTTOMLEFT;
-				if (near_bottom && near_right) return HTBOTTOMRIGHT;
-				if (near_left) return HTLEFT;
-				if (near_right) return HTRIGHT;
-				if (near_top) return HTTOP;
-				if (near_bottom) return HTBOTTOM;
-			}
 			return result;
 		}
 
-		// Special-case WM_SETCURSOR: let DefWindowProc handle non-client cursors (resize arrows)
-		if (uMsg == WM_SETCURSOR)
+		if (const auto kmt = map_keyboard_message(uMsg))
 		{
-			const auto hitTest = LOWORD(lParam);
-			if (hitTest != HTCLIENT)
-				return DefWindowProc(hWnd, uMsg, wParam, lParam);
-		}
+			pf::keyboard_params params;
 
-		// Special-case WM_PAINT: double-buffered paint via cached offscreen bitmap
-		if (uMsg == WM_PAINT)
-		{
-			PAINTSTRUCT ps;
-			const HDC hdc = BeginPaint(m_hWnd, &ps);
-
-			RECT rc;
-			GetClientRect(m_hWnd, &rc);
-			const int cx = rc.right - rc.left;
-			const int cy = rc.bottom - rc.top;
-
-			const pf::irect clip(ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
-
-			ensure_back_buffer(hdc, cx, cy);
-
-			// Fall back to painting directly to the window DC if the offscreen
-			// buffer could not be allocated (GDI exhaustion).
-			const HDC target = _hdc_back ? _hdc_back : hdc;
-
+			if (*kmt == pf::keyboard_message_type::key_down)
 			{
-				win_draw_context draw_ctx(target, clip);
-				auto self = _self_ref;
-				_reactor->handle_paint(self, draw_ctx);
+				params.vk = static_cast<unsigned int>(wParam);
+			}
+			else
+			{
+				// WM_CHAR delivers UTF-16 code units; a supplementary character arrives as two messages.
+				const auto unit = static_cast<uint16_t>(wParam);
+
+				if (pf::is_lead_surrogate(unit))
+				{
+					_pending_lead = unit;
+					return 0;
+				}
+
+				if (pf::is_trail_surrogate(unit))
+				{
+					if (_pending_lead == 0)
+						return 0;
+					params.ch = static_cast<char32_t>(0x10000u + ((_pending_lead - 0xD800u) << 10) + (unit - 0xDC00u));
+					_pending_lead = 0;
+				}
+				else
+				{
+					_pending_lead = 0;
+					params.ch = static_cast<char32_t>(unit);
+				}
 			}
 
-			if (_hdc_back)
-				BitBlt(hdc, 0, 0, cx, cy, _hdc_back, 0, 0, SRCCOPY);
+			return _reactor->handle_keyboard(self, *kmt, params);
+		}
 
-			EndPaint(m_hWnd, &ps);
+		if (const auto mmt = map_mouse_message(uMsg))
+		{
+			pf::mouse_params params;
+			params.point = pf::point_from_lparam(lParam);
+
+			const auto key_flags = static_cast<uint32_t>(wParam & 0xFFFF);
+			params.left_button = (key_flags & 0x0001) != 0; // MK_LBUTTON
+			params.control = (key_flags & 0x0008) != 0; // MK_CONTROL
+			params.shift = (key_flags & 0x0004) != 0; // MK_SHIFT
+
+			if (*mmt == pf::mouse_message_type::mouse_wheel)
+				params.wheel_delta = static_cast<int16_t>(wParam >> 16 & 0xFFFF);
+
+			if (*mmt == pf::mouse_message_type::set_cursor)
+				params.hit_test = static_cast<uint32_t>(lParam & 0xFFFF);
+
+			return _reactor->handle_mouse(self, *mmt, params);
+		}
+
+		return DefWindowProc(hWnd, uMsg, wParam, lParam);
+	}
+
+public:
+	virtual LRESULT handle_message(const HWND hWnd, const UINT uMsg, const WPARAM wParam, const LPARAM lParam)
+	{
+		const bool is_destroy = uMsg == WM_DESTROY || uMsg == WM_NCDESTROY;
+
+		// Destroy releases the self-reference that owns this object, so hold it
+		// until the message has been fully handled.
+		const pf::window_frame_ptr keep_alive = is_destroy ? _self_ref : nullptr;
+
+		if (!_reactor)
+		{
+			if (is_destroy)
+				release_self_ref(hWnd);
+			return DefWindowProc(hWnd, uMsg, wParam, lParam);
+		}
+
+		if (uMsg == WM_NCHITTEST && GetWindowLong(hWnd, GWL_STYLE) & WS_THICKFRAME)
+			return nc_hit_test(hWnd, uMsg, wParam, lParam);
+
+		// Let DefWindowProc handle non-client cursors (resize arrows)
+		if (uMsg == WM_SETCURSOR && LOWORD(lParam) != HTCLIENT)
+			return DefWindowProc(hWnd, uMsg, wParam, lParam);
+
+		if (uMsg == WM_PAINT)
+		{
+			paint();
 			return 0;
 		}
 
-		// Special-case WM_SIZE: extract dimensions and call handle_size
 		if (uMsg == WM_SIZE)
 		{
-			const pf::isize extent(LOWORD(lParam), HIWORD(lParam));
-			const auto hdc = GetDC(hWnd);
-			win_measure_context measure_ctx(hdc);
-			auto self = _self_ref;
-			_reactor->handle_size(self, extent, measure_ctx);
-			ReleaseDC(hWnd, hdc);
+			resize(hWnd, lParam);
 			return 0;
 		}
 
@@ -940,77 +1024,13 @@ public:
 		}
 
 		// Dispatch menu/accelerator WM_COMMAND via pf::menu_command actions
-		if (uMsg == WM_COMMAND && lParam == 0)
-		{
-			const int cmdId = LOWORD(wParam);
-			if (dispatch_menu_command(g_menuDef, cmdId))
-				return 0;
-		}
+		if (uMsg == WM_COMMAND && lParam == 0 && dispatch_menu_command(g_menuDef, LOWORD(wParam)))
+			return 0;
 
-		// Map to platform message_type and delegate to reactor
-		const auto mt = map_message(uMsg);
-		if (mt)
-		{
-			const auto self = _self_ref;
-			if (self)
-			{
-				const auto result = _reactor->handle_message(self, *mt, wParam, lParam);
+		if (uMsg == WM_NCDESTROY)
+			release_self_ref(hWnd);
 
-				if (uMsg == WM_DESTROY)
-				{
-					_self_ref.reset();
-					if (GetParent(hWnd) == nullptr)
-						PostQuitMessage(0);
-				}
-
-				return result;
-			}
-		}
-
-		// Map to keyboard_message_type and delegate to handle_keyboard
-		const auto kmt = map_keyboard_message(uMsg);
-		if (kmt)
-		{
-			const auto self = _self_ref;
-			if (self)
-			{
-				pf::keyboard_params params;
-
-				if (*kmt == pf::keyboard_message_type::key_down)
-					params.vk = static_cast<unsigned int>(wParam);
-				else
-					params.ch = static_cast<char>(wParam);
-
-				return _reactor->handle_keyboard(self, *kmt, params);
-			}
-		}
-
-		// Map to mouse_message_type and delegate to handle_mouse
-		const auto mmt = map_mouse_message(uMsg);
-		if (mmt)
-		{
-			const auto self = _self_ref;
-			if (self)
-			{
-				pf::mouse_params params;
-				params.point = pf::point_from_lparam(lParam);
-
-				const auto key_flags = static_cast<uint32_t>(wParam & 0xFFFF);
-				params.left_button = (key_flags & 0x0001) != 0; // MK_LBUTTON
-				params.control = (key_flags & 0x0008) != 0; // MK_CONTROL
-				params.shift = (key_flags & 0x0004) != 0; // MK_SHIFT
-
-				if (*mmt == pf::mouse_message_type::mouse_wheel)
-					params.wheel_delta = static_cast<int16_t>(wParam >> 16 & 0xFFFF);
-
-				if (*mmt == pf::mouse_message_type::set_cursor)
-					params.hit_test = static_cast<uint32_t>(lParam & 0xFFFF);
-
-				return _reactor->handle_mouse(self, *mmt, params);
-			}
-		}
-
-		return DefWindowProc(hWnd, uMsg, wParam, lParam);
+		return dispatch_to_reactor(hWnd, uMsg, wParam, lParam);
 	}
 
 	// ── Win32 window procedure ──
@@ -1113,113 +1133,6 @@ public:
 	}
 };
 
-inline void set_font(const HWND h, HFONT f)
-{
-	SendMessage(h, WM_SETFONT, (WPARAM)f, 1);
-}
-
-inline void set_icon(const HWND h, HICON i)
-{
-	SendMessage(h, WM_SETICON, ICON_BIG, (LPARAM)i);
-	SendMessage(h, WM_SETICON, ICON_SMALL, (LPARAM)i);
-}
-
-inline DWORD get_style(const HWND m_hWnd)
-{
-	return static_cast<DWORD>(::GetWindowLong(m_hWnd, GWL_STYLE));
-}
-
-inline BOOL center_window(const HWND m_hWnd, HWND hWndCenter = nullptr) noexcept
-{
-	// determine owner window to center against
-	const DWORD dwStyle = get_style(m_hWnd);
-	if (hWndCenter == nullptr)
-	{
-		if (dwStyle & WS_CHILD)
-			hWndCenter = GetParent(m_hWnd);
-		else
-			hWndCenter = GetWindow(m_hWnd, GW_OWNER);
-	}
-
-	// get coordinates of the window relative to its parent
-	RECT rcDlg;
-	GetWindowRect(m_hWnd, &rcDlg);
-	RECT rcArea;
-	RECT rcCenter;
-	const HWND hWndParent = hWndCenter;
-	if (!(dwStyle & WS_CHILD))
-	{
-		// don't center against invisible or minimized windows
-		if (hWndCenter != nullptr)
-		{
-			const DWORD dwStyleCenter = ::GetWindowLong(hWndCenter, GWL_STYLE);
-			if (!(dwStyleCenter & WS_VISIBLE) || dwStyleCenter & WS_MINIMIZE)
-				hWndCenter = nullptr;
-		}
-
-		// center within screen coordinates
-		HMONITOR hMonitor = nullptr;
-		if (hWndCenter != nullptr)
-		{
-			hMonitor = MonitorFromWindow(hWndCenter, MONITOR_DEFAULTTONEAREST);
-		}
-		else
-		{
-			hMonitor = MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTONEAREST);
-		}
-
-		MONITORINFO minfo;
-		minfo.cbSize = sizeof(MONITORINFO);
-		BOOL bResult = ::GetMonitorInfo(hMonitor, &minfo);
-
-		rcArea = minfo.rcWork;
-
-		if (hWndCenter == nullptr)
-			rcCenter = rcArea;
-		else
-			GetWindowRect(hWndCenter, &rcCenter);
-	}
-	else
-	{
-		// center within parent client coordinates
-		GetClientRect(hWndParent, &rcArea);
-		GetClientRect(hWndCenter, &rcCenter);
-		MapWindowPoints(hWndCenter, hWndParent, (POINT*)&rcCenter, 2);
-	}
-
-	const int DlgWidth = rcDlg.right - rcDlg.left;
-	const int DlgHeight = rcDlg.bottom - rcDlg.top;
-
-	// find dialog's upper left based on rcCenter
-	int xLeft = (rcCenter.left + rcCenter.right) / 2 - DlgWidth / 2;
-	int yTop = (rcCenter.top + rcCenter.bottom) / 2 - DlgHeight / 2;
-
-	// if the dialog is outside the screen, move it inside
-	if (xLeft + DlgWidth > rcArea.right)
-		xLeft = rcArea.right - DlgWidth;
-	if (xLeft < rcArea.left)
-		xLeft = rcArea.left;
-
-	if (yTop + DlgHeight > rcArea.bottom)
-		yTop = rcArea.bottom - DlgHeight;
-	if (yTop < rcArea.top)
-		yTop = rcArea.top;
-
-	// map screen coordinates to child coordinates
-	return SetWindowPos(m_hWnd, nullptr, xLeft, yTop, -1, -1,
-	                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-static std::string window_text(const HWND h)
-{
-	const auto len = GetWindowTextLengthW(h);
-	if (len == 0) return {};
-	std::wstring wresult(len + 1, 0);
-	GetWindowTextW(h, wresult.data(), len + 1);
-	wresult.resize(len);
-	return pf::utf16_to_utf8(wresult);
-}
-
 // ── Platform API implementations ───────────────────────────────────────────
 
 // ── Key binding formatting ─────────────────────────────────────────────────────
@@ -1305,95 +1218,6 @@ pf::ipoint pf::platform_cursor_pos()
 	POINT pt;
 	GetCursorPos(&pt);
 	return {pt.x, pt.y};
-}
-
-// ── Timer ──────────────────────────────────────────────────────────────────────
-
-
-double pf::platform_get_time()
-{
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	return static_cast<double>(now.QuadPart - g_perfStart.QuadPart)
-		/ static_cast<double>(g_perfFreq.QuadPart);
-}
-
-void pf::platform_sleep(const int milliseconds)
-{
-	Sleep(static_cast<DWORD>(milliseconds));
-}
-
-// ── Resource Loading ───────────────────────────────────────────────────────────
-
-void* pf::platform_load_resource(const std::string_view name, const std::string_view type)
-{
-	const auto wname = utf8_to_utf16(name);
-	const auto wtype = utf8_to_utf16(type);
-	LPCWSTR resType = wtype.c_str();
-	if (type == "BITMAP"sv)
-		resType = RT_BITMAP;
-
-	const HRSRC hResInfo = FindResourceW(nullptr, wname.c_str(), resType);
-	if (!hResInfo) return nullptr;
-
-	const HGLOBAL hResData = LoadResource(nullptr, hResInfo);
-	if (!hResData) return nullptr;
-
-	return LockResource(hResData);
-}
-
-std::optional<pf::bitmap_data> pf::platform_load_bitmap_resource(const std::string_view resName)
-{
-	const auto pData = static_cast<const uint8_t*>(platform_load_resource(resName, "BITMAP"));
-	if (!pData) return std::nullopt;
-
-	const auto bih = reinterpret_cast<const BITMAPINFOHEADER*>(pData);
-	const int w = bih->biWidth;
-	const int h = abs(bih->biHeight);
-	const bool topDown = bih->biHeight < 0;
-	const int bpp = bih->biBitCount;
-
-	int paletteSize = 0;
-	if (bpp <= 8)
-		paletteSize = (bih->biClrUsed ? bih->biClrUsed : 1 << bpp) * static_cast<int>(sizeof(RGBQUAD));
-
-	const uint8_t* pixelData = pData + bih->biSize + paletteSize;
-	const RGBQUAD* palette = bpp <= 8 ? reinterpret_cast<const RGBQUAD*>(pData + bih->biSize) : nullptr;
-
-	std::vector<uint32_t> pixels(w * h, 0);
-	const int srcStride = (w * bpp + 31) / 32 * 4;
-
-	for (int y = 0; y < h; y++)
-	{
-		const int srcY = topDown ? y : h - 1 - y;
-		const uint8_t* srcRow = pixelData + srcY * srcStride;
-
-		for (int x = 0; x < w; x++)
-		{
-			uint32_t c = 0;
-			if (bpp == 24)
-			{
-				c = xrgb(srcRow[x * 3 + 2], srcRow[x * 3 + 1], srcRow[x * 3 + 0]);
-			}
-			else if (bpp == 32)
-			{
-				c = *reinterpret_cast<const uint32_t*>(srcRow + x * 4) | 0xFF000000;
-			}
-			else if (bpp == 8 && palette)
-			{
-				const auto& p = palette[srcRow[x]];
-				c = xrgb(p.rgbRed, p.rgbGreen, p.rgbBlue);
-			}
-			else if (bpp == 4 && palette)
-			{
-				const uint8_t idx = x & 1 ? srcRow[x / 2] & 0x0F : srcRow[x / 2] >> 4;
-				c = xrgb(palette[idx].rgbRed, palette[idx].rgbGreen, palette[idx].rgbBlue);
-			}
-			pixels[y * w + x] = c;
-		}
-	}
-
-	return bitmap_data{w, h, pixels};
 }
 
 // ── Utility ────────────────────────────────────────────────────────────────────
@@ -1515,23 +1339,6 @@ void pf::platform_set_menu(std::vector<menu_command> menuDef)
 	build_runtime_accelerators();
 }
 
-
-bool pf::platform_events()
-{
-	MSG msg = {};
-	while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
-	{
-		if (msg.message == WM_QUIT)
-			return false;
-		if (!TranslateAccelerator(g_hWnd, g_hAccel, &msg))
-		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
-	}
-	return true;
-}
-
 // ── Message Loop ───────────────────────────────────────────────────────────────
 
 static CRITICAL_SECTION cs_async;
@@ -1624,9 +1431,6 @@ static void init_handles()
 	async_h = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 	exit_h = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 	ui_event_h = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-
-	QueryPerformanceFrequency(&g_perfFreq);
-	QueryPerformanceCounter(&g_perfStart);
 }
 
 int pf::platform_run()
@@ -1634,8 +1438,9 @@ int pf::platform_run()
 	MSG msg = {};
 	HANDLE hAsyncThread = CreateThread(nullptr, 0, async_thread_proc, nullptr, 0, nullptr);
 	int result = 0;
+	bool running = true;
 
-	for (;;)
+	while (running)
 	{
 		const HANDLE h[] = {ui_event_h, exit_h};
 		constexpr auto n = std::size(h);
@@ -1660,13 +1465,14 @@ int pf::platform_run()
 			break;
 		}
 
-		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+		while (running && PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
 		{
 			if (msg.message == WM_QUIT)
 			{
 				result = static_cast<int>(msg.wParam);
 				SetEvent(exit_h);
-				goto cleanup;
+				running = false;
+				break;
 			}
 
 			if (!TranslateAccelerator(g_hWnd, g_hAccel, &msg))
@@ -1676,10 +1482,10 @@ int pf::platform_run()
 			}
 		}
 
-		app_idle();
+		if (running)
+			app_idle();
 	}
 
-cleanup:
 	if (hAsyncThread)
 	{
 		SetEvent(exit_h);
@@ -1782,9 +1588,16 @@ std::vector<pf::file_path> pf::dropped_file_paths(const uintptr_t drop_handle)
 
 	for (UINT i = 0; i < count; ++i)
 	{
-		wchar_t buf[MAX_PATH] = {};
-		if (DragQueryFileW(hDrop, i, buf, MAX_PATH))
-			paths.emplace_back(utf16_to_utf8(buf));
+		// Paths can exceed MAX_PATH, so ask for the required length first
+		const auto len = DragQueryFileW(hDrop, i, nullptr, 0);
+		if (len == 0) continue;
+
+		std::wstring buf(len + 1, L'\0');
+		const auto copied = DragQueryFileW(hDrop, i, buf.data(), len + 1);
+		if (copied == 0) continue;
+
+		buf.resize(copied);
+		paths.emplace_back(utf16_to_utf8(buf));
 	}
 
 	DragFinish(hDrop);
@@ -1828,6 +1641,12 @@ bool pf::platform_text_to_clipboard(const std::string_view text)
 		if (hData)
 		{
 			const auto pszData = static_cast<wchar_t*>(GlobalLock(hData));
+			if (!pszData)
+			{
+				GlobalFree(hData);
+				CloseClipboard();
+				return false;
+			}
 			wcsncpy_s(pszData, len, wtext.c_str(), wtext.size());
 			GlobalUnlock(hData);
 			success = SetClipboardData(CF_UNICODETEXT, hData) != nullptr;
@@ -1843,49 +1662,168 @@ bool pf::platform_text_to_clipboard(const std::string_view text)
 
 // ── Configuration (INI file) ───────────────────────────────────────────────────
 
-static pf::file_path get_config_path()
+// Probes writability without leaving anything behind (delete-on-close)
+static bool is_folder_writable(const pf::file_path& folder)
 {
-	// Try next to the exe first
-	wchar_t w_exe_path[MAX_PATH];
-	GetModuleFileNameW(nullptr, w_exe_path, MAX_PATH);
-	const auto exe_path = pf::utf16_to_utf8(w_exe_path);
-	auto ini_path = pf::file_path(pf::file_path(exe_path).folder()).combine("noterad", "ini");
+	const auto probe = folder.combine(std::format("noterad_{:08x}.tmp", GetCurrentProcessId()));
+	const auto h = CreateFileW(pf::utf8_to_utf16(probe.view()).c_str(), GENERIC_WRITE, 0, nullptr,
+	                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return false;
+	CloseHandle(h);
+	return true;
+}
 
-	// Test if we can write to the exe directory
-	const auto h = CreateFileW(pf::utf8_to_utf16(ini_path.view()).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-	                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (h != INVALID_HANDLE_VALUE)
+static pf::file_path local_app_data_folder()
+{
+	PWSTR raw_path = nullptr;
+	if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &raw_path)) || !raw_path)
 	{
-		CloseHandle(h);
-		return ini_path;
+		if (raw_path) CoTaskMemFree(raw_path);
+		return {};
 	}
+	const auto result = pf::file_path{pf::utf16_to_utf8(raw_path)}.combine("Noterad");
+	CoTaskMemFree(raw_path);
+	CreateDirectoryW(pf::utf8_to_utf16(result.view()).c_str(), nullptr);
+	return result;
+}
 
-	// Fall back to AppData\Local
-	return tmp_folder().combine("noterad", "ini");
+// Folder holding the INI file and the custom spell dictionary
+static const pf::file_path& config_folder()
+{
+	static const pf::file_path folder = []
+	{
+		const auto exe_folder = pf::file_path::module_folder();
+
+		// Prefer a portable install next to the exe when that folder is writable
+		if (!exe_folder.empty() &&
+			(exe_folder.combine("noterad", "ini").exists() || is_folder_writable(exe_folder)))
+			return exe_folder;
+
+		const auto app_data = local_app_data_folder();
+		return app_data.empty() ? exe_folder : app_data;
+	}();
+	return folder;
+}
+
+static const std::wstring& config_path()
+{
+	static const std::wstring path = pf::utf8_to_utf16(config_folder().combine("noterad", "ini").view());
+	return path;
+}
+
+// Pending writes are buffered so that shutdown rewrites each INI section once
+// instead of re-parsing the whole file for every key.
+namespace
+{
+	class config_cache
+	{
+		std::map<std::string, std::map<std::string, std::string, pf::iless>, pf::iless> _pending;
+
+	public:
+		~config_cache() { flush(); }
+
+		void set(const std::string_view section, const std::string_view key, const std::string_view value)
+		{
+			_pending[std::string(section)][std::string(key)] = std::string(value);
+		}
+
+		// Returns the buffered value if this key has not yet been flushed
+		const std::string* find(const std::string_view section, const std::string_view key) const
+		{
+			const auto s = _pending.find(std::string(section));
+			if (s == _pending.end()) return nullptr;
+			const auto k = s->second.find(std::string(key));
+			if (k == s->second.end()) return nullptr;
+			return &k->second;
+		}
+
+		void flush()
+		{
+			if (_pending.empty()) return;
+
+			const auto& path = config_path();
+			auto pending = std::move(_pending);
+			_pending.clear();
+
+			for (const auto& [section, keys] : pending)
+			{
+				const auto wsection = pf::utf8_to_utf16(section);
+
+				// Merge into the existing section so unmanaged keys survive
+				std::vector<wchar_t> existing(8192);
+				auto len = GetPrivateProfileSectionW(wsection.c_str(), existing.data(),
+				                                     static_cast<DWORD>(existing.size()), path.c_str());
+				while (static_cast<size_t>(len) == existing.size() - 2 && existing.size() < 0x40000)
+				{
+					existing.resize(existing.size() * 2);
+					len = GetPrivateProfileSectionW(wsection.c_str(), existing.data(),
+					                                static_cast<DWORD>(existing.size()), path.c_str());
+				}
+
+				std::vector<std::wstring> entries;
+				for (const wchar_t* p = existing.data(); *p; p += wcslen(p) + 1)
+				{
+					const std::wstring_view entry(p);
+					const auto eq = entry.find(L'=');
+					const auto name = eq == std::wstring_view::npos ? entry : entry.substr(0, eq);
+					if (keys.contains(pf::utf16_to_utf8(name)))
+						continue; // superseded below
+					entries.emplace_back(entry);
+				}
+
+				for (const auto& [key, value] : keys)
+					entries.push_back(pf::utf8_to_utf16(key) + L'=' + pf::utf8_to_utf16(value));
+
+				std::wstring buffer;
+				for (const auto& e : entries)
+				{
+					buffer += e;
+					buffer.push_back(L'\0');
+				}
+				buffer.push_back(L'\0');
+
+				if (!WritePrivateProfileSectionW(wsection.c_str(), buffer.c_str(), path.c_str()))
+					pf::debug_trace(std::format("config: failed to write section [{}]\n", section));
+			}
+
+			// Discard the cached INI image so the writes reach disk
+			if (!WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str()))
+				pf::debug_trace("config: failed to flush the INI cache\n");
+		}
+	};
+
+	config_cache& config_state()
+	{
+		config_path(); // constructed first so it outlives the cache that flushes into it
+		static config_cache state;
+		return state;
+	}
 }
 
 std::string pf::config_read(const std::string_view section, const std::string_view key,
                             const std::string_view default_value)
 {
-	static const auto ini_path = get_config_path();
+	if (const auto* pending = config_state().find(section, key))
+		return *pending;
+
 	wchar_t buf[4096];
 	const auto len = GetPrivateProfileStringW(
 		utf8_to_utf16(section).c_str(),
 		utf8_to_utf16(key).c_str(),
 		utf8_to_utf16(default_value).c_str(),
 		buf, _countof(buf),
-		utf8_to_utf16(ini_path.view()).c_str());
+		config_path().c_str());
 	return utf16_to_utf8(std::wstring_view(buf, len));
 }
 
 void pf::config_write(const std::string_view section, const std::string_view key, const std::string_view value)
 {
-	static const auto ini_path = get_config_path();
-	WritePrivateProfileStringW(
-		utf8_to_utf16(section).c_str(),
-		utf8_to_utf16(key).c_str(),
-		utf8_to_utf16(value).c_str(),
-		utf8_to_utf16(ini_path.view()).c_str());
+	config_state().set(section, key, value);
+}
+
+void pf::config_flush()
+{
+	config_state().flush();
 }
 
 bool pf::is_directory(const file_path& path)
@@ -1904,33 +1842,37 @@ pf::file_path pf::current_directory()
 
 static constexpr wchar_t default_filter[] = L"All Files (*.*)\0*.*\0Text Files (*.txt)\0*.txt\0\0";
 
+// GetOpenFileName/GetSaveFileName silently fail if the buffer cannot hold the result
+static constexpr size_t file_dialog_buffer_size = 32768;
+
 pf::file_path pf::open_file_path(const std::string_view title, const std::string_view filters)
 {
-	wchar_t szFile[MAX_PATH] = {};
+	std::wstring szFile(file_dialog_buffer_size, L'\0');
 	const auto wtitle = utf8_to_utf16(title);
 	const auto wfilters = utf8_to_utf16(filters);
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = g_hWnd;
-	ofn.lpstrFile = szFile;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrFile = szFile.data();
+	ofn.nMaxFile = static_cast<DWORD>(szFile.size());
 	ofn.lpstrTitle = wtitle.c_str();
 	ofn.lpstrFilter = filters.empty() ? default_filter : wfilters.c_str();
 	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 
 	if (GetOpenFileNameW(&ofn))
-		return file_path{utf16_to_utf8(szFile)};
+		return file_path{utf16_to_utf8(szFile.c_str())};
 	return {};
 }
 
 pf::file_path pf::save_file_path(const std::string_view title, const file_path& default_path,
                                  const std::string_view filters)
 {
-	wchar_t szFile[MAX_PATH] = {};
+	std::wstring szFile(file_dialog_buffer_size, L'\0');
 	if (!default_path.empty())
 	{
 		const auto wpath = utf8_to_utf16(default_path.view());
-		wcsncpy_s(szFile, wpath.c_str(), MAX_PATH - 1);
+		if (wpath.size() < szFile.size())
+			std::copy(wpath.begin(), wpath.end(), szFile.begin());
 	}
 
 	const auto wtitle = utf8_to_utf16(title);
@@ -1938,14 +1880,14 @@ pf::file_path pf::save_file_path(const std::string_view title, const file_path& 
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = g_hWnd;
-	ofn.lpstrFile = szFile;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrFile = szFile.data();
+	ofn.nMaxFile = static_cast<DWORD>(szFile.size());
 	ofn.lpstrTitle = wtitle.c_str();
 	ofn.lpstrFilter = filters.empty() ? default_filter : wfilters.c_str();
 	ofn.Flags = OFN_OVERWRITEPROMPT;
 
 	if (GetSaveFileNameW(&ofn))
-		return file_path{utf16_to_utf8(szFile)};
+		return file_path{utf16_to_utf8(szFile.c_str())};
 	return {};
 }
 
@@ -2044,7 +1986,7 @@ public:
 		if (_diagnostics.empty())
 			_diagnostics = "Spell checker initialized.";
 
-		_custom_dic_path = tmp_folder().combine("noterad.dic").view();
+		_custom_dic_path = config_folder().combine("noterad.dic").view();
 
 		// Load custom dictionary words
 		std::ifstream f(pf::utf8_to_utf16(_custom_dic_path));
@@ -2280,37 +2222,23 @@ INT WINAPI WinMain(const HINSTANCE hInstance, HINSTANCE, LPSTR, const int nCmdSh
 	if (g_hMenu)
 		SetMenu(g_hWnd, g_hMenu);
 
-	ShowWindow(g_hWnd, g_nCmdShow);
+	// A placement restored during WM_CREATE must not be undone by nCmdShow
+	if (app_statedow->placement_applied())
+		ShowWindow(g_hWnd, app_statedow->placement_maximized() ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+	else
+		ShowWindow(g_hWnd, g_nCmdShow);
+
 	UpdateWindow(g_hWnd);
 
 	const int result = pf::platform_run();
 
+	// The window holds a strong reference to the reactor; drop it so the app
+	// state and its documents are released before COM shuts down.
+	app_statedow->set_reactor(nullptr);
+	app_destroy();
+
 	CoUninitialize();
 	return result;
-}
-
-
-// allow for different calling conventions in Linux and Windows
-#ifdef _WIN32
-#define STDCALL __stdcall
-#else
-#define STDCALL
-#endif
-
-
-// Error handler for the Artistic Style formatter.
-void STDCALL ASErrorHandler(const int errorNumber, const char* errorMessage)
-{
-	std::cout << "astyle error " << errorNumber << "\n"
-		<< errorMessage << std::endl;
-}
-
-// Allocate memory for the Artistic Style formatter.
-char* STDCALL ASMemoryAlloc(const unsigned long memoryNeeded)
-{
-	// error condition is checked after return from AStyleMain
-	const auto buffer = new(std::nothrow) char[memoryNeeded];
-	return buffer;
 }
 
 
@@ -2391,35 +2319,40 @@ pf::folder_contents pf::iterate_file_items(const file_path& folder, const bool s
 	results.files.reserve(64);
 	results.folders.reserve(16);
 
-	if (files != INVALID_HANDLE_VALUE)
+	if (files == INVALID_HANDLE_VALUE)
 	{
-		do
+		// Cannot be reported through folder_contents — an unreadable folder looks empty
+		debug_trace(std::format("iterate_file_items: FindFirstFileEx('{}') failed with {}\n",
+		                        folder.view(), GetLastError()));
+		return results;
+	}
+
+	do
+	{
+		if (is_folder(fd.dwFileAttributes))
 		{
-			if (is_folder(fd.dwFileAttributes))
+			if (can_show_folder(fd.cFileName, fd.dwFileAttributes, show_hidden))
 			{
-				if (can_show_folder(fd.cFileName, fd.dwFileAttributes, show_hidden))
-				{
-					folder_info i;
-					i.path = folder.combine(utf16_to_utf8(fd.cFileName));
-					populate_file_attributes(i.attributes, fd);
-					results.folders.emplace_back(i);
-				}
-			}
-			else
-			{
-				if (can_show_file(fd.cFileName, fd.dwFileAttributes, show_hidden))
-				{
-					file_info i;
-					i.path = folder.combine(utf16_to_utf8(fd.cFileName));
-					populate_file_attributes(i.attributes, fd);
-					results.files.emplace_back(i);
-				}
+				folder_info i;
+				i.path = folder.combine(utf16_to_utf8(fd.cFileName));
+				populate_file_attributes(i.attributes, fd);
+				results.folders.emplace_back(i);
 			}
 		}
-		while (FindNextFile(files, &fd) != 0);
-
-		FindClose(files);
+		else
+		{
+			if (can_show_file(fd.cFileName, fd.dwFileAttributes, show_hidden))
+			{
+				file_info i;
+				i.path = folder.combine(utf16_to_utf8(fd.cFileName));
+				populate_file_attributes(i.attributes, fd);
+				results.files.emplace_back(i);
+			}
+		}
 	}
+	while (FindNextFile(files, &fd) != 0);
+
+	FindClose(files);
 
 	return results;
 }
@@ -2432,98 +2365,6 @@ uint64_t pf::file_modified_time(const file_path& path)
 	return 0;
 }
 
-
-std::u32string pf::utf8_to_u32(const std::string_view str)
-{
-	std::u32string result;
-	result.reserve(str.size());
-
-	const auto u8 = utf8_cast(str);
-	auto it = u8.begin();
-	while (it < u8.end())
-	{
-		result.push_back(pop_utf8_char(it, u8.end()));
-	}
-	return result;
-}
-
-std::string pf::u32_to_utf8(const std::u32string_view str)
-{
-	std::string result;
-	result.reserve(str.size());
-
-	for (const auto cp : str)
-	{
-		if (cp < 0x80)
-		{
-			result.push_back(static_cast<char>(cp));
-		}
-		else if (cp < 0x800)
-		{
-			result.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-			result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-		}
-		else if (cp < 0x10000)
-		{
-			result.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-			result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-		}
-		else
-		{
-			result.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-			result.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-		}
-	}
-	return result;
-}
-
-std::wstring pf::u32_to_wstr(const std::u32string_view str)
-{
-	std::wstring result;
-	result.reserve(str.size());
-
-	for (const auto cp : str)
-	{
-		if (cp <= 0xFFFF)
-		{
-			result.push_back(static_cast<wchar_t>(cp));
-		}
-		else
-		{
-			const auto adj = cp - 0x10000;
-			result.push_back(static_cast<wchar_t>(0xD800 + (adj >> 10)));
-			result.push_back(static_cast<wchar_t>(0xDC00 + (adj & 0x3FF)));
-		}
-	}
-	return result;
-}
-
-std::u32string pf::wstr_to_u32(const std::wstring_view ws)
-{
-	std::u32string result;
-	result.reserve(ws.size());
-
-	for (size_t i = 0; i < ws.size(); ++i)
-	{
-		const auto ch = static_cast<uint32_t>(ws[i]);
-
-		if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < ws.size())
-		{
-			const auto lo = static_cast<uint32_t>(ws[i + 1]);
-			if (lo >= 0xDC00 && lo <= 0xDFFF)
-			{
-				result.push_back(0x10000 + ((ch - 0xD800) << 10) + (lo - 0xDC00));
-				++i;
-				continue;
-			}
-		}
-		result.push_back(static_cast<char32_t>(ch));
-	}
-	return result;
-}
 
 static constexpr uint32_t FNV_PRIME_32 = 16777619u;
 static constexpr uint32_t OFFSET_BASIS_32 = 2166136261u;
@@ -2554,397 +2395,6 @@ uint64_t pf::fnv1a_i_64(std::string_view sv1)
 	{
 		result ^= to_lower(pop_utf8_char(p, sv1.end()));
 		result *= FNV_PRIME_64;
-	}
-
-	return result;
-}
-
-
-static_assert(std::is_move_constructible_v<pf::web_request>);
-static_assert(std::is_move_constructible_v<pf::web_response>);
-
-bool pf::is_online()
-{
-	DWORD flags;
-	return 0 != InternetGetConnectedState(&flags, 0);
-}
-
-std::string pf::url_encode(const std::string_view input)
-{
-	static constexpr auto hex_chars = "0123456789ABCDEF";
-	std::string result;
-	result.reserve(input.size());
-
-	for (const auto c : input)
-	{
-		if ((c >= u8'A' && c <= u8'Z') || (c >= u8'a' && c <= u8'z') ||
-			(c >= u8'0' && c <= u8'9') || c == u8'-' || c == u8'_' || c == u8'.' || c == u8'~')
-		{
-			result += c;
-		}
-		else
-		{
-			const auto byte = static_cast<uint8_t>(c);
-			result += u8'%';
-			result += hex_chars[byte >> 4];
-			result += hex_chars[byte & 0x0F];
-		}
-	}
-
-	return result;
-}
-
-static int get_status_code(const HINTERNET h)
-{
-	DWORD result = 0;
-	DWORD result_size = sizeof(result);
-	if (!HttpQueryInfo(h, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &result, &result_size, nullptr))
-	{
-		return 0; // Return 0 if query fails
-	}
-	return static_cast<int>(result);
-}
-
-static std::string get_content_type(const HINTERNET request_handle)
-{
-	std::string result;
-	DWORD result_size = 0;
-	DWORD header_index = 0;
-
-	// First call to get the required buffer size
-	HttpQueryInfoA(request_handle, HTTP_QUERY_CONTENT_TYPE, nullptr, &result_size, &header_index);
-
-	if (result_size > 0)
-	{
-		result.resize(result_size);
-		header_index = 0; // Reset header index
-
-		if (HttpQueryInfoA(request_handle, HTTP_QUERY_CONTENT_TYPE, result.data(), &result_size, &header_index))
-		{
-			// result_size now contains the actual string length (excluding null terminator)
-			if (result_size > 0 && result_size <= result.size())
-			{
-				result.resize(result_size);
-			}
-			else
-			{
-				result.clear();
-			}
-		}
-		else
-		{
-			result.clear();
-		}
-	}
-
-	return result;
-}
-
-static std::string format_path(const pf::web_request& req)
-{
-	auto result = req.path;
-
-	if (!req.query.empty())
-	{
-		bool is_first = true;
-		result += "?";
-
-		for (const auto& qp : req.query)
-		{
-			if (!is_first)
-			{
-				result += "&";
-			}
-
-			result += pf::url_encode(qp.first);
-			result += "=";
-			result += pf::url_encode(qp.second);
-			is_first = false;
-		}
-	}
-
-	return result;
-}
-
-// RAII wrapper for WinInet handles
-class inet_handle
-{
-	HINTERNET _h;
-
-public:
-	explicit inet_handle(const HINTERNET handle = nullptr) : _h(handle)
-	{
-	}
-
-	~inet_handle()
-	{
-		if (_h)
-		{
-			InternetCloseHandle(_h);
-		}
-	}
-
-	HINTERNET detach()
-	{
-		const auto handle = _h;
-		_h = nullptr;
-		return handle;
-	}
-
-	// No copy constructor/assignment
-	inet_handle(const inet_handle&) = delete;
-	inet_handle& operator=(const inet_handle&) = delete;
-
-	// Move constructor/assignment
-	inet_handle(inet_handle&& other) noexcept : _h(other._h)
-	{
-		other._h = nullptr;
-	}
-
-	inet_handle& operator=(inet_handle&& other) noexcept
-	{
-		if (this != &other)
-		{
-			if (_h)
-			{
-				InternetCloseHandle(_h);
-			}
-			_h = other._h;
-			other._h = nullptr;
-		}
-		return *this;
-	}
-
-	operator HINTERNET() const { return _h; }
-	HINTERNET get() const { return _h; }
-	bool is_valid() const { return _h != nullptr; }
-
-	void reset(const HINTERNET handle = nullptr)
-	{
-		if (_h)
-		{
-			InternetCloseHandle(_h);
-		}
-		_h = handle;
-	}
-};
-
-struct pf::web_host
-{
-	HINTERNET session_handle = nullptr;
-	HINTERNET connection_handle = nullptr;
-	bool secure = true;
-
-	~web_host()
-	{
-		if (connection_handle) InternetCloseHandle(connection_handle);
-		if (session_handle) InternetCloseHandle(session_handle);
-	}
-};
-
-pf::web_host_ptr pf::connect_to_host(const std::string_view host, const bool secure_in, const int port_in,
-                                     const std::string_view user_agent)
-{
-	// InternetOpen and InternetConnect
-	const std::wstring agent_str = user_agent.empty() ? utf8_to_utf16(g_app_name) : utf8_to_utf16(user_agent);
-	inet_handle session_handle(InternetOpenW(agent_str.c_str(), INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0));
-
-	if (!session_handle.is_valid())
-	{
-		return nullptr; // Return empty response on failure
-	}
-
-	const auto hostW = utf8_to_utf16(host);
-	const auto port = port_in == 0
-		                  ? (secure_in ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT)
-		                  : port_in;
-	inet_handle conn(::InternetConnect(session_handle, hostW.c_str(), port, nullptr, nullptr,
-	                                   INTERNET_SERVICE_HTTP, 0, 0));
-
-	if (!conn.is_valid())
-	{
-		return nullptr; // Return empty response on failure
-	}
-
-	return std::make_shared<web_host>(web_host{session_handle.detach(), conn.detach(), secure_in});
-}
-
-pf::web_response pf::send_request(const web_host_ptr& host, const web_request& req)
-{
-	web_response result;
-
-	if (!host)
-		return result;
-
-	std::string content;
-	std::string header_str;
-
-	for (const auto& h : req.headers)
-	{
-		header_str += h.first;
-		header_str += ": ";
-		header_str += h.second;
-		header_str += "\r\n";
-	}
-
-	if (!req.body.empty())
-	{
-		content = req.body;
-	}
-	else if (!req.form_data.empty())
-	{
-		constexpr std::string_view boundary = "54B8723DE6044695A68C838E8BF0CB00";
-
-		for (const auto& f : req.form_data)
-		{
-			content += "--";
-			content += boundary;
-			content += "\r\n";
-			content += "Content-Disposition: form-data; name=\"";
-			content += f.first;
-			content += "\"\r\n";
-			content += "Content-Type: text/plain; charset=\"utf-8\"\r\n";
-			content += "\r\n";
-			content += f.second;
-			content += "\r\n";
-		}
-
-		if (!req.upload_file_path.empty() && !req.file_form_data_name.empty())
-		{
-			std::string ct = "application/octet-stream";
-			if (req.upload_file_path.extension() == ".zip") ct = "application/x-zip-compressed";
-
-			content += "--";
-			content += boundary;
-			content += "\r\n";
-			content += "Content-Disposition: form-data; name=\"";
-			content += req.file_form_data_name;
-			content += "\"; filename=\"";
-			content += req.file_name;
-			content += "\"\r\n";
-			content += "Content-Type: ";
-			content += ct;
-			content += "\r\n\r\n";
-
-			auto fh = open_for_read(req.upload_file_path);
-			if (fh)
-			{
-				std::vector<uint8_t> buf(65536);
-				uint32_t bytes_read = 0;
-				while (fh->read(buf.data(), static_cast<uint32_t>(buf.size()), &bytes_read) && bytes_read > 0)
-				{
-					content.append(reinterpret_cast<const char*>(buf.data()), bytes_read);
-				}
-			}
-
-			content += "\r\n";
-		}
-
-		content += "--";
-		content += boundary;
-		content += "--";
-		header_str += "Content-Type: multipart/form-data; boundary=";
-		header_str += boundary;
-		header_str += "\r\n";
-	}
-
-	const auto wverb = req.verb == web_request_verb::GET ? L"GET" : L"POST";
-	const auto wpath = utf8_to_utf16(format_path(req));
-	auto flags = INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_AUTH |
-		INTERNET_FLAG_RELOAD;
-	if (host->secure) flags |= INTERNET_FLAG_SECURE;
-
-	inet_handle request_handle(HttpOpenRequest(host->connection_handle, wverb, wpath.c_str(), nullptr, nullptr, nullptr,
-	                                           flags, 0));
-
-	if (!request_handle.is_valid())
-	{
-		return result;
-	}
-
-	const auto headerW = utf8_to_utf16(header_str);
-
-	if (content.empty())
-	{
-		// Simple request with no body — use HttpSendRequest which handles redirects properly
-		if (!HttpSendRequest(request_handle, headerW.c_str(), static_cast<DWORD>(headerW.size()), nullptr, 0))
-		{
-			return result;
-		}
-	}
-	else
-	{
-		// Request with body — use HttpSendRequestEx for chunked sending
-		INTERNET_BUFFERS buffers = {};
-		buffers.dwStructSize = sizeof(INTERNET_BUFFERS);
-		buffers.lpcszHeader = headerW.c_str();
-		buffers.dwHeadersTotal = buffers.dwHeadersLength = static_cast<DWORD>(headerW.size());
-		buffers.dwBufferTotal = static_cast<DWORD>(content.size());
-
-		if (!HttpSendRequestEx(request_handle, &buffers, nullptr, 0, 0))
-		{
-			return result;
-		}
-
-		constexpr size_t chunk_size = 8192;
-		size_t total_written = 0;
-
-		while (total_written < content.size())
-		{
-			const auto remaining = content.size() - total_written;
-			const auto to_write = std::min(chunk_size, remaining);
-			DWORD written = 0;
-
-			if (!InternetWriteFile(request_handle, content.data() + total_written, static_cast<DWORD>(to_write),
-			                       &written))
-			{
-				return result;
-			}
-
-			if (written == 0)
-			{
-				return result;
-			}
-
-			total_written += written;
-		}
-
-		if (!::HttpEndRequest(request_handle, nullptr, 0, 0))
-		{
-			return result;
-		}
-	}
-
-	result.status_code = get_status_code(request_handle);
-	result.content_type = get_content_type(request_handle);
-
-	if (!req.download_file_path.empty())
-	{
-		const auto download_file = open_file_for_write(req.download_file_path);
-
-		if (download_file)
-		{
-			uint8_t buffer[8192];
-			DWORD read = 0;
-
-			while (InternetReadFile(request_handle, buffer, sizeof(buffer), &read) && read > 0)
-			{
-				if (download_file->write(buffer, read) != read)
-				{
-					break;
-				}
-			}
-		}
-	}
-	else
-	{
-		uint8_t buffer[8192];
-		DWORD read = 0;
-
-		while (InternetReadFile(request_handle, buffer, sizeof(buffer), &read) && read > 0)
-		{
-			result.body.append(buffer, buffer + read);
-		}
 	}
 
 	return result;

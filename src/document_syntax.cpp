@@ -208,6 +208,7 @@ static constexpr int COOKIE_CHAR = 0x0010;
 
 static constexpr int max_syntax_blocks = 8192;
 
+// Highlighter contract: every highlight_* function resets nActualItems to 0 and then fills pBuf.
 static void add_block(text_block* pBuf, int& nActualItems, const int pos, const style colorindex)
 {
 	if (pBuf != nullptr)
@@ -227,6 +228,8 @@ static void add_block(text_block* pBuf, int& nActualItems, const int pos, const 
 uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
                        int& nActualItems)
 {
+	nActualItems = 0;
+
 	if (line_view.empty())
 	{
 		return dwCookie & COOKIE_EXT_COMMENT;
@@ -428,6 +431,8 @@ uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text
 uint32_t highlight_text(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
                         int& nActualItems)
 {
+	nActualItems = 0;
+
 	if (pBuf)
 	{
 		const auto len = static_cast<int>(line_view.size());
@@ -648,9 +653,9 @@ uint32_t highlight_markdown(uint32_t dwCookie, const std::string_view line_view,
 uint32_t highlight_rust(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
                         int& nActualItems)
 {
+	nActualItems = 0;
 	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
 	const auto len = static_cast<int>(line_view.size());
-	auto bFirstChar = (dwCookie & ~COOKIE_EXT_COMMENT) == 0;
 	auto bRedefineBlock = true;
 	auto bDecIndex = false;
 	auto block_start = -1;
@@ -749,7 +754,6 @@ uint32_t highlight_rust(uint32_t dwCookie, const std::string_view line_view, tex
 			continue;
 		}
 		// Rust uses # for attributes, not preprocessor
-		if (!is_space32(c)) bFirstChar = false;
 		if (pBuf == nullptr) continue;
 		if (is_alnum32(c) || c == '_' || c == '.') { if (block_start == -1) block_start = i; }
 		else
@@ -786,9 +790,9 @@ uint32_t highlight_rust(uint32_t dwCookie, const std::string_view line_view, tex
 uint32_t highlight_python(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
                           int& nActualItems)
 {
+	nActualItems = 0;
 	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
 	const auto len = static_cast<int>(line_view.size());
-	auto bFirstChar = (dwCookie & ~COOKIE_EXT_COMMENT) == 0;
 	auto bRedefineBlock = true;
 	auto bDecIndex = false;
 	auto block_start = -1;
@@ -897,9 +901,9 @@ uint32_t highlight_python(uint32_t dwCookie, const std::string_view line_view, t
 uint32_t highlight_ps1(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
                        int& nActualItems)
 {
+	nActualItems = 0;
 	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
 	const auto len = static_cast<int>(line_view.size());
-	auto bFirstChar = (dwCookie & ~COOKIE_EXT_COMMENT) == 0;
 	auto bRedefineBlock = true;
 	auto bDecIndex = false;
 	auto block_start = -1;

@@ -11,8 +11,10 @@ class file_list_view final : public list_view
 	edit_box_widget _rename_input;
 	list_view_item_ptr _renaming_item;
 
-	bool is_renaming() const { return _renaming_item != nullptr; }
+public:
+	[[nodiscard]] bool is_renaming() const { return _renaming_item != nullptr; }
 
+private:
 	void begin_rename(const pf::window_frame_ptr& window, const list_view_item_ptr& item)
 	{
 		if (!item || !item->source || item->is_group)
@@ -110,10 +112,6 @@ protected:
 			return 0;
 		}
 
-		if (_selected_item && _events.invoke_menu_accelerator(window, build_context_menu_items(window, _selected_item),
-		                                                      vk))
-			return 0;
-
 		if (vk == pk::F2)
 		{
 			if (_selected_item && !_selected_item->is_group)
@@ -155,15 +153,14 @@ protected:
 		}
 	}
 
-	uint32_t on_char(pf::window_frame_ptr& window, const char ch) override
+	uint32_t on_char(pf::window_frame_ptr& window, const char32_t ch) override
 	{
 		if (is_renaming())
 		{
-			if (ch == u8'\r' || ch == u8'\n')
+			if (ch == U'\r' || ch == U'\n')
 				return 0; // handled by on_key_down
 			_rename_input.on_char(window, ch);
 			window->invalidate();
-			return 0;
 		}
 		return 0;
 	}
@@ -181,6 +178,8 @@ protected:
 			cancel_rename(window);
 		list_view::update_focus(window);
 	}
+
+	edit_box_widget* active_edit_box() override { return is_renaming() ? &_rename_input : nullptr; }
 
 public:
 	file_list_view(app_events& events) : list_view(events)
@@ -228,7 +227,7 @@ public:
 		{
 			const auto bounds = _renaming_item->bounds.offset(0, -_scroll_offset.y);
 
-			const auto styles = _events.styles();
+			const auto& styles = _events.styles();
 			const auto indent = styles.padding_x + _renaming_item->depth * styles.indent + 4;
 			auto edit_rect = bounds;
 			edit_rect.left += indent;
@@ -374,7 +373,7 @@ public:
 			map_index_items_recursive(existing, root);
 		}
 
-		_path_to_item = existing;
+		_path_to_item = std::move(existing);
 
 		std::vector<list_view_item_ptr> items;
 		if (root)

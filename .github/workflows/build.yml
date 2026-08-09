@@ -27,7 +27,7 @@ jobs:
       - name: Run unit tests
         shell: pwsh
         run: |
-          & .\exe\noterad64d.exe /test
+          & .\exe\noterad-64d.exe /test
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

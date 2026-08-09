@@ -30,6 +30,8 @@ struct search_result
 	int text_match_length = 0;
 };
 
+constexpr int max_search_results = 5000;
+
 struct create_path_result
 {
 	bool created = false;
@@ -49,6 +51,9 @@ struct index_item
 	document_ptr doc;
 	std::vector<index_item_ptr> children;
 	std::vector<search_result> search_results;
+
+	// Bumped by each async load so a stale read can be discarded when it completes
+	uint32_t load_generation = 0;
 
 	index_item() = default;
 
@@ -171,7 +176,10 @@ public:
 	virtual ~document_events() = default;
 
 	virtual void invalidate(uint32_t i) = 0;
+	// Repaint only — the text of these lines is unchanged
 	virtual void invalidate_lines(int start, int end) = 0;
+	// The text of these lines changed, so layout and highlighting must be redone
+	virtual void lines_changed(int start, int end) = 0;
 	virtual void ensure_visible(const text_location& pt) = 0;
 };
 
@@ -208,7 +216,7 @@ public:
 	virtual std::string_view message_bar_text() const = 0;
 	virtual index_item_ptr root_item() const = 0;
 	virtual index_item_ptr active_item() const = 0;
-	virtual view_styles styles() const = 0;
+	virtual const view_styles& styles() const = 0;
 
 	virtual void set_focus(view_focus v) = 0;
 	virtual void set_mode(view_mode m) = 0;
@@ -225,9 +233,6 @@ public:
 	                                           std::function<bool()> is_enabled_override = nullptr,
 	                                           std::function<bool()> is_checked_override = nullptr,
 	                                           std::string text_override = {}) const = 0;
-	virtual bool invoke_menu_accelerator(const pf::window_frame_ptr& window,
-	                                     const std::vector<pf::menu_command>& items,
-	                                     unsigned int vk) const = 0;
 
 	virtual pf::file_path save_folder() const = 0;
 	virtual void copy_files_to_folder(const std::vector<pf::file_path>& sources, const pf::file_path& dest_folder) = 0;

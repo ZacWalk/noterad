@@ -277,6 +277,7 @@
     <ClInclude Include="view_list_search.h" />
     <ClInclude Include="view_doc_edit.h" />
     <ClInclude Include="view_doc_markdown.h" />
+    <ClInclude Include="view_doc_readonly.h" />
     <ClInclude Include="view_doc_hex.h" />
     <ClInclude Include="view_doc_csv.h" />
     <ClInclude Include="app_state.h" />

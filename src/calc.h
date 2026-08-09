@@ -139,16 +139,17 @@ private:
 			return 0.0;
 		}
 
-		try
-		{
-			const auto raw = _text.substr(start, _pos - start);
-			const std::string temp((raw.data()), raw.size());
-			return std::stod(temp);
-		}
-		catch (...)
+		const auto raw = _text.substr(start, _pos - start);
+		double value = 0.0;
+		const auto* const raw_end = raw.data() + raw.size();
+		const auto [ptr, ec] = std::from_chars(raw.data(), raw_end, value);
+
+		if (ec != std::errc{} || ptr != raw_end)
 		{
 			_error = "Invalid number.";
 			return 0.0;
 		}
+
+		return value;
 	}
 };

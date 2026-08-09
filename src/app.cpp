@@ -94,7 +94,9 @@ static std::string make_about_text(const commands& cmds)
 		if (cmd.accel.empty())
 			continue;
 
-		const auto key_text = pf::format_key_binding(cmd.accel);
+		auto key_text = pf::format_key_binding(cmd.accel);
+		if (!cmd.accel_alt.empty())
+			key_text += " or " + pf::format_key_binding(cmd.accel_alt);
 		text += std::format("- **{}** {}\n", key_text, cmd.description);
 	}
 
@@ -352,28 +354,39 @@ namespace
 		}
 	}
 
-	std::vector<search_result> search_file_results(const pf::file_path& path, const document_ptr& doc,
+	std::vector<search_result> search_file_results(const app_state::search_input& input,
 	                                               const std::string_view search_text)
 	{
 		if (search_text.empty())
 			return {};
-		if (is_binary_file(path))
+		if (is_binary_extension(input.path))
 			return {};
 
-		std::string line_text;
+		std::vector<search_result> results;
 
-		if (doc)
+		if (input.has_snapshot)
 		{
-			std::vector<search_result> results;
-			for (int line_number = 0; line_number < static_cast<int>(doc->size()); line_number++)
+			int line_number = 0;
+			for (const auto& line : input.lines)
 			{
-				(*doc)[line_number].render(line_text);
+				find_matches_in_line(results, line, line_number, search_text);
+				line_number++;
+			}
+			return results;
+		}
+
+		if (input.doc)
+		{
+			std::string line_text;
+			for (int line_number = 0; line_number < static_cast<int>(input.doc->size()); line_number++)
+			{
+				(*input.doc)[line_number].render(line_text);
 				find_matches_in_line(results, line_text, line_number, search_text);
 			}
 			return results;
 		}
 
-		const auto handle = pf::open_for_read(path);
+		const auto handle = pf::open_for_read(input.path);
 		if (!handle)
 			return {};
 
@@ -381,12 +394,13 @@ namespace
 		if (size > app_state::max_search_file_size || size == 0)
 			return {};
 
-		std::vector<search_result> results;
-
-		iterate_file_lines(handle, [&](const std::string& line, const int line_number)
+		const auto info = iterate_file_lines(handle, [&](const std::string& line, const int line_number)
 		{
 			find_matches_in_line(results, line, line_number, search_text);
 		});
+
+		if (info.enc == file_encoding::binary)
+			return {};
 
 		return results;
 	}
@@ -397,6 +411,58 @@ namespace
 		if (line_number >= 0)
 			text += std::format(":{}", line_number + 1);
 		return text;
+	}
+
+	bool is_reserved_device_name(const std::string_view name)
+	{
+		const auto stem = name.substr(0, name.find(u8'.'));
+
+		for (const std::string_view reserved : {"CON", "PRN", "AUX", "NUL"})
+			if (pf::icmp(stem, reserved) == 0)
+				return true;
+
+		return stem.size() == 4 && stem[3] >= u8'1' && stem[3] <= u8'9' &&
+			(pf::icmp(stem.substr(0, 3), "COM") == 0 || pf::icmp(stem.substr(0, 3), "LPT") == 0);
+	}
+
+	// Rejects anything that could escape the containing folder or is illegal on Windows
+	bool is_valid_item_name(const std::string_view name)
+	{
+		if (name.empty() || name.size() > 255)
+			return false;
+		if (name == "." || name == "..")
+			return false;
+		if (name.back() == u8'.' || name.back() == u8' ')
+			return false;
+
+		for (const auto c : name)
+		{
+			if (static_cast<unsigned char>(c) < 0x20)
+				return false;
+			if (c == u8'\\' || c == u8'/' || c == u8':' || c == u8'*' || c == u8'?' ||
+				c == u8'"' || c == u8'<' || c == u8'>' || c == u8'|')
+				return false;
+		}
+
+		return !is_reserved_device_name(name);
+	}
+
+	bool parse_int_value(const std::string_view text, int& out)
+	{
+		if (text.empty())
+			return false;
+		const auto end = text.data() + text.size();
+		const auto result = std::from_chars(text.data(), end, out);
+		return result.ec == std::errc{} && result.ptr == end;
+	}
+
+	bool parse_double_value(const std::string_view text, double& out)
+	{
+		if (text.empty())
+			return false;
+		const auto end = text.data() + text.size();
+		const auto result = std::from_chars(text.data(), end, out);
+		return result.ec == std::errc{} && result.ptr == end;
 	}
 }
 
@@ -417,9 +483,37 @@ void app_state::ensure_visible(const text_location& pt)
 	_doc_view->ensure_visible(_doc_window, pt);
 }
 
+void app_state::open_path_and_select(const index_item_ptr& item, const int line, const int col,
+                                     const int length)
+{
+	load_doc(item, [this, item, line, col, length]
+	{
+		const auto& d = item->doc;
+		if (!d || active_item() != item || line < 0 || line >= static_cast<int>(d->size()))
+			return;
+
+		const auto line_len = static_cast<int>((*d)[line].size());
+		const auto start = std::clamp(col, 0, line_len);
+		const auto end = std::clamp(col + length, start, line_len);
+
+		// Scrolling to the match needs metrics for the document just loaded, not the one it replaced
+		_doc_view->layout();
+		_doc_view->recalc_vert_scrollbar();
+
+		d->select(text_selection(start, line, end, line));
+		ensure_visible(text_location(end, line)); // select() is a no-op when re-opening the same match
+		invalidate(invalid::doc | invalid::doc_caret);
+	});
+}
+
 void app_state::invalidate_lines(const int start, const int end)
 {
 	_doc_view->invalidate_lines(_doc_window, start, end);
+}
+
+void app_state::lines_changed(const int start, const int end)
+{
+	_doc_view->lines_changed(_doc_window, start, end);
 }
 
 void app_state::on_navigate_next(const bool forward)
@@ -432,7 +526,7 @@ void app_state::on_navigate_next(const bool forward)
 		_files_view->navigate_next(_list_window, forward);
 }
 
-void app_state::load_doc(const index_item_ptr& item)
+void app_state::load_doc(const index_item_ptr& item, std::function<void()> on_loaded)
 {
 	auto d = item->doc;
 	bool load_from_disk = true;
@@ -441,18 +535,21 @@ void app_state::load_doc(const index_item_ptr& item)
 	{
 		const auto current_time = pf::file_modified_time(item->path);
 		const uint64_t disk_modified_time = d->disk_modified_time();
-		if (disk_modified_time > 1 && current_time != disk_modified_time)
+		const bool changed_on_disk = disk_modified_time > 1 && current_time != disk_modified_time;
+
+		if (!changed_on_disk)
 		{
+			load_from_disk = false;
+		}
+		else if (d->is_modified())
+		{
+			// Only worth asking when there is something to lose
 			const auto id = _app_window->message_box(
 				"This file has been modified on disk. Do you want to reload it and lose your local changes?",
 				g_app_name,
 				pf::msg_box_style::yes_no | pf::msg_box_style::icon_question);
 
 			load_from_disk = id == pf::msg_box_result::yes;
-		}
-		else
-		{
-			load_from_disk = false;
 		}
 	}
 	else
@@ -464,24 +561,43 @@ void app_state::load_doc(const index_item_ptr& item)
 
 	set_active_item(item);
 
-	if (load_from_disk)
+	if (!load_from_disk)
 	{
-		_scheduler->run_async([t = shared_from_this(), item]
-		{
-			auto lines = load_lines(item->path);
+		if (on_loaded)
+			on_loaded();
+		return;
+	}
 
-			t->_scheduler->run_ui([t, item, lines = std::move(lines)]()
+	const auto generation = ++item->load_generation;
+	const auto was_modified = d->is_modified();
+	const auto path = item->path;
+
+	_scheduler->run_async([t = shared_from_this(), item, path, generation, was_modified,
+			on_loaded = std::move(on_loaded)]() mutable
+		{
+			auto lines = load_lines(path);
+
+			t->_scheduler->run_ui([t, item, path, generation, was_modified, lines = std::move(lines),
+					on_loaded = std::move(on_loaded)]() mutable
 			{
-				item->doc->apply_loaded_data(item->path, lines);
+				// Discard the read if a newer load started or the user edited while it was in flight
+				if (item->load_generation != generation)
+					return;
+				if (!item->doc || (!was_modified && item->doc->is_modified()))
+					return;
+
+				item->doc->apply_loaded_data(path, std::move(lines));
 				t->apply_spell_check_mode(item->doc);
 
 				// Only switch view if this item is still the active one,
 				// otherwise we'd override the user's current selection
 				if (t->active_item() == item)
 					t->set_active_item(item);
+
+				if (on_loaded)
+					on_loaded();
 			});
 		});
-	}
 }
 
 void app_state::load_doc(const pf::file_path& path)
@@ -601,6 +717,18 @@ bool app_state::search_list_has_focus() const
 	return list_has_focus() && is_search(get_mode());
 }
 
+// The search box, or an inline rename box in the file list
+bool app_state::inline_edit_has_focus() const
+{
+	return focused_edit_box_owner() != nullptr;
+}
+
+bool app_state::can_edit_document() const
+{
+	return !inline_edit_has_focus() && is_edit_text(get_mode()) && _active_item && _active_item->doc &&
+		!_active_item->doc->is_read_only();
+}
+
 list_view_item_ptr app_state::selected_file_list_item() const
 {
 	return _files_view ? _files_view->selected_item() : nullptr;
@@ -613,18 +741,16 @@ list_view_item_ptr app_state::selected_search_list_item() const
 
 bool app_state::can_copy_current_focus() const
 {
+	// The search box is always present, so it only wins when something is selected in it
+	if (auto* const edit_owner = focused_edit_box_owner(); edit_owner && edit_owner->edit_can_copy())
+		return true;
+
 	if (const auto view = focused_text_view())
 		return view->can_copy_text();
 
-	if (search_list_has_focus())
+	if (list_has_focus())
 	{
-		const auto item = selected_search_list_item();
-		return item && item->source;
-	}
-
-	if (file_list_has_focus())
-	{
-		const auto item = selected_file_list_item();
+		const auto item = is_search(get_mode()) ? selected_search_list_item() : selected_file_list_item();
 		return item && item->source;
 	}
 
@@ -633,6 +759,9 @@ bool app_state::can_copy_current_focus() const
 
 bool app_state::can_delete_current_focus() const
 {
+	if (auto* const edit_owner = focused_edit_box_owner())
+		return edit_owner != nullptr;
+
 	if (const auto view = focused_text_view())
 		return view->can_delete_text();
 
@@ -647,6 +776,9 @@ bool app_state::can_delete_current_focus() const
 
 bool app_state::copy_current_focus_to_clipboard() const
 {
+	if (auto* const edit_owner = focused_edit_box_owner(); edit_owner && edit_owner->edit_copy())
+		return true;
+
 	if (const auto view = focused_text_view())
 		return view->copy_text_to_clipboard();
 
@@ -671,6 +803,9 @@ bool app_state::copy_current_focus_to_clipboard() const
 
 bool app_state::delete_current_focus()
 {
+	if (auto* const edit_owner = focused_edit_box_owner())
+		return edit_owner->edit_delete();
+
 	if (const auto view = focused_text_view())
 		return view->delete_selected_text();
 
@@ -737,54 +872,79 @@ pf::file_path app_state::save_folder() const
 {
 	if (_active_item && !_active_item->path.empty())
 		return _active_item->path.folder();
-	if (_root_folder)
+	if (_root_folder && !_root_folder->path.empty())
 		return _root_folder->path;
-	return {}; // TODO What should it be?
+	return pf::current_directory();
+}
+
+void app_state::set_word_wrap(const bool enabled)
+{
+	_word_wrap = enabled;
+	if (_doc_view)
+		_doc_view->set_word_wrap(enabled);
+}
+
+void app_state::set_message(std::string text)
+{
+	_message_bar_text = std::move(text);
+	invalidate(invalid::doc);
+}
+
+list_view* app_state::focused_list_view() const
+{
+	if (!list_has_focus())
+		return nullptr;
+	if (is_search(get_mode()))
+		return _search_view.get();
+	return _files_view.get();
+}
+
+list_view* app_state::focused_edit_box_owner() const
+{
+	auto* const view = focused_list_view();
+	return view && view->has_active_edit_box() ? view : nullptr;
 }
 
 void app_state::refresh_index(const pf::file_path& root_path, std::function<void()> on_complete,
                               const bool preserve_in_memory_documents)
 {
-	std::unordered_map<pf::file_path, index_item_ptr, pf::ihash> existing;
+	index_snapshot_map existing;
 	if (_root_folder)
-		map_index_items_recursive(existing, _root_folder);
+		snapshot_index_items_recursive(existing, _root_folder);
 
 	const bool same_root = !_root_folder || _root_folder->path == root_path;
-
-	// Collect in-memory documents to preserve across disk rescan
-	std::vector<index_item_ptr> in_memory;
-	if (preserve_in_memory_documents && same_root)
-	{
-		for (const auto& [path, item] : existing)
-		{
-			if (item->doc && !item->is_folder && !item->is_deleted)
-				in_memory.push_back(item);
-		}
-	}
+	const bool preserve = preserve_in_memory_documents && same_root;
 
 	_scheduler->run_async([t = shared_from_this(), root_path, existing = std::move(existing),
-			in_memory = std::move(in_memory),
-			on_complete = std::move(on_complete)]() mutable
+			preserve, on_complete = std::move(on_complete)]() mutable
 		{
-			auto new_root = load_index(root_path, std::move(existing));
+			auto new_root = load_index(root_path, existing);
 
-			// Re-add in-memory documents not found on disk
-			std::unordered_map<pf::file_path, index_item_ptr, pf::ihash> new_paths;
-			map_index_items_recursive(new_paths, new_root);
-
-			for (const auto& item : in_memory)
+			t->_scheduler->run_ui([t, new_root = std::move(new_root), preserve,
+					on_complete = std::move(on_complete)]() mutable
 			{
-				if (!new_paths.contains(item->path))
+				// Re-attach in-memory documents that are not on disk. Done on the UI thread
+				// because it walks and mutates live index items.
+				if (preserve && t->_root_folder)
 				{
-					auto parent = find_item_recursively(new_root, item->path.folder());
-					if (!parent)
-						parent = new_root;
-					add_child_sorted(parent, item);
-				}
-			}
+					std::unordered_map<pf::file_path, index_item_ptr, pf::ihash> old_items;
+					map_index_items_recursive(old_items, t->_root_folder);
 
-			t->_scheduler->run_ui([t, new_root = std::move(new_root), on_complete = std::move(on_complete)]()
-			{
+					std::unordered_map<pf::file_path, index_item_ptr, pf::ihash> new_paths;
+					map_index_items_recursive(new_paths, new_root);
+
+					for (const auto& [path, item] : old_items)
+					{
+						if (!item->doc || item->is_folder || item->is_deleted || new_paths.contains(path))
+							continue;
+
+						auto parent = find_item_recursively(new_root, path.folder());
+						if (!parent)
+							parent = new_root;
+						add_child_sorted(parent, item);
+					}
+				}
+
 				t->set_root(new_root);
 				t->remember_root_folder(t->root_item()->path);
 				t->invalidate(invalid::files_layout | invalid::files_populate);
@@ -800,23 +960,46 @@ void app_state::execute_search(const std::string& text, std::function<void()> on
 	std::vector<search_input> inputs;
 	collect_search_inputs(_root_folder->children, inputs);
 
-	_scheduler->run_async(
-		[t = shared_from_this(), inputs = std::move(inputs), text, on_complete = std::move(on_complete)]() mutable
-		{
-			auto results = perform_search(inputs, text);
+	const auto generation = _search_generation.fetch_add(1) + 1;
 
-			t->_scheduler->run_ui([t, results = std::move(results), on_complete = std::move(on_complete)]()
-			{
-				apply_search_results(t->_root_folder->children, results);
-				if (on_complete)
-					on_complete();
-			});
+	_scheduler->run_async(
+		[t = shared_from_this(), inputs = std::move(inputs), text, generation,
+			on_complete = std::move(on_complete)]() mutable
+		{
+			const auto is_cancelled = [t, generation] { return t->_search_generation.load() != generation; };
+
+			auto results = perform_search(inputs, text, is_cancelled);
+
+			if (is_cancelled())
+				return;
+
+			t->_scheduler->run_ui(
+				[t, results = std::move(results), generation, on_complete = std::move(on_complete)]()
+				{
+					if (t->_search_generation.load() != generation)
+						return; // a newer search has superseded this one
+
+					apply_search_results(t->_root_folder->children, results);
+					if (on_complete)
+						on_complete();
+				});
 		});
 }
 
 void app_state::on_search(const std::string& text)
 {
-	execute_search(text, [this]() { _search_view->populate(); });
+	_pending_search_text = text;
+
+	// Coalesce keystrokes so a full-tree scan is not queued per character
+	if (_app_window && _app_window->set_timer(search_debounce_timer_id, search_debounce_ms))
+		return;
+
+	run_pending_search();
+}
+
+void app_state::run_pending_search()
+{
+	execute_search(_pending_search_text, [this]() { _search_view->populate(); });
 }
 
 void app_state::set_mode(const view_mode m)
@@ -837,6 +1020,8 @@ void app_state::set_mode(const view_mode m)
 			_doc_view->stop_caret_blink(_doc_window);
 
 		new_view->set_document(active_item()->doc);
+		if (view_content_of(m) == view_content::edit_text)
+			new_view->set_word_wrap(_word_wrap);
 
 		_doc_view = new_view;
 		_doc_window->set_reactor(new_view);
@@ -868,7 +1053,8 @@ void app_state::toggle_search_mode()
 }
 
 app_state::search_results_map app_state::perform_search(const std::vector<search_input>& inputs,
-                                                        const std::string& text)
+                                                        const std::string& text,
+                                                        const std::function<bool()>& is_cancelled)
 {
 	search_results_map results;
 	int total = 0;
@@ -876,8 +1062,9 @@ app_state::search_results_map app_state::perform_search(const std::vector<search
 	for (const auto& input : inputs)
 	{
 		if (total >= max_search_results) break;
+		if (is_cancelled && is_cancelled()) break;
 
-		auto file_results = search_file_results(input.path, input.doc, text);
+		auto file_results = search_file_results(input, text);
 
 		if (total + static_cast<int>(file_results.size()) > max_search_results)
 			file_results.resize(max_search_results - total);
@@ -1009,6 +1196,15 @@ void app_state::rename_item(const index_item_ptr& item, const std::string& new_n
 	if (!item || new_name.empty() || item->is_folder)
 		return;
 
+	if (!is_valid_item_name(new_name))
+	{
+		_app_window->message_box(
+			std::format("'{}' is not a valid file name.", new_name),
+			g_app_name,
+			pf::msg_box_style::ok | pf::msg_box_style::icon_warning);
+		return;
+	}
+
 	const auto old_path = item->path;
 	const auto new_path = old_path.folder().combine(new_name);
 
@@ -1081,6 +1277,15 @@ uint32_t app_state::handle_message(const pf::window_frame_ptr window,
 		return on_close();
 	if (msg == mt::command)
 		return 0;
+	if (msg == mt::timer)
+	{
+		if (static_cast<uint32_t>(wParam) == search_debounce_timer_id)
+		{
+			_app_window->kill_timer(search_debounce_timer_id);
+			run_pending_search();
+		}
+		return 0;
+	}
 	if (msg == mt::dpi_changed)
 		return on_window_dpi_changed(wParam, lParam);
 	if (msg == mt::drop_files)
@@ -1159,18 +1364,11 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	const auto text_size = pf::config_read("Font", "TextSize");
 	const auto list_size = pf::config_read("Font", "ListSize");
 
-	if (!text_size.empty() && !list_size.empty())
+	int lh = 0;
+	int th = 0;
+	if (parse_int_value(list_size, lh) && parse_int_value(text_size, th))
 	{
-		try
-		{
-			const auto lh = pf::stoi(list_size);
-			const auto th = pf::stoi(text_size);
-
-			initialize_styles(lh, th);
-		}
-		catch (...)
-		{
-		}
+		initialize_styles(lh, th);
 	}
 
 	invalidate(invalid::doc);
@@ -1181,16 +1379,12 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	const auto word_wrap = pf::config_read("View", "WordWrap");
 	const auto spell_check = pf::config_read("View", "SpellCheck");
 
-	try
-	{
-		if (!panel_ratio.empty())
-			_panel_splitter._ratio = std::clamp(pf::stod(panel_ratio), splitter::min_ratio, splitter::max_ratio);
-		if (!word_wrap.empty())
-			_doc_view->set_word_wrap(word_wrap != "0");
-	}
-	catch (...)
-	{
-	}
+	if (double ratio = 0.0; parse_double_value(panel_ratio, ratio))
+		_panel_splitter._ratio = std::clamp(ratio, splitter::min_ratio, splitter::max_ratio);
+
+	if (!word_wrap.empty())
+		_word_wrap = word_wrap != "0";
+	set_word_wrap(_word_wrap);
 
 	_spell_check_mode = parse_spell_check_mode(spell_check);
 	apply_spell_check_mode(doc());
@@ -1266,13 +1460,13 @@ void app_state::save_config() const
 	}
 
 	// Save font sizes
-	const auto styles = _styles;
+	const auto& styles = _styles;
 	pf::config_write("Font", "TextSize", to_str(styles.text_font_height));
 	pf::config_write("Font", "ListSize", to_str(styles.list_font_height));
 
 	// Save splitter positions as ratios
 	pf::config_write("Splitter", "PanelRatio", to_str(_panel_splitter._ratio));
-	pf::config_write("View", "WordWrap", _doc_view->word_wrap() ? "1" : "0");
+	pf::config_write("View", "WordWrap", _word_wrap ? "1" : "0");
 	pf::config_write("View", "SpellCheck", spell_check_mode_config_value(_spell_check_mode));
 
 	// Save current root folder and document
@@ -1298,12 +1492,16 @@ void app_state::save_config() const
 	const auto active = active_item();
 	if (active && !active->path.empty() && active->path.is_save_path())
 		pf::config_write("Recent", "Document", active->path.view());
+
+	pf::config_flush();
 }
 
 void app_state::remember_root_folder(const pf::file_path& folder, const pf::file_path& document)
 {
 	if (folder.empty())
 		return;
+
+	const auto previous_folders = _recent_root_folders;
 
 	pf::file_path remembered_document = document;
 	for (size_t i = 0; i < _recent_root_folders.size(); ++i)
@@ -1326,7 +1524,9 @@ void app_state::remember_root_folder(const pf::file_path& folder, const pf::file
 	if (_recent_root_documents.size() > max_recent_root_folders)
 		_recent_root_documents.resize(max_recent_root_folders);
 
-	update_recent_root_menu();
+	// Rebuilding the menu recreates every command closure and the accelerator table
+	if (previous_folders != _recent_root_folders)
+		update_recent_root_menu();
 }
 
 void app_state::remember_root_document(const pf::file_path& folder, const pf::file_path& document)
@@ -1348,6 +1548,17 @@ void app_state::remember_root_document(const pf::file_path& folder, const pf::fi
 	remember_root_folder(folder, document);
 }
 
+void app_state::restore_recent_root_folders(const std::span<const recent_root_entry> entries)
+{
+	// Each entry is pushed to the front, so replay oldest first to end up most-recent-first
+	for (auto i = entries.size(); i > 0; --i)
+	{
+		const auto& entry = entries[i - 1];
+		if (!entry.folder.empty())
+			remember_root_folder(entry.folder, entry.document);
+	}
+}
+
 void app_state::update_recent_root_menu()
 {
 	if (_app_window)
@@ -1362,11 +1573,10 @@ std::vector<pf::menu_command> app_state::build_recent_root_folder_menu()
 	for (size_t i = 0; i < _recent_root_folders.size(); ++i)
 	{
 		const auto path = _recent_root_folders[i];
-		const auto doc_path = i < _recent_root_documents.size() ? _recent_root_documents[i] : pf::file_path{};
 		items.emplace_back(
 			std::format("&{} {}", i + 1, escape_menu_text(path.view())),
 			recent_root_folder_menu_id_base + static_cast<int>(i),
-			[this, path, doc_path]
+			[this, path]
 			{
 				if (root_item() && path == root_item()->path)
 				{
@@ -1375,6 +1585,10 @@ std::vector<pf::menu_command> app_state::build_recent_root_folder_menu()
 				}
 				if (!prompt_save_all_modified())
 					return;
+
+				// Resolved now rather than captured, so the menu survives document changes
+				const auto doc_path = recent_root_document(path);
+
 				refresh_index(path, [this, doc_path]
 				{
 					invalidate(
@@ -1399,9 +1613,29 @@ std::vector<pf::menu_command> app_state::build_recent_root_folder_menu()
 	return items;
 }
 
+// About and test output are generated, not authored: read-only and never dirty
+void app_state::show_generated_document(const pf::file_path& path, std::string content)
+{
+	const auto unique_path = make_unique_child_path(root_item(), path, false);
+	const auto d = std::make_shared<document>(*this, content, false);
+	d->path(unique_path);
+	d->read_only(true);
+
+	const auto item = std::make_shared<index_item>(
+		unique_path, std::string(unique_path.name()), false, d);
+	item->saved_view_content = view_content::markdown;
+
+	auto parent = find_item_recursively(root_item(), unique_path.folder());
+	if (!parent) parent = _root_folder;
+	add_child_sorted(parent, item);
+
+	set_active_item(item);
+	invalidate(invalid::files_populate);
+}
+
 uint32_t app_state::on_about()
 {
-	create_new_file(save_folder().combine("about", "md"), make_about_text(get_commands()));
+	show_generated_document(save_folder().combine("about", "md"), make_about_text(get_commands()));
 	return 0;
 }
 
@@ -1436,8 +1670,7 @@ void app_state::select_alternative()
 uint32_t app_state::on_run_tests()
 {
 	const auto results = run_all_tests();
-	create_new_file(save_folder().combine("tests", "md"), results);
-	invalidate(invalid::files_populate);
+	show_generated_document(save_folder().combine("tests", "md"), results);
 	return 0;
 }
 
@@ -1513,66 +1746,138 @@ public:
 	void run_ui(std::function<void()> task) override { pf::run_ui(std::move(task)); }
 };
 
+namespace
+{
+	struct cli_mode_result
+	{
+		bool handled = false;
+		app_init_result result;
+	};
+
+	std::string spell_check_diagnostics(const std::string_view word)
+	{
+		auto checker = pf::create_spell_checker();
+		std::string out;
+		out += std::format("Word: {}\n", word);
+		const std::string_view available_text = checker && checker->available() ? "yes" : "no";
+		const std::string diagnostics =
+			checker ? checker->diagnostics() : std::string("No checker instance.");
+		out += std::format("Available: {}\n", available_text);
+		out += std::format("Diagnostics: {}\n", diagnostics);
+
+		if (checker && checker->available())
+		{
+			const auto valid = checker->is_word_valid(word);
+			const std::string_view valid_text = valid ? "yes" : "no";
+			out += std::format("Valid: {}\n", valid_text);
+			const auto suggestions = checker->suggest(word);
+			out += "Suggestions:";
+			if (suggestions.empty())
+			{
+				out += " (none)\n";
+			}
+			else
+			{
+				out += "\n";
+				for (const auto& suggestion : suggestions)
+					out += std::format("- {}\n", suggestion);
+			}
+		}
+
+		return out;
+	}
+
+	// Handles the non-GUI command-line modes; also reports any file argument to open.
+	cli_mode_result run_cli_mode(const std::span<const std::string_view> params, std::string_view& file_to_open)
+	{
+		for (const auto& param : params)
+		{
+			if (pf::icmp(param, "/test") == 0 || pf::icmp(param, "--test") == 0)
+			{
+				const auto results = run_all_tests_result();
+				pf::write_stdout(results.output);
+				return {true, {.start_gui = false, .exit_code = results.fail_count == 0 ? 0 : 1}};
+			}
+
+			auto try_prefix = [&](const std::string_view p1, const std::string_view p2) -> std::string_view
+			{
+				if (param.size() > p1.size() && pf::icmp(param.substr(0, p1.size()), p1) == 0)
+					return param.substr(p1.size());
+				if (param.size() > p2.size() && pf::icmp(param.substr(0, p2.size()), p2) == 0)
+					return param.substr(p2.size());
+				return {};
+			};
+
+			if (const auto word = try_prefix("/spell:", "--spell:"); !word.empty())
+			{
+				pf::write_stdout(spell_check_diagnostics(word));
+				return {true, {.start_gui = false}};
+			}
+
+			if (!param.starts_with(u8'/') && !param.starts_with(u8'-'))
+			{
+				file_to_open = param;
+			}
+		}
+
+		return {};
+	}
+
+	void restore_session(app_state& app)
+	{
+		std::vector<app_state::recent_root_entry> entries;
+		entries.reserve(app_state::max_recent_root_folders);
+
+		for (size_t i = 0; i < app_state::max_recent_root_folders; ++i)
+		{
+			// Kept even when currently unreachable, so an offline drive is not forgotten
+			entries.emplace_back(
+				pf::file_path{pf::config_read("RecentFolders", recent_root_folder_config_key(i))},
+				pf::file_path{pf::config_read("RecentFolders", recent_root_document_config_key(i))});
+		}
+
+		app.restore_recent_root_folders(entries);
+
+		const auto folder = pf::file_path{pf::config_read("Recent", "Folder")};
+		const auto document = pf::file_path{pf::config_read("Recent", "Document")};
+
+		const bool folder_ok = pf::is_directory(folder);
+		const bool document_ok = !document.empty() && document.exists();
+
+		if (folder_ok)
+			app._startup_folder = folder;
+		if (document_ok)
+			app._startup_document = document;
+		if (folder_ok && document_ok)
+			app.remember_root_document(folder, document);
+	}
+
+	void restore_window_placement(app_state& app)
+	{
+		int left = 0;
+		int top = 0;
+		int right = 0;
+		int bottom = 0;
+
+		if (!parse_int_value(pf::config_read("Window", "Left"), left) ||
+			!parse_int_value(pf::config_read("Window", "Top"), top) ||
+			!parse_int_value(pf::config_read("Window", "Right"), right) ||
+			!parse_int_value(pf::config_read("Window", "Bottom"), bottom))
+			return;
+
+		app._startup_placement.normal_bounds = {left, top, right, bottom};
+		app._startup_placement.maximized = pf::config_read("Window", "Maximized") == "1";
+		app._has_startup_placement = true;
+	}
+}
+
 app_init_result app_init(const pf::window_frame_ptr& main_frame,
                          const std::span<const std::string_view> params)
 {
 	std::string_view file_to_open;
 
-	for (const auto& param : params)
-	{
-		if (pf::icmp(param, "/test") == 0 || pf::icmp(param, "--test") == 0)
-		{
-			const auto results = run_all_tests_result();
-			pf::write_stdout(results.output);
-			return {.start_gui = false, .exit_code = results.fail_count == 0 ? 0 : 1};
-		}
-
-		auto try_prefix = [&](const std::string_view p1, const std::string_view p2) -> std::string_view
-		{
-			if (param.size() > p1.size() && pf::icmp(param.substr(0, p1.size()), p1) == 0)
-				return param.substr(p1.size());
-			if (param.size() > p2.size() && pf::icmp(param.substr(0, p2.size()), p2) == 0)
-				return param.substr(p2.size());
-			return {};
-		};
-
-		if (const auto word = try_prefix("/spell:", "--spell:"); !word.empty())
-		{
-			auto checker = pf::create_spell_checker();
-			std::string out;
-			out += std::format("Word: {}\n", word);
-			const std::string_view available_text = checker && checker->available() ? "yes" : "no";
-			const std::string diagnostics =
-				checker ? checker->diagnostics() : std::string("No checker instance.");
-			out += std::format("Available: {}\n", available_text);
-			out += std::format("Diagnostics: {}\n", diagnostics);
-			if (checker && checker->available())
-			{
-				const auto valid = checker->is_word_valid(word);
-				const std::string_view valid_text = valid ? "yes" : "no";
-				out += std::format("Valid: {}\n", valid_text);
-				const auto suggestions = checker->suggest(word);
-				out += "Suggestions:";
-				if (suggestions.empty())
-				{
-					out += " (none)\n";
-				}
-				else
-				{
-					out += "\n";
-					for (const auto& suggestion : suggestions)
-						out += std::format("- {}\n", suggestion);
-				}
-			}
-			pf::write_stdout(out);
-			return {.start_gui = false};
-		}
-
-		if (!param.starts_with(u8'/') && !param.starts_with(u8'-'))
-		{
-			file_to_open = param;
-		}
-	}
+	if (const auto cli = run_cli_mode(params, file_to_open); cli.handled)
+		return cli.result;
 
 	g_main_app = std::make_shared<app_state>(std::make_shared<platform_scheduler>());
 
@@ -1586,45 +1891,10 @@ app_init_result app_init(const pf::window_frame_ptr& main_frame,
 	}
 	else
 	{
-		// Restore last session from config
-		for (size_t i = 0; i < app_state::max_recent_root_folders; ++i)
-		{
-			const auto recent = pf::file_path{pf::config_read("RecentFolders", recent_root_folder_config_key(i))};
-			const auto document = pf::file_path{pf::config_read("RecentFolders", recent_root_document_config_key(i))};
-			if (!recent.empty())
-				g_main_app->remember_root_folder(recent, document);
-		}
-
-		const auto folder = pf::file_path{pf::config_read("Recent", "Folder")};
-		const auto document = pf::file_path{pf::config_read("Recent", "Document")};
-
-		if (!folder.empty())
-			g_main_app->_startup_folder = folder;
-		if (!document.empty())
-			g_main_app->_startup_document = document;
-		if (!folder.empty() && !document.empty())
-			g_main_app->remember_root_document(folder, document);
+		restore_session(*g_main_app);
 	}
 
-	// Restore window placement from config
-	const auto wl = pf::config_read("Window", "Left");
-	const auto wt = pf::config_read("Window", "Top");
-	const auto wr = pf::config_read("Window", "Right");
-	const auto wb = pf::config_read("Window", "Bottom");
-
-	if (!wl.empty() && !wt.empty() && !wr.empty() && !wb.empty())
-	{
-		try
-		{
-			g_main_app->_startup_placement.normal_bounds = {pf::stoi(wl), pf::stoi(wt), pf::stoi(wr), pf::stoi(wb)};
-			g_main_app->_startup_placement.maximized = pf::config_read("Window", "Maximized") == "1";
-			g_main_app->_has_startup_placement = true;
-		}
-		catch (const std::exception&)
-		{
-			// Ignore corrupted config values
-		}
-	}
+	restore_window_placement(*g_main_app);
 
 	return {};
 }
@@ -1637,5 +1907,7 @@ void app_idle()
 
 void app_destroy()
 {
+	// Release the COM spell checker while COM is still initialised
+	reset_spell_checker();
 	g_main_app.reset();
 }

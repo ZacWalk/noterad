@@ -14,8 +14,6 @@ protected:
 	bool _drag_selection = false;
 	bool _word_selection = false;
 	bool _line_selection = false;
-	bool _preparing_to_drag = false;
-	bool _cursor_hidden = false;
 	bool _sel_margin = true;
 	uint32_t _drag_sel_timer = 0;
 
@@ -29,17 +27,27 @@ protected:
 
 	// Text layout scratch buffers
 	mutable std::vector<text_block> _block_buf;
+	mutable std::vector<text_block> _spell_blocks;
 	mutable std::string _expand_buf;
+	mutable std::string _render_buf; // line text being drawn / hit-tested
+	mutable std::string _highlight_buf; // line text being parsed by the highlighter
 
 	// Word wrap state
 	bool _word_wrap = true;
-	std::vector<uint16_t> _wrap_breaks; // all break points, concatenated across all lines
+	std::vector<int> _wrap_breaks; // all break points, concatenated across all lines
 	std::vector<int> _wrap_offsets;
 	std::vector<int> _wrap_line_y; // prefix sum: _wrap_line_y[i] = first visual row of doc line i
+	std::vector<int> _line_breaks_buf; // scratch for one line's break points
+
+	// Lines whose text changed since the last layout; -1 means none
+	int _wrap_dirty_first = -1;
+	int _wrap_dirty_last = -1;
+	bool _wrap_dirty_all = true;
 
 	// Syntax highlighting — owned by the view, not the document
 	highlight_fn _highlight;
 	mutable std::vector<uint32_t> _parse_cookies;
+	mutable int _cookies_valid_to = 0; // cookies at or above this line are stale
 
 public:
 	doc_view(app_events& events) : text_view(events),
@@ -49,9 +57,11 @@ public:
 
 	~doc_view() override = default;
 
+	[[nodiscard]] virtual bool has_caret() const { return true; }
+
 	void start_caret_blink(const pf::window_frame_ptr& window)
 	{
-		if (window && !_caret.active)
+		if (window && has_caret() && !_caret.active)
 		{
 			_caret.start(window);
 			_events.invalidate(invalid::windows);
@@ -69,7 +79,7 @@ public:
 
 	void reset_caret_blink(const pf::window_frame_ptr& window)
 	{
-		if (window && _focused)
+		if (window && has_caret() && _focused)
 		{
 			_caret.reset(window);
 			_events.invalidate(invalid::windows);
@@ -81,7 +91,7 @@ public:
 		_scroll_offset = {};
 		_doc = d;
 		_highlight = select_highlighter(d->get_doc_type(), d->path());
-		_parse_cookies.assign(d ? d->size() : 0, invalid_cookie);
+		reset_parse_cookies();
 
 		// Clear stale word-wrap state so visual_row_to_line_index
 		// won't index into data sized for a previous document.
@@ -89,6 +99,17 @@ public:
 		_wrap_offsets.clear();
 		_wrap_line_y.clear();
 		_total_visual_rows = 0;
+		mark_wrap_dirty_all();
+	}
+
+	void mark_wrap_dirty_all() { _wrap_dirty_all = true; }
+
+	void mark_wrap_dirty(const int start, const int end)
+	{
+		const auto lo = std::max(0, std::min(start, end));
+		const auto hi = std::max(start, end);
+		_wrap_dirty_first = _wrap_dirty_first < 0 ? lo : std::min(_wrap_dirty_first, lo);
+		_wrap_dirty_last = std::max(_wrap_dirty_last, hi);
 	}
 
 	// --- Text selection overrides (coordinate with document) ---
@@ -111,38 +132,73 @@ public:
 
 	// --- Syntax highlighting (view-owned) ---
 
+	// Cookies are stored per line but only trusted below a watermark, so an edit
+	// invalidates the tail of the document in O(1).
+	void reset_parse_cookies() const
+	{
+		_parse_cookies.assign(_doc ? _doc->size() : 0, invalid_cookie);
+		_cookies_valid_to = static_cast<int>(_parse_cookies.size());
+	}
+
+	[[nodiscard]] bool cookie_valid(const int lineIndex) const
+	{
+		return lineIndex < _cookies_valid_to && _parse_cookies[lineIndex] != invalid_cookie;
+	}
+
+	// Drop cookies between the watermark and 'lineIndex' so the watermark can move up
+	void discard_cookies_below(const int lineIndex) const
+	{
+		if (lineIndex > _cookies_valid_to)
+			std::fill(_parse_cookies.begin() + _cookies_valid_to,
+			          _parse_cookies.begin() + lineIndex, invalid_cookie);
+		_cookies_valid_to = std::max(_cookies_valid_to, lineIndex);
+	}
+
+	void set_parse_cookie(const int lineIndex, const uint32_t cookie) const
+	{
+		if (lineIndex < 0 || lineIndex >= static_cast<int>(_parse_cookies.size()))
+			return;
+
+		discard_cookies_below(lineIndex);
+		_parse_cookies[lineIndex] = cookie;
+		_cookies_valid_to = std::max(_cookies_valid_to, lineIndex + 1);
+	}
+
 	uint32_t highlight_cookie(const int lineIndex) const
 	{
 		if (!_doc || lineIndex < 0 || lineIndex >= static_cast<int>(_doc->size()))
 			return 0;
 
 		if (_parse_cookies.size() != _doc->size())
-			_parse_cookies.assign(_doc->size(), invalid_cookie);
+			reset_parse_cookies();
 
 		auto i = lineIndex;
 		const auto scan_limit = std::max(0, i - 1000);
-		while (i >= scan_limit && _parse_cookies[i] == invalid_cookie)
+		while (i >= scan_limit && !cookie_valid(i))
 			i--;
 		if (i < scan_limit) i = scan_limit;
 		else i++;
 
+		if (i > lineIndex)
+			return _parse_cookies[lineIndex];
+
+		discard_cookies_below(i);
+
 		int nBlocks;
-		std::string line_view;
 
-		while (i <= lineIndex && _parse_cookies[i] == invalid_cookie)
+		while (i <= lineIndex)
 		{
-			uint32_t dwCookie = 0;
-
-			if (i > 0)
-				dwCookie = _parse_cookies[i - 1];
+			const uint32_t dwCookie = i > 0 ? _parse_cookies[i - 1] : 0;
 
 			const auto& line = (*_doc)[i];
-			line.render(line_view);
+			line.render(_highlight_buf);
 
-			_parse_cookies[i] = _highlight(dwCookie, line_view, nullptr, nBlocks);
+			_parse_cookies[i] = _highlight(dwCookie, _highlight_buf, nullptr, nBlocks);
 			assert(_parse_cookies[i] != invalid_cookie);
 			i++;
 		}
+
+		_cookies_valid_to = std::max(_cookies_valid_to, i);
 
 		return _parse_cookies[lineIndex];
 	}
@@ -150,16 +206,20 @@ public:
 	uint32_t highlight_line(const uint32_t cookie, const document_line& line,
 	                        text_block* pBuf, int& nBlocks) const
 	{
-		std::string line_view;
+		auto& line_view = _highlight_buf;
 		line.render(line_view);
 		const auto result = _highlight(cookie, line_view, pBuf, nBlocks);
 
 		if (_doc->spell_check() && pBuf)
 		{
 			const auto len = static_cast<int>(line_view.size());
+			const std::string_view line_text(line_view);
+
+			// Non-ASCII bytes count as word characters so a codepoint is never split
 			auto is_word_char = [](const char ch)
 			{
-				return isalnum(static_cast<unsigned char>(ch)) != 0;
+				const auto b = static_cast<unsigned char>(ch);
+				return b >= 0x80 || isalnum(b) != 0;
 			};
 			auto can_spell_check_style = [](const style color)
 			{
@@ -194,8 +254,8 @@ public:
 				blocks.push_back({pos, color});
 			};
 
-			std::vector<text_block> spell_blocks;
-			spell_blocks.reserve(std::max(8, len * 2 + 4));
+			auto& spell_blocks = _spell_blocks;
+			spell_blocks.clear();
 
 			auto append_segment = [&](const int start, const int end, const style base_color)
 			{
@@ -214,17 +274,17 @@ public:
 					int next = pos + 1;
 					auto color = base_color;
 
-					if (is_word_char(line_view[pos]))
+					if (is_word_char(line_text[pos]))
 					{
-						while (next < end && is_word_char(line_view[next]))
+						while (next < end && is_word_char(line_text[next]))
 							next++;
 
-						if (!spell_check_word(line_view.substr(pos, next - pos)))
+						if (!spell_check_word(line_text.substr(pos, next - pos)))
 							color = style::error_text;
 					}
 					else
 					{
-						while (next < end && !is_word_char(line_view[next]))
+						while (next < end && !is_word_char(line_text[next]))
 							next++;
 					}
 
@@ -326,8 +386,11 @@ public:
 	                 pf::measure_context& measure) override
 	{
 		text_view::handle_size(window, extent, measure);
-		_screen_chars = _font_extent.cx > 0 ? extent.cx / _font_extent.cx : 0;
+		_screen_chars = extent.cx / _font_extent.cx;
 		_hscroll.set_dpi_scale(_events.styles().dpi_scale);
+
+		// A width change invalidates every break point
+		mark_wrap_dirty_all();
 
 		if (_word_wrap)
 			layout();
@@ -346,6 +409,7 @@ public:
 
 		_word_wrap = enabled;
 		_scroll_offset.x = 0;
+		mark_wrap_dirty_all();
 		_events.invalidate(invalid::doc);
 	}
 
@@ -360,14 +424,16 @@ public:
 		return std::max(1, (_view_extent.cx - text_left()) / _font_extent.cx);
 	}
 
-	void calc_line_wrap_into(const document_line& line)
+	void calc_line_wrap_into(const document_line& line, std::vector<int>& breaks)
 	{
+		breaks.clear();
+
 		const auto ww = wrap_width();
 		if (ww <= 0) return;
 
 		const auto tab_sz = _doc->tab_size();
 
-		std::string line_view;
+		auto& line_view = _render_buf;
 		line.render(line_view);
 
 		auto char_advance = [&](const int i, const int col) -> int
@@ -377,12 +443,10 @@ public:
 			return 1;
 		};
 
-		const auto breaks = calc_word_breaks(line_view, ww, char_advance);
-		for (const auto b : breaks)
-			_wrap_breaks.push_back(static_cast<uint16_t>(b));
+		calc_word_breaks_into(breaks, line_view, ww, char_advance);
 	}
 
-	std::span<const uint16_t> line_breaks(const int lineIndex) const
+	std::span<const int> line_breaks(const int lineIndex) const
 	{
 		if (_wrap_offsets.empty() || lineIndex < 0
 			|| lineIndex >= static_cast<int>(_wrap_offsets.size()) - 1)
@@ -557,7 +621,7 @@ protected:
 					y += 2;
 			}
 
-			y = std::clamp(y, 0, line_count - 1);
+			y = std::clamp(y, 0, std::max(0, line_count - 1));
 
 			if (scroll_line() != y)
 			{
@@ -578,7 +642,7 @@ protected:
 				x++;
 			}
 
-			x = std::clamp(x, 0, nMaxLineLength - 1);
+			x = std::clamp(x, 0, std::max(0, nMaxLineLength - 1));
 
 			if (scroll_char() != x)
 			{
@@ -632,9 +696,9 @@ protected:
 				const auto sel = _doc->line_selection(client_to_text(point), bShift);
 				_doc->select(sel);
 
-				window->set_capture();
 				_drag_sel_timer = window->set_timer(TIMER_DRAGSEL, 100);
 				if (_drag_sel_timer == 0) return;
+				window->set_capture();
 				_word_selection = false;
 				_line_selection = true;
 				_drag_selection = true;
@@ -642,25 +706,16 @@ protected:
 		}
 		else
 		{
-			const auto ptText = client_to_text(point);
+			const auto pos = client_to_text(point);
+			const auto sel = bControl ? _doc->word_selection(pos, bShift) : _doc->pos_selection(pos, bShift);
+			_doc->select(sel);
 
-			if (_doc->is_inside_selection(ptText))
-			{
-				_preparing_to_drag = true;
-			}
-			else
-			{
-				const auto pos = client_to_text(point);
-				const auto sel = bControl ? _doc->word_selection(pos, bShift) : _doc->pos_selection(pos, bShift);
-				_doc->select(sel);
-
-				window->set_capture();
-				_drag_sel_timer = window->set_timer(TIMER_DRAGSEL, 100);
-				if (_drag_sel_timer == 0) return;
-				_word_selection = bControl;
-				_line_selection = false;
-				_drag_selection = true;
-			}
+			_drag_sel_timer = window->set_timer(TIMER_DRAGSEL, 100);
+			if (_drag_sel_timer == 0) return;
+			window->set_capture();
+			_word_selection = bControl;
+			_line_selection = false;
+			_drag_selection = true;
 		}
 	}
 
@@ -710,7 +765,7 @@ protected:
 		if (_hscroll._tracking)
 		{
 			const auto new_pos = _hscroll.track_to(point, client_rect());
-			scroll_to_char(std::clamp(new_pos, 0, _doc->max_line_length() - 1));
+			scroll_to_char(std::clamp(new_pos, 0, std::max(0, _doc->max_line_length() - 1)));
 			update_caret(window);
 			return;
 		}
@@ -737,14 +792,8 @@ protected:
 			_doc->select(sel);
 		}
 
-		if (_preparing_to_drag)
-		{
-			_preparing_to_drag = false;
-			// TODO: OLE drag/drop needs platform abstraction
-		}
-
 		// Update scrollbar hover
-		if (!_drag_selection && !_preparing_to_drag)
+		if (!_drag_selection)
 		{
 			const auto rc = scrollbar_rect();
 			bool need_redraw = _vscroll.set_hover(_vscroll.hit_test(point, rc));
@@ -788,12 +837,6 @@ protected:
 			window->kill_timer(_drag_sel_timer);
 			_drag_selection = false;
 		}
-
-		if (_preparing_to_drag)
-		{
-			_preparing_to_drag = false;
-			_doc->select(client_to_text(point));
-		}
 	}
 
 	void on_left_button_dbl_clk(const pf::window_frame_ptr& window, const pf::ipoint& point)
@@ -803,9 +846,9 @@ protected:
 			const bool bShift = window->is_key_down(pf::platform_key::Shift);
 			_doc->select(_doc->word_selection(client_to_text(point), bShift));
 
-			window->set_capture();
 			_drag_sel_timer = window->set_timer(TIMER_DRAGSEL, 100);
 			if (_drag_sel_timer == 0) return;
+			window->set_capture();
 			_word_selection = true;
 			_line_selection = false;
 			_drag_selection = true;
@@ -1086,6 +1129,7 @@ public:
 
 	void update_caret(pf::window_frame_ptr& window) override
 	{
+		if (!has_caret()) return;
 		reset_caret_blink(window);
 	}
 
@@ -1100,7 +1144,6 @@ protected:
 	}
 
 	// TODO: Drag-drop needs platform abstraction
-	// The following scroll methods support drag-based scrolling
 
 	void wrap_scroll_by(const int delta)
 	{
@@ -1112,54 +1155,6 @@ protected:
 		{
 			scroll_by(delta);
 		}
-	}
-
-	void scroll_up(pf::window_frame_ptr& window)
-	{
-		if (scroll_line() > 0)
-		{
-			scroll_to_line(scroll_line() - 1);
-			update_caret(window);
-		}
-	}
-
-	void scroll_down(pf::window_frame_ptr& window)
-	{
-		if (scroll_line() < static_cast<int>(_doc->size()) - 1)
-		{
-			scroll_to_line(scroll_line() + 1);
-			update_caret(window);
-		}
-	}
-
-	void scroll_left(pf::window_frame_ptr& window)
-	{
-		if (scroll_char() > 0)
-		{
-			scroll_to_char(scroll_char() - 1);
-			update_caret(window);
-		}
-	}
-
-	void scroll_right(pf::window_frame_ptr& window)
-	{
-		if (scroll_char() < _doc->max_line_length() - 1)
-		{
-			scroll_to_char(scroll_char() + 1);
-			update_caret(window);
-		}
-	}
-
-	void show_cursor(pf::window_frame_ptr& window)
-	{
-		_cursor_hidden = false;
-		update_caret(window);
-	}
-
-	void hide_cursor(pf::window_frame_ptr& window)
-	{
-		_cursor_hidden = true;
-		update_caret(window);
 	}
 
 	uint32_t on_mouse_leave()
@@ -1204,7 +1199,7 @@ protected:
 		{
 			const auto tabSize = _doc->tab_size();
 			const auto& line = (*_doc)[pt.y];
-			std::string line_view;
+			auto& line_view = _render_buf;
 			line.render(line_view);
 
 			const auto lineSize = static_cast<int>(line_view.size());
@@ -1298,7 +1293,7 @@ protected:
 
 				const auto tabSize = _doc->tab_size();
 				const auto& line = (*_doc)[point.y];
-				std::string line_view;
+				auto& line_view = _render_buf;
 				line.render(line_view);
 
 				int abs_col = _doc->calc_offset(point.y, row_start);
@@ -1322,7 +1317,7 @@ protected:
 
 				const auto tabSize = _doc->tab_size();
 				const auto& line = (*_doc)[point.y];
-				std::string line_view;
+				auto& line_view = _render_buf;
 				line.render(line_view);
 
 				for (auto i = 0; i < point.x && i < static_cast<int>(line_view.size()); i++)
@@ -1352,16 +1347,6 @@ protected:
 public:
 	void invalidate_lines(pf::window_frame_ptr& window, int start, int end) override
 	{
-		if (_word_wrap)
-			_events.invalidate(invalid::doc_layout);
-
-		// Invalidate parse cookies from 'start' to end of document (later lines depend on earlier cookies)
-		if (start >= 0 && start < static_cast<int>(_parse_cookies.size()))
-		{
-			for (int i = start; i < static_cast<int>(_parse_cookies.size()); ++i)
-				_parse_cookies[i] = invalid_cookie;
-		}
-
 		auto rcInvalid = client_rect();
 		const auto top = top_offset() - text_top();
 
@@ -1383,23 +1368,65 @@ public:
 		invalidate(window, rcInvalid);
 	}
 
+	// Later lines inherit the highlighter cookie, so everything below 'start' becomes stale
+	void lines_changed(pf::window_frame_ptr& window, const int start, const int end) override
+	{
+		mark_wrap_dirty(start, end);
+
+		if (start >= 0)
+			_cookies_valid_to = std::min(_cookies_valid_to, start);
+
+		if (_word_wrap)
+		{
+			// A changed line can gain or lose rows, moving everything below it
+			_events.invalidate(invalid::doc_layout);
+			invalidate_lines(window, start, -1);
+		}
+		else
+		{
+			invalidate_lines(window, start, end);
+		}
+	}
+
 	void layout() override
 	{
-		if (_doc)
-			_parse_cookies.assign(_doc->size(), invalid_cookie);
-		else
-			_parse_cookies.clear();
-
 		if (!_doc || !_word_wrap)
 		{
 			_wrap_breaks.clear();
 			_wrap_offsets.clear();
 			_wrap_line_y.clear();
 			_total_visual_rows = _doc ? static_cast<int>(_doc->size()) : 0;
+			clear_wrap_dirty();
 			return;
 		}
 
 		const auto line_count = static_cast<int>(_doc->size());
+
+		// A changed line count means every offset after it has moved
+		if (_wrap_dirty_all || static_cast<int>(_wrap_offsets.size()) != line_count + 1)
+		{
+			full_layout(line_count);
+		}
+		else if (_wrap_dirty_first >= 0)
+		{
+			const auto last = std::min(_wrap_dirty_last, line_count - 1);
+			for (int i = _wrap_dirty_first; i <= last; i++)
+				relayout_line(i);
+		}
+
+		clear_wrap_dirty();
+	}
+
+private:
+	void clear_wrap_dirty()
+	{
+		_wrap_dirty_all = false;
+		_wrap_dirty_first = -1;
+		_wrap_dirty_last = -1;
+	}
+
+	void full_layout(const int line_count)
+	{
 		_wrap_breaks.clear();
 		_wrap_offsets.resize(line_count + 1);
 		_wrap_line_y.resize(line_count + 1);
@@ -1408,13 +1435,42 @@ public:
 		for (int i = 0; i < line_count; i++)
 		{
 			_wrap_offsets[i] = static_cast<int>(_wrap_breaks.size());
-			calc_line_wrap_into((*_doc)[i]);
-			const int break_count = static_cast<int>(_wrap_breaks.size()) - _wrap_offsets[i];
-			_wrap_line_y[i + 1] = _wrap_line_y[i] + break_count + 1;
+			calc_line_wrap_into((*_doc)[i], _line_breaks_buf);
+			_wrap_breaks.insert(_wrap_breaks.end(), _line_breaks_buf.begin(), _line_breaks_buf.end());
+			_wrap_line_y[i + 1] = _wrap_line_y[i] + static_cast<int>(_line_breaks_buf.size()) + 1;
 		}
-		_wrap_offsets[line_count] = static_cast<int>(_wrap_breaks.size());
 
+		_wrap_offsets[line_count] = static_cast<int>(_wrap_breaks.size());
 		_total_visual_rows = _wrap_line_y[line_count];
+	}
+
+	// Re-wraps one line; only shifts the tail arrays when its row count actually changed
+	void relayout_line(const int line_index)
+	{
+		calc_line_wrap_into((*_doc)[line_index], _line_breaks_buf);
+
+		const auto begin = _wrap_offsets[line_index];
+		const auto end = _wrap_offsets[line_index + 1];
+		const auto old_count = end - begin;
+		const auto new_count = static_cast<int>(_line_breaks_buf.size());
+
+		if (new_count == old_count)
+		{
+			std::copy(_line_breaks_buf.begin(), _line_breaks_buf.end(), _wrap_breaks.begin() + begin);
+			return;
+		}
+
+		_wrap_breaks.erase(_wrap_breaks.begin() + begin, _wrap_breaks.begin() + end);
+		_wrap_breaks.insert(_wrap_breaks.begin() + begin, _line_breaks_buf.begin(), _line_breaks_buf.end());
+
+		const auto delta = new_count - old_count;
+		for (size_t i = line_index + 1; i < _wrap_offsets.size(); i++)
+		{
+			_wrap_offsets[i] += delta;
+			_wrap_line_y[i] += delta;
+		}
+
+		_total_visual_rows = _wrap_line_y.back();
 	}
 
 protected:
@@ -1447,7 +1503,7 @@ protected:
 
 	int line_height(int lineIndex) const
 	{
-		if (_word_wrap && !_wrap_offsets.empty())
+		if (_word_wrap && _wrap_offsets.size() > 1)
 		{
 			lineIndex = std::clamp(lineIndex, 0, static_cast<int>(_wrap_offsets.size()) - 2);
 			return (line_break_count(lineIndex) + 1) * _font_extent.cy;
@@ -1576,7 +1632,7 @@ protected:
 		const auto bg_color = line_bg_color(lineIndex);
 		const auto& line = (*_doc)[lineIndex];
 		const auto breaks = line_breaks(lineIndex);
-		std::string line_view;
+		auto& line_view = _render_buf;
 		line.render(line_view);
 		const auto nLength = static_cast<int>(line_view.size());
 
@@ -1587,7 +1643,7 @@ protected:
 		auto* pBuf = _block_buf.data();
 		auto nBlocks = 0;
 		const auto cookie = highlight_cookie(lineIndex - 1);
-		_parse_cookies[lineIndex] = highlight_line(cookie, line, pBuf, nBlocks);
+		set_parse_cookie(lineIndex, highlight_line(cookie, line, pBuf, nBlocks));
 
 		const int num_rows = static_cast<int>(breaks.size()) + 1;
 
@@ -1670,10 +1726,10 @@ protected:
 		auto nBlocks = 0;
 		const auto cookie = highlight_cookie(lineIndex - 1);
 
-		_parse_cookies[lineIndex] = highlight_line(cookie, line, pBuf, nBlocks);
+		set_parse_cookie(lineIndex, highlight_line(cookie, line, pBuf, nBlocks));
 
 		pf::ipoint origin(rc.left - scroll_char() * _font_extent.cx, rc.top);
-		std::string line_view;
+		auto& line_view = _render_buf;
 		line.render(line_view);
 
 		if (nBlocks > 0)
@@ -1739,7 +1795,7 @@ protected:
 
 	void draw_view(pf::window_frame_ptr& window, pf::draw_context& draw) const override
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto rcClient = client_rect();
 		const auto clip = draw.clip_rect();
 		const auto line_count = static_cast<int>(_doc->size());
@@ -1805,7 +1861,7 @@ protected:
 
 	virtual void draw_caret(pf::draw_context& draw) const
 	{
-		if (!_focused || !_caret.visible || _cursor_hidden)
+		if (!has_caret() || !_focused || !_caret.visible)
 			return;
 
 		const auto pos = _doc->cursor_pos();

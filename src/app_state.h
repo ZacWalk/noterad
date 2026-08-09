@@ -12,6 +12,7 @@ struct search_result;
 class app_state;
 
 class text_view;
+class list_view;
 class file_list_view;
 class search_list_view;
 class doc_view;
@@ -27,11 +28,10 @@ using list_view_item_ptr = std::shared_ptr<list_view_item>;
 class app_state final : public app_events, public pf::frame_reactor, public std::enable_shared_from_this<app_state>
 {
 public:
-	static const pf::file_path about_path;
-	static const pf::file_path test_results_path;
-
 	static constexpr uint64_t max_search_file_size = 10 * 1024 * 1024;
 	static constexpr size_t max_recent_root_folders = 8;
+	static constexpr uint32_t search_debounce_timer_id = 2001;
+	static constexpr uint32_t search_debounce_ms = 150;
 
 	pf::window_frame_ptr _app_window;
 	pf::window_frame_ptr _doc_window;
@@ -71,13 +71,11 @@ public:
 	                                   std::function<bool()> is_enabled_override = nullptr,
 	                                   std::function<bool()> is_checked_override = nullptr,
 	                                   std::string text_override = {}) const override;
-	bool invoke_menu_accelerator(const pf::window_frame_ptr& window,
-	                             const std::vector<pf::menu_command>& items,
-	                             unsigned int vk) const override;
 
 	void ensure_visible(const text_location& pt) override;
 
 	void invalidate_lines(int start, int end) override;
+	void lines_changed(int start, int end) override;
 
 	void path_selected(const index_item_ptr& item) override
 	{
@@ -86,22 +84,26 @@ public:
 		load_doc(item);
 	}
 
-	void open_path_and_select(const index_item_ptr& item, const int line, const int col,
-	                          const int length) override
-	{
-		load_doc(item);
-		const text_selection sel(col, line, col + length, line);
-		active_item()->doc->select(sel);
-		invalidate(invalid::doc | invalid::doc_caret);
-	}
+	// The document may still be loading, so the match is selected from the load continuation
+	void open_path_and_select(const index_item_ptr& item, int line, int col, int length) override;
 
 	void set_focus(view_focus v) override;
 
 	void set_mode(view_mode m) override;
 
 	void on_search(const std::string& text) override;
+	void run_pending_search();
 
 	void toggle_search_mode();
+
+	// The list panel that currently has focus, and the one whose inline edit box is active
+	[[nodiscard]] list_view* focused_list_view() const;
+	[[nodiscard]] list_view* focused_edit_box_owner() const;
+	[[nodiscard]] bool word_wrap() const { return _word_wrap; }
+	void set_word_wrap(bool enabled);
+	void toggle_word_wrap() { set_word_wrap(!_word_wrap); }
+
+	void set_message(std::string text);
 
 	uint32_t handle_message(pf::window_frame_ptr window, pf::message_type msg,
 	                        uintptr_t wParam, intptr_t lParam) override;
@@ -144,10 +146,29 @@ public:
 	void set_spell_check_mode(spell_check_mode mode, bool persist = true);
 	void remember_root_folder(const pf::file_path& folder, const pf::file_path& document = {});
 	void remember_root_document(const pf::file_path& folder, const pf::file_path& document);
+
+	struct recent_root_entry
+	{
+		pf::file_path folder;
+		pf::file_path document;
+	};
+
+	// Entries arrive most-recent-first, the order they are written to config
+	void restore_recent_root_folders(std::span<const recent_root_entry> entries);
 	void update_recent_root_menu();
 	[[nodiscard]] std::vector<pf::menu_command> build_recent_root_folder_menu();
 	[[nodiscard]] const std::vector<pf::file_path>& recent_root_folders() const { return _recent_root_folders; }
 	[[nodiscard]] const std::vector<pf::file_path>& recent_root_documents() const { return _recent_root_documents; }
+
+	[[nodiscard]] pf::file_path recent_root_document(const pf::file_path& folder) const
+	{
+		for (size_t i = 0; i < _recent_root_folders.size(); ++i)
+		{
+			if (_recent_root_folders[i] == folder)
+				return i < _recent_root_documents.size() ? _recent_root_documents[i] : pf::file_path{};
+		}
+		return {};
+	}
 
 	uint32_t on_close()
 	{
@@ -220,6 +241,17 @@ public:
 		return 0;
 	}
 
+	uint32_t on_refresh_focused_panel()
+	{
+		// F5 refreshes whatever the focused panel shows
+		if (search_list_has_focus() && !_pending_search_text.empty())
+		{
+			run_pending_search();
+			return 0;
+		}
+		return on_refresh();
+	}
+
 	uint32_t on_save()
 	{
 		const auto& path = active_item()->path;
@@ -260,6 +292,8 @@ public:
 		return 0;
 	}
 
+	void calc_selection();
+
 	uint32_t on_edit_remove_duplicates()
 	{
 		doc()->sort_remove_duplicates();
@@ -289,7 +323,7 @@ public:
 
 	void on_navigate_next(bool forward);
 
-	void load_doc(const index_item_ptr& item);
+	void load_doc(const index_item_ptr& item, std::function<void()> on_loaded = {});
 	void load_doc(const pf::file_path& path);
 
 	bool is_path_modified(const index_item_ptr& item) const override
@@ -349,13 +383,14 @@ public:
 	void rename_item(const index_item_ptr& item, const std::string& new_name) override;
 	create_path_result create_new_file(const pf::file_path& folder, std::string content) override;
 	create_path_result create_new_folder(const pf::file_path& folder) override;
+	void show_generated_document(const pf::file_path& path, std::string content);
 
 	void on_idle();
 
 
 	[[nodiscard]] index_item_ptr active_item() const override { return _active_item; }
 	[[nodiscard]] index_item_ptr root_item() const override { return _root_folder; }
-	[[nodiscard]] view_styles styles() const override { return _styles; }
+	[[nodiscard]] const view_styles& styles() const override { return _styles; }
 	[[nodiscard]] view_mode get_mode() const { return _mode; }
 	[[nodiscard]] commands& get_commands() { return _commands; }
 	[[nodiscard]] const commands& get_commands() const { return _commands; }
@@ -363,6 +398,7 @@ public:
 	[[nodiscard]] bool list_has_focus() const;
 	[[nodiscard]] bool file_list_has_focus() const;
 	[[nodiscard]] bool search_list_has_focus() const;
+	[[nodiscard]] bool inline_edit_has_focus() const;
 	[[nodiscard]] list_view_item_ptr selected_file_list_item() const;
 	[[nodiscard]] list_view_item_ptr selected_search_list_item() const;
 	[[nodiscard]] bool can_copy_current_focus() const;
@@ -370,6 +406,8 @@ public:
 	[[nodiscard]] bool copy_current_focus_to_clipboard() const;
 	[[nodiscard]] bool delete_current_focus();
 	[[nodiscard]] bool can_rename_selected_file() const;
+	// True when a text-editing command should apply to the document pane
+	[[nodiscard]] bool can_edit_document() const;
 	void begin_rename_selected_file();
 
 	void invalidate(const uint32_t i) override
@@ -385,8 +423,32 @@ public:
 	[[nodiscard]] document_ptr& doc() { return _active_item->doc; }
 	[[nodiscard]] const document_ptr& doc() const { return _active_item->doc; }
 
+	// False when the file changed on disk since it was loaded and the user declined to overwrite
+	[[nodiscard]] bool confirm_overwrite_external_changes(const pf::file_path& path) const
+	{
+		const auto& d = _active_item->doc;
+		if (!d || !_app_window || !(path == _active_item->path))
+			return true;
+
+		const auto loaded_time = d->disk_modified_time();
+		if (loaded_time <= 1)
+			return true;
+
+		const auto current_time = pf::file_modified_time(path);
+		if (current_time == 0 || current_time == loaded_time)
+			return true;
+
+		return _app_window->message_box(
+			"This file has been modified on disk since it was opened. Overwrite those changes?",
+			g_app_name,
+			pf::msg_box_style::yes_no | pf::msg_box_style::icon_question) == pf::msg_box_result::yes;
+	}
+
 	bool save_active_doc(const pf::file_path& path)
 	{
+		if (!confirm_overwrite_external_changes(path))
+			return false;
+
 		if (_active_item->doc->save_to_file(path))
 		{
 			_active_item->doc->path(path);
@@ -404,11 +466,7 @@ public:
 
 	[[nodiscard]] bool is_item_modified(const index_item_ptr& item) const
 	{
-		if (!item->path.is_save_path())
-			return true;
-		if (item->doc)
-			return item->doc->is_modified();
-		return false;
+		return item->doc && item->doc->is_modified();
 	}
 
 	void update_styles();
@@ -431,6 +489,27 @@ public:
 
 	pf::file_path save_folder() const override;
 
+	// index_snapshot — Plain copy of the per-path state the index loader needs.
+	// The loader runs on a worker thread and must never touch live index_item objects.
+	struct index_snapshot
+	{
+		document_ptr doc;
+		view_content saved_view_content = view_content::none;
+	};
+
+	using index_snapshot_map = std::unordered_map<pf::file_path, index_snapshot, pf::ihash>;
+
+	static void snapshot_index_items_recursive(index_snapshot_map& items_by_path,
+	                                           const index_item_ptr& item)
+	{
+		items_by_path[item->path] = {item->doc, item->saved_view_content};
+
+		for (const auto& i : item->children)
+		{
+			snapshot_index_items_recursive(items_by_path, i);
+		}
+	}
+
 	static void map_index_items_recursive(std::unordered_map<pf::file_path, index_item_ptr, pf::ihash>& items_by_path,
 	                                      const index_item_ptr& item)
 	{
@@ -442,7 +521,7 @@ public:
 		}
 	}
 
-	static index_item_ptr make_item(const std::unordered_map<pf::file_path, index_item_ptr, pf::ihash>& existing,
+	static index_item_ptr make_item(const index_snapshot_map& existing,
 	                                pf::file_path path, bool is_folder)
 	{
 		auto item = std::make_shared<index_item>(path, std::string(path.name()), is_folder);
@@ -450,15 +529,15 @@ public:
 		const auto found = existing.find(path);
 		if (found != existing.end())
 		{
-			item->doc = found->second->doc;
-			item->saved_view_content = found->second->saved_view_content;
+			item->doc = found->second.doc;
+			item->saved_view_content = found->second.saved_view_content;
 		}
 
 		return item;
 	}
 
 	static index_item_ptr load_index(const pf::file_path& root_path,
-	                                 const std::unordered_map<pf::file_path, index_item_ptr, pf::ihash>& existing)
+	                                 const index_snapshot_map& existing)
 	{
 		index_item_ptr root = make_item(existing, root_path, true);
 		std::vector<index_item_ptr> folders_to_load{root};
@@ -509,17 +588,22 @@ public:
 	struct search_input
 	{
 		pf::file_path path;
-		document_ptr doc;
+		document_ptr doc; // only used for direct in-process searches (tests); never crosses a thread
+		std::vector<std::string> lines; // UI-thread snapshot of a modified document
+		bool has_snapshot = false;
 	};
 
 	using search_results_map = std::unordered_map<pf::file_path, std::vector<search_result>, pf::ihash>;
 
-	static constexpr int max_search_results = 5000;
-
 	void execute_search(const std::string& text, std::function<void()> on_complete = {});
-	static search_results_map perform_search(const std::vector<search_input>& inputs, const std::string& text);
+	static search_results_map perform_search(const std::vector<search_input>& inputs, const std::string& text,
+	                                         const std::function<bool()>& is_cancelled = {});
 
 private:
+	bool _word_wrap = true;
+	std::string _pending_search_text;
+	std::atomic<uint32_t> _search_generation = 0;
+
 	[[nodiscard]] std::string relative_name(const pf::file_path& path) const
 	{
 		auto rel_name = std::string(path.view());
@@ -583,14 +667,43 @@ private:
 		return nullptr;
 	}
 
+	static std::vector<std::string> snapshot_document_lines(const document& d)
+	{
+		std::vector<std::string> lines;
+		lines.reserve(d.size());
+
+		for (int i = 0; i < static_cast<int>(d.size()); i++)
+		{
+			std::string line_text;
+			d[i].render(line_text);
+			lines.push_back(std::move(line_text));
+		}
+
+		return lines;
+	}
+
+	// Snapshots unsaved edits so the search worker never reads a live document.
+	// Unmodified documents match the file on disk, so the worker reads those instead.
 	static void collect_search_inputs(const std::vector<index_item_ptr>& items, std::vector<search_input>& inputs)
 	{
 		for (const auto& item : items)
 		{
-			if (!item->is_folder)
-				inputs.push_back({item->path, item->doc});
 			if (item->is_folder)
+			{
 				collect_search_inputs(item->children, inputs);
+				continue;
+			}
+
+			search_input input;
+			input.path = item->path;
+
+			if (item->doc && (item->doc->is_modified() || !item->path.is_save_path()))
+			{
+				input.lines = snapshot_document_lines(*item->doc);
+				input.has_snapshot = true;
+			}
+
+			inputs.push_back(std::move(input));
 		}
 	}
 

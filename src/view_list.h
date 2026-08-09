@@ -63,7 +63,7 @@ protected:
 	void draw_item(pf::draw_context& dc, const list_view_item_ptr& item,
 	               const pf::irect& bounds, const bool selected, const bool hovered)
 	{
-		auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto indent = styles.padding_x + item->depth * styles.indent;
 
 		const auto bg = selected
@@ -207,10 +207,22 @@ protected:
 			{
 				const auto ellipsis_sz = dc.measure_text("...", font_spec);
 				const auto avail = text_bounds.width() - ellipsis_sz.cx;
-				size_t fit = display_text.size();
-				while (fit > 0 && dc.measure_text(display_text.substr(0, fit), font_spec).cx > avail)
-					--fit;
-				ellipsized = std::string(display_text.substr(0, fit)) + "...";
+
+				// Binary search the longest whole-codepoint prefix that fits
+				int lo = 0;
+				int hi = pf::utf8_codepoint_count(display_text);
+				while (lo < hi)
+				{
+					const auto mid = lo + (hi - lo + 1) / 2;
+					const auto bytes = pf::utf8_truncate(display_text, mid);
+					if (dc.measure_text(display_text.substr(0, bytes), font_spec).cx <= avail)
+						lo = mid;
+					else
+						hi = mid - 1;
+				}
+
+				ellipsized = std::string(display_text.substr(0, pf::utf8_truncate(display_text, lo)));
+				ellipsized += "...";
 				display_text = ellipsized;
 			}
 			dc.draw_text(text_bounds.left, text_bounds.top, text_bounds, display_text, font_spec, text_color, bg);
@@ -223,7 +235,7 @@ protected:
 
 	virtual uint32_t on_timer(pf::window_frame_ptr& window, uint32_t id) { return 0; }
 
-	virtual uint32_t on_char(pf::window_frame_ptr& window, char ch) { return 0; }
+	virtual uint32_t on_char(pf::window_frame_ptr& window, char32_t ch) { return 0; }
 
 	virtual uint32_t on_key_down(pf::window_frame_ptr& window, const unsigned int vk)
 	{
@@ -266,7 +278,62 @@ protected:
 		}
 	}
 
+	// The inline text field currently accepting input, if any (search box, rename box)
+	virtual edit_box_widget* active_edit_box() { return nullptr; }
+
+	virtual void on_edit_text_changed()
+	{
+	}
+
 public:
+	// --- Inline edit field operations, invoked by the application command table ---
+
+	[[nodiscard]] bool has_active_edit_box() { return active_edit_box() != nullptr; }
+
+	bool edit_select_all()
+	{
+		auto* e = active_edit_box();
+		if (!e) return false;
+		e->edit.select_all();
+		return true;
+	}
+
+	[[nodiscard]] bool edit_can_copy()
+	{
+		auto* e = active_edit_box();
+		return e && e->edit.has_selection();
+	}
+
+	bool edit_copy()
+	{
+		auto* e = active_edit_box();
+		return e && e->edit.copy_to_clipboard();
+	}
+
+	bool edit_cut()
+	{
+		auto* e = active_edit_box();
+		if (!e || !e->edit.cut_to_clipboard()) return false;
+		on_edit_text_changed();
+		return true;
+	}
+
+	bool edit_paste()
+	{
+		auto* e = active_edit_box();
+		if (!e || !e->edit.paste_from_clipboard()) return false;
+		on_edit_text_changed();
+		return true;
+	}
+
+	bool edit_delete()
+	{
+		auto* e = active_edit_box();
+		if (!e || !e->edit.delete_forward()) return false;
+		on_edit_text_changed();
+		return true;
+	}
+
 	list_view(app_events& events) : _events(events)
 	{
 	}
@@ -392,12 +459,13 @@ public:
 		_view_extent = extent;
 		_vscroll.set_dpi_scale(_events.styles().dpi_scale);
 		layout_list(measure);
+		clamp_scroll_offset();
 		window->invalidate();
 	}
 
 	void layout_list(const pf::measure_context& measure)
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto font_spec = styles.list_font;
 		_font_extent = measure.measure_char(font_spec);
 		layout_list(styles);

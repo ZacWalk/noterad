@@ -17,21 +17,15 @@ protected:
 
 	pf::isize _font_extent = {10, 10};
 	int _screen_lines = 0;
-	int _max_lines = 0;
-
-	// Text selection state
-	text_selection _output_sel;
-	text_location _sel_anchor;
-	bool _selecting = false;
 
 	// --- Scroll position helpers (convert between pixels and line/char units) ---
-
-	int scroll_line() const { return _font_extent.cy > 0 ? _scroll_offset.y / _font_extent.cy : 0; }
-	int scroll_char() const { return _font_extent.cx > 0 ? _scroll_offset.x / _font_extent.cx : 0; }
 
 	void set_scroll_char(const int x) { _scroll_offset.x = x * _font_extent.cx; }
 
 public:
+	[[nodiscard]] int scroll_line() const { return _scroll_offset.y / _font_extent.cy; }
+	[[nodiscard]] int scroll_char() const { return _scroll_offset.x / _font_extent.cx; }
+
 	[[nodiscard]] int message_bar_height() const
 	{
 		return _events.message_bar_text().empty() ? 0 : _font_extent.cy + _font_extent.cy / 2;
@@ -58,10 +52,9 @@ public:
 
 	// --- Text selection interface ---
 	// Virtual methods for text selection, coordinating with document selection logic.
-	// Default implementation uses the local _output_sel; doc_view overrides to delegate to the document.
-	[[nodiscard]] virtual text_selection current_selection() const { return _output_sel; }
-	virtual void set_selection(const text_selection& sel) { _output_sel = sel; }
-	[[nodiscard]] virtual bool has_current_selection() const { return !_output_sel.empty(); }
+	[[nodiscard]] virtual text_selection current_selection() const = 0;
+	virtual void set_selection(const text_selection& sel) = 0;
+	[[nodiscard]] virtual bool has_current_selection() const = 0;
 	[[nodiscard]] virtual bool can_copy_text() const { return has_current_selection(); }
 	[[nodiscard]] virtual bool can_cut_text() const { return false; }
 	[[nodiscard]] virtual bool can_paste_text() const { return false; }
@@ -106,20 +99,7 @@ public:
 	{
 	}
 
-	virtual void recalc_vert_scrollbar()
-	{
-		// Content extent includes one row of top padding for smooth pixel scrolling
-		_content_extent.cy = _font_extent.cy + _max_lines * _font_extent.cy;
-
-		const int max_y = std::max(0, _content_extent.cy - (_view_extent.cy - text_top()));
-		if (_scroll_offset.y > max_y)
-		{
-			_scroll_offset.y = max_y;
-			_events.invalidate(invalid::windows);
-		}
-
-		_vscroll.update(_max_lines + 1 + 2, _screen_lines, scroll_line());
-	}
+	virtual void recalc_vert_scrollbar() = 0;
 
 	void invalidate(const pf::window_frame_ptr& window, const pf::irect r = {}) const
 	{
@@ -203,11 +183,13 @@ public:
 	void handle_size(pf::window_frame_ptr& window, const pf::isize extent,
 	                 pf::measure_context& measure) override
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 
 		_view_extent = extent;
 		_font_extent = measure.measure_char(styles.text_font);
-		_screen_lines = _font_extent.cy > 0 ? extent.cy / _font_extent.cy : 0;
+		_font_extent.cx = std::max(1, _font_extent.cx);
+		_font_extent.cy = std::max(1, _font_extent.cy);
+		_screen_lines = extent.cy / _font_extent.cy;
 		_vscroll.set_dpi_scale(styles.dpi_scale);
 		_events.invalidate(invalid::doc_scrollbar);
 		window->invalidate();
@@ -215,13 +197,13 @@ public:
 
 	void scroll_to_top()
 	{
-		view_base::scroll_to_top();
+		_scroll_offset = {};
 		_events.invalidate(invalid::windows);
 	}
 
 	void scroll_to_end()
 	{
-		view_base::scroll_to_end();
+		_scroll_offset.y = max_scroll_y();
 		_events.invalidate(invalid::windows);
 	}
 
@@ -254,6 +236,11 @@ public:
 		invalidate(window);
 	}
 
+	virtual void lines_changed(pf::window_frame_ptr& window, const int start, const int end)
+	{
+		invalidate_lines(window, start, end);
+	}
+
 protected:
 	[[nodiscard]] pf::color_t focus_band_color() const
 	{
@@ -281,10 +268,10 @@ protected:
 	}
 
 	template <typename AdvanceFn>
-	static std::vector<int> calc_word_breaks(const std::string_view text, const int max_cols,
-	                                         AdvanceFn&& char_advance)
+	static void calc_word_breaks_into(std::vector<int>& breaks, const std::string_view text, const int max_cols,
+	                                  AdvanceFn&& char_advance)
 	{
-		std::vector<int> breaks;
+		breaks.clear();
 		const auto len = static_cast<int>(text.size());
 		int col = 0;
 		int last_break_opportunity = -1;
@@ -320,13 +307,21 @@ protected:
 				col += advance;
 			}
 		}
+	}
+
+	template <typename AdvanceFn>
+	static std::vector<int> calc_word_breaks(const std::string_view text, const int max_cols,
+	                                         AdvanceFn&& char_advance)
+	{
+		std::vector<int> breaks;
+		calc_word_breaks_into(breaks, text, max_cols, std::forward<AdvanceFn>(char_advance));
 		return breaks;
 	}
 
 	virtual void draw_view(pf::window_frame_ptr& window,
 	                       pf::draw_context& draw) const = 0;
 
-	virtual void on_char(pf::window_frame_ptr& window, const char c)
+	virtual void on_char(pf::window_frame_ptr& window, const char32_t c)
 	{
 	}
 
@@ -414,10 +409,7 @@ protected:
 
 	virtual void on_mouse_wheel(pf::window_frame_ptr& window, const int zDelta)
 	{
-		if (_screen_lines < _max_lines)
-		{
-			set_scroll_pixel(_scroll_offset.y + zDelta * _font_extent.cy);
-		}
+		set_scroll_pixel(_scroll_offset.y + zDelta * _font_extent.cy);
 	}
 
 	virtual void zoom(const pf::window_frame_ptr& window, const int delta)
@@ -461,14 +453,13 @@ protected:
 		const auto text = _events.message_bar_text();
 		if (text.empty()) return;
 
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto rcClient = client_rect();
 		const auto bar_h = message_bar_height();
 		const auto pad_y = _font_extent.cy / 4;
 		const auto bg = _focused ? ui::focus_handle_color : ui::handle_color;
 		const pf::irect bar_rc(0, 0, rcClient.right, bar_h);
-		const auto text_len = static_cast<int>(text.size());
-		const auto text_w = text_len * _font_extent.cx;
+		const auto text_w = pf::utf8_codepoint_count(text) * _font_extent.cx;
 		const auto text_x = (rcClient.right - text_w) / 2;
 
 		draw.fill_solid_rect(bar_rc, bg);

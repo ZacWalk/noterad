@@ -1,9 +1,11 @@
-// tests.cpp — Unit tests for document editing, undo/redo, search, and crypto
+// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
 
 #include "pch.h"
 #include "app.h"
 #include "document.h"
 #include "app_state.h"
+#include "view_doc.h"
+#include "calc.h"
 #include "test.h"
 
 
@@ -15,6 +17,10 @@ public:
 	}
 
 	void invalidate_lines(int, int) override
+	{
+	}
+
+	void lines_changed(int, int) override
 	{
 	}
 
@@ -86,8 +92,6 @@ struct stub_window_frame final : pf::window_frame
 	{
 	}
 
-	std::string text_from_clipboard() override { return {}; }
-	bool text_to_clipboard(std::string_view) override { return false; }
 	placement get_placement() const override { return {}; }
 
 	void set_placement(const placement&) override
@@ -269,11 +273,82 @@ static void should_reformat_json_preserves_strings()
 	                      "comma and braces inside string preserved");
 }
 
-static void should_calc_sha256()
+static void should_ignore_carriage_return_char()
 {
-	const auto text = "hello world";
-	const auto output = calc_sha256(text);
-	should::is_equal("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", to_hex(output));
+	const auto doc = std::make_shared<document>(null_ev, "ab");
+	{
+		undo_group ug(doc);
+		doc->insert_text(ug, text_location(1, 0), '\r');
+	}
+
+	should::is_equal("ab", doc->str());
+	should::is_equal(false, doc->can_undo(), "CR records no undo step");
+	should::is_equal(false, doc->is_modified(), "CR does not modify");
+}
+
+static void should_delete_back_multibyte_char()
+{
+	const std::string_view initial = "a\xC3\xA9" "b"; // a + U+00E9 + b
+	const auto doc = std::make_shared<document>(null_ev, initial);
+	{
+		undo_group ug(doc);
+		doc->delete_text(ug, text_location(3, 0));
+	}
+
+	should::is_equal("ab", doc->str(), "whole codepoint erased");
+	doc->undo();
+	should::is_equal(initial, doc->str(), "undo restores the codepoint");
+	doc->redo();
+	should::is_equal("ab", doc->str(), "redo");
+}
+
+static void should_max_line_length_grows_on_typing()
+{
+	const auto doc = std::make_shared<document>(null_ev, "ab\nlonger line");
+	should::is_equal(11, doc->max_line_length(), "initial longest line");
+
+	{
+		undo_group ug(doc);
+		auto location = text_location(2, 0);
+		for (const auto c : std::string_view("cdefghijklmn"))
+			location = doc->insert_text(ug, location, c);
+	}
+
+	should::is_equal(14, doc->max_line_length(), "max line length after typing");
+}
+
+static double calc_value(const std::string_view expression)
+{
+	calc_parser parser(expression);
+	const auto value = parser.parse();
+	should::is_equal_true(value.has_value(), std::format("parse '{}': {}", expression, parser.error()));
+	return value.value_or(0.0);
+}
+
+static void should_calc_expressions()
+{
+	should::is_equal_true(calc_value("2+3*4") == 14.0, "precedence");
+	should::is_equal_true(calc_value("(2+3)*4") == 20.0, "parentheses");
+	should::is_equal_true(calc_value("-3+5") == 2.0, "unary minus");
+	should::is_equal_true(calc_value("1.5*2") == 3.0, "decimal point");
+	should::is_equal_true(calc_value("10/4") == 2.5, "division");
+	should::is_equal_true(calc_value(" 1 + 2 ") == 3.0, "whitespace");
+}
+
+static void should_calc_rejects_bad_input()
+{
+	calc_parser div_zero("1/0");
+	should::is_equal(false, div_zero.parse().has_value(), "division by zero rejected");
+	should::is_equal("Division by zero.", div_zero.error());
+
+	calc_parser trailing("1+2 abc");
+	should::is_equal(false, trailing.parse().has_value(), "trailing garbage rejected");
+
+	calc_parser unbalanced("(1+2");
+	should::is_equal(false, unbalanced.parse().has_value(), "missing paren rejected");
+
+	calc_parser empty("");
+	should::is_equal(false, empty.parse().has_value(), "empty input rejected");
 }
 
 // ── util.h string tests ────────────────────────────────────────────────────────
@@ -336,12 +411,6 @@ static void should_replace_string()
 	should::is_equal("abc", replace("abc", "", "X")); // empty find must not loop forever
 }
 
-static void should_last_char()
-{
-	should::is_equal(L'd', last_char("abcd"));
-	should::is_equal(0, last_char(""));
-}
-
 static void should_is_empty()
 {
 	should::is_equal_true(pf::is_empty(static_cast<const char*>(nullptr)));
@@ -400,60 +469,7 @@ static void should_irect_ops()
 	should::is_equal(false, a.intersects(c));
 }
 
-// ── util.h encoding tests ──────────────────────────────────────────────────────
-
-static void should_hex_roundtrip()
-{
-	std::vector<uint8_t> data = {0xDE, 0xAD, 0xBE, 0xEF};
-	const auto hex = to_hex(data);
-	should::is_equal("deadbeef", hex);
-
-	const auto back = hex_to_data(hex);
-	should::is_equal(static_cast<int>(data.size()), static_cast<int>(back.size()));
-	for (size_t i = 0; i < data.size(); ++i)
-		should::is_equal(data[i], back[i]);
-}
-
-static void should_base64_encode()
-{
-	const std::string text = "Hello";
-	const std::vector<uint8_t> data(text.begin(), text.end());
-	should::is_equal("SGVsbG8=", to_base64(data));
-
-	std::vector<uint8_t> empty;
-	should::is_equal("", to_base64(empty));
-}
-
-static void should_aes256_roundtrip()
-{
-	static const uint8_t key_data[32] = {
-		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-		0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-		0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
-	};
-	uint8_t plaintext[16] = {
-		'H', 'e', 'l', 'l', 'o', ' ', 'A', 'E',
-		'S', '-', '2', '5', '6', '!', '!', '!'
-	};
-	uint8_t original[16];
-	std::copy_n(plaintext, 16, original);
-
-	aes256 cipher(key_data);
-	cipher.encrypt_ecb(plaintext);
-
-	// encrypted data should differ from original
-	bool differs = false;
-	for (int i = 0; i < 16; ++i)
-		if (plaintext[i] != original[i]) differs = true;
-	should::is_equal_true(differs);
-
-	aes256 decipher(key_data);
-	decipher.decrypt_ecb(plaintext);
-
-	for (int i = 0; i < 16; ++i)
-		should::is_equal(original[i], plaintext[i]);
-}
+// ── util.h misc tests ──────────────────────────────────────────────────────────
 
 static void should_clamp_value()
 {
@@ -739,6 +755,30 @@ public:
 	void run_ui(const std::function<void()> task) override { if (task) task(); }
 };
 
+// deferred_scheduler — Queues work the way the real message loop does, so tests
+// see the same ordering as production instead of everything completing inline.
+class deferred_scheduler final : public async_scheduler
+{
+	std::vector<std::function<void()>> _async;
+	std::vector<std::function<void()>> _ui;
+
+public:
+	void run_async(std::function<void()> task) override { if (task) _async.push_back(std::move(task)); }
+	void run_ui(std::function<void()> task) override { if (task) _ui.push_back(std::move(task)); }
+
+	void pump()
+	{
+		for (int round = 0; round < 32 && !(_async.empty() && _ui.empty()); round++)
+		{
+			auto async_tasks = std::exchange(_async, {});
+			for (auto& t : async_tasks) t();
+
+			auto ui_tasks = std::exchange(_ui, {});
+			for (auto& t : ui_tasks) t();
+		}
+	}
+};
+
 
 static std::shared_ptr<app_state> create_test_app()
 {
@@ -825,7 +865,7 @@ static void should_cap_search_results()
 	// First file alone produces more matches than the cap; the second file must
 	// not push the total above max_search_results.
 	std::string many_lines;
-	for (int i = 0; i < app_state::max_search_results + 50; i++)
+	for (int i = 0; i < max_search_results + 50; i++)
 		many_lines += "x\n";
 
 	std::vector<app_state::search_input> inputs;
@@ -838,7 +878,7 @@ static void should_cap_search_results()
 	for (const auto& entry : results)
 		total += static_cast<int>(entry.second.size());
 
-	should::is_equal(app_state::max_search_results, total, "search results capped");
+	should::is_equal(max_search_results, total, "search results capped");
 }
 
 static void should_create_new_file_with_content()
@@ -1032,6 +1072,97 @@ static void should_cap_recent_root_folders_at_eight()
 	should::is_equal("c:\\folder2", state->recent_root_folders()[7].view(), "oldest retained folder kept last");
 }
 
+static void should_select_word_containing_non_ascii()
+{
+	// "café latte" — é is two bytes, so a byte-wise scan would stop inside it
+	const auto d = std::make_shared<document>(null_ev, "caf\xC3\xA9 latte");
+
+	const auto sel = d->word_selection(text_location(1, 0), false);
+	should::is_equal(0, sel._start.x, "word starts at line start");
+	should::is_equal(5, sel._end.x, "word ends after the two-byte codepoint");
+
+	d->move_to(text_location(0, 0), false);
+	d->move_word_right(false);
+	should::is_equal(6, d->cursor_pos().x, "word right lands past the trailing space");
+
+	d->move_word_left(false);
+	should::is_equal(0, d->cursor_pos().x, "word left returns to the start of the word");
+}
+
+static void should_insert_non_ascii_codepoint_as_utf8()
+{
+	const auto d = std::make_shared<document>(null_ev, "");
+
+	{
+		undo_group ug(d);
+		d->insert_text(ug, text_location(0, 0), pf::utf8_encode(U'\u00e9'));
+	}
+
+	should::is_equal("\xC3\xA9", d->str(), "codepoint stored as UTF-8");
+
+	{
+		undo_group ug(d);
+		d->insert_text(ug, text_location(2, 0), pf::utf8_encode(U'\U0001F600'));
+	}
+
+	should::is_equal("\xC3\xA9\xF0\x9F\x98\x80", d->str(), "supplementary codepoint stored as UTF-8");
+
+	d->edit_undo();
+	should::is_equal("\xC3\xA9", d->str(), "undo removes the whole codepoint");
+}
+
+static void should_keep_max_line_length_after_editing_a_short_line()
+{
+	const std::string long_line(50, 'x');
+	const auto d = std::make_shared<document>(null_ev, "ab\n" + long_line);
+
+	{
+		undo_group ug(d);
+		d->insert_text(ug, text_location(2, 0), "c"); // edit the short first line
+	}
+
+	should::is_equal(50, d->max_line_length(), "longest line still drives the max");
+}
+
+static void should_block_edits_to_read_only_document()
+{
+	const auto state = create_test_app();
+	const auto root = std::make_shared<index_item>(pf::file_path{"c:\\folder"}, "folder", true);
+	state->set_root(root);
+	state->create_new_file(state->save_folder().combine("data", "txt"), "b\na\nb\n");
+
+	should::is_equal_true(state->can_edit_document(), "writable document allows editing commands");
+
+	state->doc()->read_only(true);
+	should::is_equal_true(!state->can_edit_document(), "read-only document blocks editing commands");
+
+	const auto before = state->doc()->str();
+	state->doc()->sort_remove_duplicates();
+	should::is_equal(before, state->doc()->str(), "sort leaves a read-only document unchanged");
+}
+
+static void should_restore_recent_root_folders_in_saved_order()
+{
+	const auto state = create_test_app();
+	state->_recent_root_folders.clear();
+	state->_recent_root_documents.clear();
+
+	const app_state::recent_root_entry entries[] = {
+		{pf::file_path{"c:\\newest"}, pf::file_path{"c:\\newest\\a.md"}},
+		{pf::file_path{"c:\\middle"}, pf::file_path{"c:\\middle\\b.md"}},
+		{pf::file_path{"c:\\oldest"}, pf::file_path{"c:\\oldest\\c.md"}},
+	};
+
+	state->restore_recent_root_folders(entries);
+
+	should::is_equal(3, static_cast<int>(state->recent_root_folders().size()), "all entries restored");
+	should::is_equal("c:\\newest", state->recent_root_folders()[0].view(), "most recent stays first");
+	should::is_equal("c:\\middle", state->recent_root_folders()[1].view(), "middle entry keeps position");
+	should::is_equal("c:\\oldest", state->recent_root_folders()[2].view(), "oldest stays last");
+	should::is_equal("c:\\newest\\a.md", state->recent_root_document(pf::file_path{"c:\\newest"}).view(),
+	                 "document restored alongside its folder");
+}
+
 static void should_restore_last_open_file_when_switching_recent_root_folder()
 {
 	const auto state = create_test_app();
@@ -1065,6 +1196,63 @@ static void should_restore_last_open_file_when_switching_recent_root_folder()
 	pf::platform_recycle_file(second_root);
 }
 
+static void should_select_search_match_after_deferred_load()
+{
+	const auto root = create_temp_test_root();
+	const auto file = root.combine("match", "txt");
+	write_test_text_file(file, "alpha\r\nbeta needle gamma\r\n");
+
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = std::make_shared<app_state>(scheduler);
+	state->_startup_folder = root;
+	state->on_create(std::make_shared<stub_window_frame>());
+	scheduler->pump();
+
+	const auto item = find_test_item(state->root_item(), file);
+	should::is_equal_true(item != nullptr, "indexed file found");
+
+	// "needle" begins at byte 5 of line 1 and the document has not been read yet
+	state->open_path_and_select(item, 1, 5, 6);
+	should::is_equal_true(state->active_item()->doc->size() == 1, "document not yet loaded");
+
+	scheduler->pump();
+
+	const auto sel = state->active_item()->doc->selection();
+	should::is_equal(1, sel._start.y, "match line selected after load");
+	should::is_equal(5, sel._start.x, "match start selected after load");
+	should::is_equal(11, sel._end.x, "match end selected after load");
+
+	pf::platform_recycle_file(root);
+}
+
+static void should_scroll_to_search_match_after_deferred_load()
+{
+	const auto root = create_temp_test_root();
+	const auto file = root.combine("scroll", "txt");
+
+	std::string text;
+	for (int i = 0; i < 200; i++) text += std::format("line {}\r\n", i);
+	text += "beta needle gamma\r\n";
+	write_test_text_file(file, text);
+
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = std::make_shared<app_state>(scheduler);
+	state->_startup_folder = root;
+	state->on_create(std::make_shared<stub_window_frame>());
+	scheduler->pump();
+
+	const auto item = find_test_item(state->root_item(), file);
+	should::is_equal_true(item != nullptr, "indexed file found");
+
+	state->open_path_and_select(item, 200, 5, 6);
+	scheduler->pump();
+
+	// The view metrics still described the placeholder document, so the scroll clamped to zero
+	should::is_equal_true(state->_doc_view->scroll_line() > 0, "view scrolled to the match");
+
+	pf::platform_recycle_file(root);
+}
+
 static void should_doc_is_json()
 {
 	const auto d1 = std::make_shared<document>(null_ev, "{\"key\":\"value\"}");
@@ -1085,6 +1273,38 @@ static void should_doc_sort_remove_duplicates()
 	d->sort_remove_duplicates();
 
 	should::is_equal("apple\nbanana\ncherry", d->str());
+}
+
+static void should_doc_sort_remove_duplicates_keeps_case()
+{
+	const auto d = std::make_shared<document>(null_ev,
+	                                          "Apple\napple\nApple\nbanana");
+	d->sort_remove_duplicates();
+
+	should::is_equal("Apple\napple\nbanana", d->str());
+}
+
+static void should_save_preserves_bom_presence()
+{
+	const auto root = create_temp_test_root();
+
+	const auto no_bom_path = root.combine("no_bom.txt");
+	write_test_text_file(no_bom_path, "hello\r\nworld");
+
+	const auto without_bom = std::make_shared<document>(null_ev);
+	without_bom->apply_loaded_data(no_bom_path, load_lines(no_bom_path));
+	should::is_equal_true(without_bom->save_to_file(no_bom_path), "saved BOM-less file");
+	should::is_equal("hello\r\nworld", read_test_text_file(no_bom_path), "no BOM added on save");
+
+	const auto bom_path = root.combine("bom.txt");
+	write_test_text_file(bom_path, "\xEF\xBB\xBF" "hello");
+
+	const auto with_bom = std::make_shared<document>(null_ev);
+	with_bom->apply_loaded_data(bom_path, load_lines(bom_path));
+	should::is_equal_true(with_bom->save_to_file(bom_path), "saved BOM file");
+	should::is_equal("\xEF\xBB\xBF" "hello", read_test_text_file(bom_path), "BOM preserved on save");
+
+	pf::platform_recycle_file(root);
 }
 
 static void should_doc_reformat_json()
@@ -1147,6 +1367,26 @@ static void should_undo_multiple_to_clean()
 	// Undo two → clean
 	d->edit_undo();
 	should::is_equal(false, d->is_modified(), "undo two clean");
+}
+
+static void should_undo_delete_back_to_clean()
+{
+	const auto d = std::make_shared<document>(null_ev, "hello world");
+	should::is_equal(false, d->is_modified());
+
+	{
+		undo_group ug(d);
+		d->delete_text(ug, text_selection(5, 0, 11, 0));
+	}
+	should::is_equal("hello", d->str());
+	should::is_equal_true(d->is_modified(), "delete is modified");
+
+	d->edit_undo();
+	should::is_equal("hello world", d->str(), "undo restores deleted text");
+	should::is_equal(false, d->is_modified(), "undo of delete returns to clean");
+
+	d->edit_redo();
+	should::is_equal_true(d->is_modified(), "redo is modified");
 }
 
 
@@ -1283,7 +1523,13 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should return selection", should_return_selection);
 	tests.register_test("should cut and paste", should_cut_and_paste);
 	tests.register_test("should reformat json preserves strings", should_reformat_json_preserves_strings);
-	tests.register_test("should calc pf::sha256", should_calc_sha256);
+	tests.register_test("should ignore carriage return char", should_ignore_carriage_return_char);
+	tests.register_test("should delete back over multi-byte char", should_delete_back_multibyte_char);
+	tests.register_test("should grow max_line_length while typing", should_max_line_length_grows_on_typing);
+
+	// Calculator tests
+	tests.register_test("should calc expressions", should_calc_expressions);
+	tests.register_test("should calc reject bad input", should_calc_rejects_bad_input);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);
@@ -1292,7 +1538,6 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should find_in_text", should_find_in_text);
 	tests.register_test("should combine lines", should_combine_lines);
 	tests.register_test("should replace string", should_replace_string);
-	tests.register_test("should last_char", should_last_char);
 	tests.register_test("should is_empty", should_is_empty);
 
 	// Geometry tests
@@ -1301,9 +1546,7 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should pf::irect ops", should_irect_ops);
 
 	// Encoding tests
-	tests.register_test("should hex roundtrip", should_hex_roundtrip);
-	tests.register_test("should base64 encode", should_base64_encode);
-	tests.register_test("should pf::aes256 roundtrip", should_aes256_roundtrip);
+	tests.register_test("should save preserve BOM presence", should_save_preserves_bom_presence);
 
 	// Misc utility tests
 	tests.register_test("should clamp value", should_clamp_value);
@@ -1359,12 +1602,28 @@ tests::run_result run_all_tests_result()
 	                    should_remember_recent_root_folders_most_recent_first);
 	tests.register_test("should cap recent root folders at eight",
 	                    should_cap_recent_root_folders_at_eight);
+	tests.register_test("should restore recent root folders in saved order",
+	                    should_restore_recent_root_folders_in_saved_order);
+	tests.register_test("should keep max line length after editing a short line",
+	                    should_keep_max_line_length_after_editing_a_short_line);
+	tests.register_test("should select word containing non ascii",
+	                    should_select_word_containing_non_ascii);
+	tests.register_test("should insert non ascii codepoint as utf8",
+	                    should_insert_non_ascii_codepoint_as_utf8);
+	tests.register_test("should block edits to read only document",
+	                    should_block_edits_to_read_only_document);
 	tests.register_test("should restore last open file when switching recent root folder",
 	                    should_restore_last_open_file_when_switching_recent_root_folder);
+	tests.register_test("should select search match after deferred load",
+	                    should_select_search_match_after_deferred_load);
+	tests.register_test("should scroll to search match after deferred load",
+	                    should_scroll_to_search_match_after_deferred_load);
 	tests.register_test("should doc is_json", should_doc_is_json);
 	tests.register_test("should doc sort_remove_duplicates", should_doc_sort_remove_duplicates);
+	tests.register_test("should doc sort_remove_duplicates keeps case", should_doc_sort_remove_duplicates_keeps_case);
 	tests.register_test("should doc reformat_json", should_doc_reformat_json);
 	tests.register_test("should undo back to clean", should_undo_back_to_clean);
+	tests.register_test("should undo delete back to clean", should_undo_delete_back_to_clean);
 	tests.register_test("should undo multiple to clean", should_undo_multiple_to_clean);
 
 	// Search tests

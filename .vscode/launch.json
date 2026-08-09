@@ -5,7 +5,7 @@
             "name": "Noterad (Debug x64)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/exe/noterad64d.exe",
+            "program": "${workspaceFolder}/exe/noterad-64d.exe",
             "args": [],
             "cwd": "${workspaceFolder}/exe",
             "preLaunchTask": "Build Noterad"
@@ -14,7 +14,7 @@
             "name": "Noterad (Release x64)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/exe/noterad64.exe",
+            "program": "${workspaceFolder}/exe/noterad-64.exe",
             "args": [],
             "cwd": "${workspaceFolder}/exe",
             "preLaunchTask": "Build Noterad (Release)"

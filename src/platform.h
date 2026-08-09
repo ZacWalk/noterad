@@ -3,12 +3,16 @@
 
 #pragma once
 
+#include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <bit>
 #include <charconv>
 #include <stdexcept>
@@ -18,6 +22,8 @@
 
 namespace pf
 {
+	constexpr uint32_t REPLACEMENT_CHAR = 0xfffdu;
+	constexpr uint32_t MAX_CODE_POINT = 0x10ffffu;
 	constexpr uint32_t LEAD_SURROGATE_MIN = 0xd800u;
 	constexpr uint32_t LEAD_SURROGATE_MAX = 0xdbffu;
 	constexpr uint32_t TRAIL_SURROGATE_MIN = 0xdc00u;
@@ -92,10 +98,6 @@ namespace pf
 	}
 
 	std::string utf16_to_utf8(std::wstring_view wstr);
-	std::string u32_to_utf8(std::u32string_view str);
-	std::u32string utf8_to_u32(std::string_view str);
-	std::wstring u32_to_wstr(std::u32string_view str);
-	std::u32string wstr_to_u32(std::wstring_view str);
 
 	constexpr uint32_t to_lower(const uint32_t c)
 	{
@@ -163,36 +165,40 @@ namespace pf
 		return '?';
 	}
 
-	constexpr uint32_t peek_utf8_char(std::string_view::const_iterator in_ptr,
-	                                  const std::string_view::const_iterator& end)
-	{
-		return pop_utf8_char(in_ptr, end);
-	}
-
 	inline std::string_view utf8_cast(const std::string_view val)
 	{
 		return {std::bit_cast<const char*>(val.data()), val.size()};
 	}
 
-	inline std::wstring utf8_to_utf16(const std::string_view s)
+	inline void utf8_to_utf16(const std::string_view s, std::wstring& result)
 	{
-		std::wstring result;
-		result.reserve(s.size());
+		result.clear();
+		result.reserve(std::max(result.capacity(), s.size()));
 		auto i = s.begin();
 		while (i < s.end())
 		{
-			const auto cp = pop_utf8_char(i, s.end());
+			auto cp = pop_utf8_char(i, s.end());
+
+			// Surrogate halves and out-of-range values have no valid UTF-16 form
+			if (cp > MAX_CODE_POINT || is_lead_surrogate(cp) || is_trail_surrogate(cp))
+				cp = REPLACEMENT_CHAR;
 
 			if (cp > 0xffff)
 			{
-				result += static_cast<uint16_t>((cp >> 10) + LEAD_OFFSET);
-				result += static_cast<uint16_t>((cp & 0x3ff) + TRAIL_SURROGATE_MIN);
+				result += static_cast<wchar_t>((cp >> 10) + LEAD_OFFSET);
+				result += static_cast<wchar_t>((cp & 0x3ff) + TRAIL_SURROGATE_MIN);
 			}
 			else
 			{
-				result += static_cast<uint16_t>(cp);
+				result += static_cast<wchar_t>(cp);
 			}
 		}
+	}
+
+	inline std::wstring utf8_to_utf16(const std::string_view s)
+	{
+		std::wstring result;
+		utf8_to_utf16(s, result);
 		return result;
 	}
 
@@ -236,29 +242,22 @@ namespace pf
 		{
 			uint32_t cp = mask16(*start++);
 
+			// Unpaired surrogates are substituted rather than rejected: NTFS permits
+			// them in file names and the clipboard can contain them.
 			if (is_lead_surrogate(cp))
 			{
-				if (start != end)
+				if (start != end && is_trail_surrogate(mask16(*start)))
 				{
-					const uint32_t trail_surrogate = mask16(*start++);
-
-					if (is_trail_surrogate(trail_surrogate))
-					{
-						cp = (cp << 10) + trail_surrogate + SURROGATE_OFFSET;
-					}
-					else
-					{
-						throw std::invalid_argument("Invalid input string");
-					}
+					cp = (cp << 10) + mask16(*start++) + SURROGATE_OFFSET;
 				}
 				else
 				{
-					throw std::invalid_argument("Invalid input string");
+					cp = REPLACEMENT_CHAR;
 				}
 			}
 			else if (is_trail_surrogate(cp))
 			{
-				throw std::invalid_argument("Invalid input string");
+				cp = REPLACEMENT_CHAR;
 			}
 
 			char32_to_utf8(inserter, cp);
@@ -271,6 +270,14 @@ namespace pf
 		utf16_to_utf8(s, result);
 		return result;
 	};
+
+	// Short enough to stay inside the small-string buffer, so this does not allocate.
+	inline std::string utf8_encode(const char32_t cp)
+	{
+		std::string result;
+		char32_to_utf8(std::back_inserter(result), static_cast<uint32_t>(cp));
+		return result;
+	}
 
 	inline std::string to_lower(const std::string_view s)
 	{
@@ -344,9 +351,6 @@ namespace pf
 
 		return text;
 	}
-
-
-	std::string url_encode(std::string_view input);
 
 	class ipoint
 	{
@@ -481,12 +485,6 @@ namespace pf
 		{
 			return lighten(-n);
 		}
-
-		[[nodiscard]] constexpr color_t emphasize(const int n = 48) const
-		{
-			const bool is_light = r > 0x80 || g > 0x80 || b > 0x80;
-			return lighten(is_light ? -n : n);
-		}
 	};
 
 	uint32_t fnv1a_i(std::string_view sv);
@@ -572,6 +570,8 @@ namespace pf
 
 		[[nodiscard]] file_path combine(const std::string_view part) const
 		{
+			if (_path.empty()) return file_path{part};
+
 			auto result = _path;
 
 			if (!part.empty())
@@ -665,14 +665,6 @@ namespace pf
 		return result;
 	}
 
-	inline double stod(const std::string_view u8_string)
-	{
-		const auto sv = std::string_view(u8_string.data(), u8_string.size());
-		double result = 0.0;
-		std::from_chars(sv.data(), sv.data() + sv.size(), result);
-		return result;
-	}
-
 
 	// Key codes (match Windows VK_ values)
 	//
@@ -743,6 +735,7 @@ namespace pf
 		std::function<bool()> is_checked;
 		std::vector<menu_command> children;
 		key_binding accel;
+		key_binding accel_alt; // second binding for the same command; only accel is shown in the menu
 
 		menu_command() = default;
 
@@ -751,10 +744,11 @@ namespace pf
 		             std::function<void()> act,
 		             std::function<bool()> en = nullptr,
 		             std::function<bool()> chk = nullptr,
-		             const key_binding kb = {})
+		             const key_binding kb = {},
+		             const key_binding kb_alt = {})
 			: text(std::move(t)), id(cmd_id), action(std::move(act)),
 			  is_enabled(std::move(en)), is_checked(std::move(chk)),
-			  accel(kb)
+			  accel(kb), accel_alt(kb_alt)
 		{
 		}
 
@@ -844,7 +838,7 @@ namespace pf
 	struct keyboard_params
 	{
 		unsigned int vk = 0; // virtual key code (for key_down)
-		char ch = 0; // character (for char_input)
+		char32_t ch = 0; // codepoint (for char_input), surrogate pairs already combined
 	};
 
 	// Extract signed mouse coordinates from packed lParam (handles negative values on multi-monitor)
@@ -936,9 +930,6 @@ namespace pf
 		virtual void show(bool visible) = 0;
 		virtual bool is_visible() const = 0;
 		virtual void set_text(std::string_view text) = 0;
-		// Clipboard
-		virtual std::string text_from_clipboard() = 0;
-		virtual bool text_to_clipboard(std::string_view text) = 0;
 
 		// Window placement
 		struct placement
@@ -1067,18 +1058,10 @@ namespace pf
 
 	uint64_t file_modified_time(const file_path& path);
 
-	bool platform_events();
 	void platform_set_menu(std::vector<menu_command> menuDef);
 
 	// Platform message loop (returns process exit code)
 	int platform_run();
-
-	// Timer
-	double platform_get_time();
-	void platform_sleep(int milliseconds);
-
-	// Resource loading
-	void* platform_load_resource(std::string_view name, std::string_view type);
 
 	void platform_show_error(std::string_view message, std::string_view title);
 
@@ -1138,17 +1121,6 @@ namespace pf
 	std::string platform_text_from_clipboard();
 	bool platform_text_to_clipboard(std::string_view text);
 
-	// Bitmap resource loading
-	struct bitmap_data
-	{
-		int width;
-		int height;
-		std::vector<uint32_t> pixels;
-	};
-
-	std::optional<bitmap_data> platform_load_bitmap_resource(std::string_view resName);
-
-
 	void debug_trace(const std::string& msg);
 	void write_stdout(std::string_view text);
 
@@ -1157,54 +1129,12 @@ namespace pf
 	                        std::string_view default_value = {});
 	void config_write(std::string_view section, std::string_view key, std::string_view value);
 
+	// Writes buffered config to disk; also runs at process exit
+	void config_flush();
+
 	// background tasks
 	void run_async(std::function<void()> task);
 	void run_ui(std::function<void()> task);
-
-	// network
-	bool is_online();
-
-	using web_params = std::vector<std::pair<std::string, std::string>>;
-
-	enum class web_request_verb
-	{
-		POST,
-		GET
-	};
-
-	struct web_request
-	{
-		std::string command;
-		std::string path;
-		std::string body;
-
-		web_params query;
-		web_params headers;
-		web_params form_data;
-
-		std::string file_form_data_name;
-		std::string file_name;
-		file_path upload_file_path;
-
-		file_path download_file_path;
-
-		web_request_verb verb = web_request_verb::GET;
-	};
-
-	struct web_response
-	{
-		std::string headers;
-		std::string body;
-		std::string content_type;
-		int status_code = 0;
-	};
-
-	struct web_host;
-	using web_host_ptr = std::shared_ptr<web_host>;
-
-	web_host_ptr connect_to_host(std::string_view host, bool secure = true, int port = 0,
-	                             std::string_view user_agent = {});
-	web_response send_request(const web_host_ptr& host, const web_request& req);
 }
 
 struct app_init_result

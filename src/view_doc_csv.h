@@ -2,14 +2,14 @@
 
 #pragma once
 
-#include "view_text.h"
+#include "view_doc_readonly.h"
 
-class csv_doc_view final : public doc_view
+class csv_doc_view final : public read_only_doc_view
 {
 	table_layout::table_block _table; // cached column layout for entire document
 
 public:
-	csv_doc_view(app_events& events) : doc_view(events)
+	csv_doc_view(app_events& events) : read_only_doc_view(events)
 	{
 		_sel_margin = false;
 		_word_wrap = true;
@@ -23,76 +23,6 @@ public:
 		rebuild_table();
 	}
 
-	void handle_size(pf::window_frame_ptr& window, const pf::isize extent,
-	                 pf::measure_context& measure) override
-	{
-		doc_view::handle_size(window, extent, measure);
-	}
-
-	void on_mouse_wheel(pf::window_frame_ptr& window, const int zDelta) override
-	{
-		if (!can_scroll()) return;
-		set_scroll_pixel(_scroll_offset.y + zDelta * _font_extent.cy);
-	}
-
-	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
-	{
-		namespace pk = pf::platform_key;
-		const bool ctrl = window->is_key_down(pk::Control);
-
-		if (vk == pk::Up && ctrl)
-		{
-			wrap_scroll_by(-1);
-			return true;
-		}
-		if (vk == pk::Down && ctrl)
-		{
-			wrap_scroll_by(1);
-			return true;
-		}
-		if (vk == pk::Prior)
-		{
-			wrap_scroll_by(-_screen_lines);
-			return true;
-		}
-		if (vk == pk::Next)
-		{
-			wrap_scroll_by(_screen_lines);
-			return true;
-		}
-
-		if (vk == pk::Home && ctrl)
-		{
-			_scroll_offset = {};
-			recalc_vert_scrollbar();
-			_events.invalidate(invalid::windows);
-			return true;
-		}
-		if (vk == pk::End && ctrl)
-		{
-			const int max_y = std::max(0, _content_extent.cy - (_view_extent.cy - text_top()));
-			set_scroll_pixel(max_y);
-			return true;
-		}
-
-		return doc_view::on_key_down(window, vk);
-	}
-
-	uint32_t handle_mouse(const pf::window_frame_ptr window, const pf::mouse_message_type msg,
-	                      const pf::mouse_params& params) override
-	{
-		using mt = pf::mouse_message_type;
-
-		if (msg == mt::mouse_move && _vscroll._tracking)
-		{
-			const auto new_pos = _vscroll.track_to(params.point, scrollbar_rect());
-			set_scroll_pixel(new_pos * _font_extent.cy);
-			return 0;
-		}
-
-		return doc_view::handle_mouse(window, msg, params);
-	}
-
 	void recalc_vert_scrollbar() override
 	{
 		_content_extent.cy = _font_extent.cy + _total_visual_rows * _font_extent.cy;
@@ -104,16 +34,13 @@ public:
 			_events.invalidate(invalid::windows);
 		}
 
-		const int pos = _font_extent.cy > 0 ? _scroll_offset.y / _font_extent.cy : 0;
-		_vscroll.update(_total_visual_rows + 1 + 2, _screen_lines, pos);
+		const int visible_height = std::max(0, _view_extent.cy - text_top());
+		_vscroll.update(_content_extent.cy, visible_height, _scroll_offset.y);
 	}
 
 	void layout() override
 	{
-		if (_doc)
-			_parse_cookies.assign(_doc->size(), invalid_cookie);
-		else
-			_parse_cookies.clear();
+		reset_parse_cookies();
 
 		rebuild_table();
 
@@ -166,12 +93,6 @@ public:
 	}
 
 protected:
-	void update_focus(pf::window_frame_ptr& window) override
-	{
-		doc_view::update_focus(window);
-		stop_caret_blink(window);
-	}
-
 	void draw_view(pf::window_frame_ptr& window, pf::draw_context& draw) const override
 	{
 		const auto rcClient = client_rect();
@@ -248,11 +169,6 @@ protected:
 	}
 
 private:
-	static int safe_cols(const int width, const int char_width)
-	{
-		return char_width > 0 ? std::max(1, width / char_width) : 1;
-	}
-
 	void rebuild_table()
 	{
 		_table = {};

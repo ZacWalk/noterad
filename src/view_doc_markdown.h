@@ -2,16 +2,16 @@
 
 #pragma once
 
-#include "view_text.h"
+#include "view_doc_readonly.h"
 
-class markdown_doc_view final : public doc_view
+class markdown_doc_view final : public read_only_doc_view
 {
 	pf::isize _heading_font_extent[3] = {}; // cached char sizes for h1, h2, h3
 	std::vector<int> _line_pixel_y;
 	int _total_content_height = 0;
 
 public:
-	markdown_doc_view(app_events& events) : doc_view(events)
+	markdown_doc_view(app_events& events) : read_only_doc_view(events)
 	{
 		_sel_margin = false;
 		_word_wrap = true;
@@ -27,71 +27,6 @@ public:
 			_heading_font_extent[level - 1] = measure.measure_char(font_for_heading(level));
 
 		doc_view::handle_size(window, extent, measure);
-	}
-
-	void on_mouse_wheel(pf::window_frame_ptr& window, const int zDelta) override
-	{
-		if (!can_scroll()) return;
-
-		set_scroll_pixel(_scroll_offset.y + zDelta * _font_extent.cy);
-	}
-
-	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
-	{
-		namespace pk = pf::platform_key;
-		const bool ctrl = window->is_key_down(pk::Control);
-
-		if (vk == pk::Up && ctrl)
-		{
-			wrap_scroll_by(-1);
-			return true;
-		}
-		if (vk == pk::Down && ctrl)
-		{
-			wrap_scroll_by(1);
-			return true;
-		}
-		if (vk == pk::Prior)
-		{
-			wrap_scroll_by(-_screen_lines);
-			return true;
-		}
-		if (vk == pk::Next)
-		{
-			wrap_scroll_by(_screen_lines);
-			return true;
-		}
-
-		if (vk == pk::Home && ctrl)
-		{
-			_scroll_offset = {};
-			recalc_vert_scrollbar();
-			_events.invalidate(invalid::windows);
-			return true;
-		}
-		if (vk == pk::End && ctrl)
-		{
-			const int max_y = std::max(0, _content_extent.cy - (_view_extent.cy - text_top()));
-			set_scroll_pixel(max_y);
-			return true;
-		}
-
-		return doc_view::on_key_down(window, vk);
-	}
-
-	uint32_t handle_mouse(const pf::window_frame_ptr window, const pf::mouse_message_type msg,
-	                      const pf::mouse_params& params) override
-	{
-		using mt = pf::mouse_message_type;
-
-		if (msg == mt::mouse_move && _vscroll._tracking)
-		{
-			const auto new_pos = _vscroll.track_to(params.point, scrollbar_rect());
-			set_scroll_pixel(new_pos);
-			return 0;
-		}
-
-		return doc_view::handle_mouse(window, msg, params);
 	}
 
 	void recalc_vert_scrollbar() override
@@ -111,10 +46,7 @@ public:
 
 	void layout() override
 	{
-		if (_doc)
-			_parse_cookies.assign(_doc->size(), invalid_cookie);
-		else
-			_parse_cookies.clear();
+		reset_parse_cookies();
 
 		if (!_doc)
 		{
@@ -235,14 +167,6 @@ public:
 	}
 
 protected:
-	void update_focus(pf::window_frame_ptr& window) override
-	{
-		// Reuse text_view's full focus logic (selection invalidation, drag cleanup)
-		// then suppress caret blink since this is a read-only rendered view
-		doc_view::update_focus(window);
-		stop_caret_blink(window);
-	}
-
 	void draw_view(pf::window_frame_ptr& window, pf::draw_context& draw) const override
 	{
 		const auto rcClient = client_rect();
@@ -367,12 +291,6 @@ protected:
 	}
 
 private:
-	// Safely compute columns that fit in a given pixel width
-	static int safe_cols(const int width, const int char_width)
-	{
-		return char_width > 0 ? std::max(1, width / char_width) : 1;
-	}
-
 	// Draw pipe character(s) at x for the given number of sub-rows — delegates to table_layout
 	static void draw_pipe(pf::draw_context& draw, const int x, const int y, const int rows,
 	                      const pf::font& font, const int font_cx, const int font_cy,
@@ -685,7 +603,7 @@ private:
 
 	pf::font font_for_heading(const int level) const
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		switch (level)
 		{
 		case 1: return {styles.text_font_height + 12, pf::font_name::consolas};

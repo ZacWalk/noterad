@@ -48,76 +48,88 @@ struct edit_box
 		sel_anchor = cursor_pos;
 	}
 
-	// Returns true if text was modified
-	bool on_char(const pf::window_frame_ptr& w, const char ch)
+	void select_all()
 	{
-		if (ch == 0x01) // Ctrl+A
-		{
-			sel_anchor = 0;
-			cursor_pos = static_cast<int>(text.length());
-			return false;
-		}
+		sel_anchor = 0;
+		cursor_pos = static_cast<int>(text.length());
+	}
 
-		if (ch == 0x03) // Ctrl+C
-		{
-			if (has_selection())
-				w->text_to_clipboard(text.substr(sel_start(), sel_end() - sel_start()));
-			else if (!text.empty())
-				w->text_to_clipboard(text);
-			return false;
-		}
+	[[nodiscard]] std::string_view selected_text() const
+	{
+		return std::string_view(text).substr(sel_start(), sel_end() - sel_start());
+	}
 
-		if (ch == 0x16) // Ctrl+V
-		{
-			const auto clip = w->text_from_clipboard();
-			if (!clip.empty())
-			{
-				std::string clean;
-				clean.reserve(clip.size());
-				for (const auto c : clip)
-					if (c != '\r' && c != '\n')
-						clean += c;
-				insert_at_cursor(clean);
-				return true;
-			}
-			return false;
-		}
+	bool copy_to_clipboard() const
+	{
+		return has_selection() && pf::platform_text_to_clipboard(selected_text());
+	}
 
-		if (ch == 0x18) // Ctrl+X
+	bool cut_to_clipboard()
+	{
+		if (!copy_to_clipboard()) return false;
+		delete_selection();
+		return true;
+	}
+
+	// Newlines are stripped: a single-line field cannot represent them
+	bool paste_from_clipboard()
+	{
+		const auto clip = pf::platform_text_from_clipboard();
+		if (clip.empty()) return false;
+
+		std::string clean;
+		clean.reserve(clip.size());
+		for (const auto c : clip)
+			if (c != '\r' && c != '\n')
+				clean += c;
+
+		insert_at_cursor(clean);
+		return true;
+	}
+
+	bool delete_forward()
+	{
+		if (has_selection())
 		{
-			if (has_selection())
-			{
-				w->text_to_clipboard(text.substr(sel_start(), sel_end() - sel_start()));
-				delete_selection();
-			}
-			else if (!text.empty())
-			{
-				w->text_to_clipboard(text);
-				text.clear();
-				cursor_pos = 0;
-				sel_anchor = 0;
-			}
+			delete_selection();
 			return true;
 		}
+		if (cursor_pos < static_cast<int>(text.length()))
+		{
+			const auto next = pf::utf8_next(text, cursor_pos);
+			text.erase(cursor_pos, next - cursor_pos);
+			return true;
+		}
+		return false;
+	}
 
+	bool delete_back()
+	{
+		if (has_selection())
+		{
+			delete_selection();
+			return true;
+		}
+		if (cursor_pos > 0)
+		{
+			const auto prev = pf::utf8_prev(text, cursor_pos);
+			text.erase(prev, cursor_pos - prev);
+			cursor_pos = prev;
+			sel_anchor = cursor_pos;
+			return true;
+		}
+		return false;
+	}
+
+	// Returns true if text was modified
+	bool on_char(const char32_t ch)
+	{
 		if (ch == 0x08) // Backspace
-		{
-			if (has_selection())
-			{
-				delete_selection();
-			}
-			else if (cursor_pos > 0)
-			{
-				text.erase(cursor_pos - 1, 1);
-				cursor_pos--;
-				sel_anchor = cursor_pos;
-			}
-			return true;
-		}
+			return delete_back();
 
-		if (ch >= ' ')
+		if (ch >= U' ')
 		{
-			insert_at_cursor(std::string_view(&ch, 1));
+			insert_at_cursor(pf::utf8_encode(ch));
 			return true;
 		}
 
@@ -143,7 +155,7 @@ struct edit_box
 			}
 			else if (cursor_pos > 0)
 			{
-				cursor_pos--;
+				cursor_pos = pf::utf8_prev(text, cursor_pos);
 			}
 			if (!shift) sel_anchor = cursor_pos;
 			return true;
@@ -161,7 +173,7 @@ struct edit_box
 			}
 			else if (cursor_pos < len)
 			{
-				cursor_pos++;
+				cursor_pos = pf::utf8_next(text, cursor_pos);
 			}
 			if (!shift) sel_anchor = cursor_pos;
 			return true;
@@ -183,16 +195,7 @@ struct edit_box
 
 		if (vk == pk::Delete)
 		{
-			if (has_selection())
-			{
-				delete_selection();
-				text_modified = true;
-			}
-			else if (cursor_pos < static_cast<int>(text.length()))
-			{
-				text.erase(cursor_pos, 1);
-				text_modified = true;
-			}
+			text_modified = delete_forward();
 			return true;
 		}
 
@@ -663,9 +666,9 @@ struct edit_box_widget
 	}
 
 	// Returns true if text content was modified
-	bool on_char(const pf::window_frame_ptr& window, const char ch)
+	bool on_char(const pf::window_frame_ptr& window, const char32_t ch)
 	{
-		const bool modified = edit.on_char(window, ch);
+		const bool modified = edit.on_char(ch);
 		reset_caret(window);
 		return modified;
 	}

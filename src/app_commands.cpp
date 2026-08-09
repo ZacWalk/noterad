@@ -3,27 +3,13 @@
 #include "pch.h"
 
 #include "app.h"
+#include "calc.h"
 #include "document.h"
 #include "commands.h"
 #include "view_doc.h"
+#include "view_list.h"
+#include "view_text.h"
 #include "app_state.h"
-
-namespace
-{
-	bool key_binding_matches(const pf::window_frame_ptr& window, const unsigned int vk, const pf::key_binding& binding)
-	{
-		if (!window || binding.empty() || binding.key != vk)
-			return false;
-
-		const bool ctrl = window->is_key_down(pf::platform_key::Control);
-		const bool shift = window->is_key_down(pf::platform_key::Shift);
-		const bool alt = window->is_key_down(pf::platform_key::Alt);
-
-		return ctrl == ((binding.modifiers & pf::key_mod::ctrl) != 0) &&
-			shift == ((binding.modifiers & pf::key_mod::shift) != 0) &&
-			alt == ((binding.modifiers & pf::key_mod::alt) != 0);
-	}
-}
 
 pf::menu_command app_state::command_menu_item(const command_id id,
                                               const std::function<void()> action_override,
@@ -69,29 +55,9 @@ pf::menu_command app_state::command_menu_item(const command_id id,
 		std::move(action),
 		std::move(is_enabled),
 		std::move(is_checked),
-		def->accel
+		def->accel,
+		def->accel_alt
 	};
-}
-
-bool app_state::invoke_menu_accelerator(const pf::window_frame_ptr& window,
-                                        const std::vector<pf::menu_command>& items,
-                                        const unsigned int vk) const
-{
-	for (const auto& item : items)
-	{
-		if (!item.children.empty() && invoke_menu_accelerator(window, item.children, vk))
-			return true;
-
-		if (!item.children.empty() || !key_binding_matches(window, vk, item.accel))
-			continue;
-		if (item.is_enabled && !item.is_enabled())
-			return true; // consume keystroke even when disabled
-		if (item.action)
-			item.action();
-		return true;
-	}
-
-	return false;
 }
 
 
@@ -103,64 +69,91 @@ std::vector<command_def> app_state::make_commands()
 			"Create a new document",
 			"&New", static_cast<int>(command_id::file_new), {'N', pf::key_mod::ctrl},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::file_new)
+			[this] { on_new(); }
 		},
 		{
 			"Open a file",
 			"&Open...", static_cast<int>(command_id::file_open), {'O', pf::key_mod::ctrl},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::file_open)
+			[this] { on_open(); }
 		},
 		{
 			"Save the current file",
 			"&Save", static_cast<int>(command_id::file_save), {'S', pf::key_mod::ctrl},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::file_save)
+			[this] { on_save(); }
 		},
 		{
 			"Save the current file as...",
 			"Save &As...", static_cast<int>(command_id::file_save_as), {},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::file_save_as)
+			[this] { on_save_as(); }
 		},
 		{
 			"Save all modified files",
 			"Save A&ll", static_cast<int>(command_id::file_save_all),
 			{'S', pf::key_mod::ctrl | pf::key_mod::shift},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::file_save_all)
+			[this] { save_all(); }
 		},
 		{
 			"Exit the application",
 			"E&xit", static_cast<int>(command_id::app_exit), {},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::app_exit)
+			[this] { on_close(); }
 		},
 
 		// ── Edit ───────────────────────────────────────────────────────
 		{
 			"Undo the last edit",
 			"&Undo", static_cast<int>(command_id::edit_undo), {'Z', pf::key_mod::ctrl},
-			[this] { return doc()->can_undo(); }, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_undo)
+			[this] { return can_edit_document() && doc()->can_undo(); }, nullptr,
+			[this]
+			{
+				if (!doc()->can_undo())
+				{
+					set_message("Nothing to undo.");
+					return;
+				}
+				doc()->edit_undo();
+			}
 		},
 		{
 			"Redo the last undone edit",
 			"&Redo", static_cast<int>(command_id::edit_redo), {'Y', pf::key_mod::ctrl},
-			[this] { return doc()->can_redo(); }, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_redo)
+			[this] { return can_edit_document() && doc()->can_redo(); }, nullptr,
+			[this]
+			{
+				if (!doc()->can_redo())
+				{
+					set_message("Nothing to redo.");
+					return;
+				}
+				doc()->edit_redo();
+			}
 		},
 		{
 			"Cut selection to clipboard",
 			"Cu&t", static_cast<int>(command_id::edit_cut), {'X', pf::key_mod::ctrl},
 			[this]
 			{
+				if (auto* const edit_owner = focused_edit_box_owner())
+					return edit_owner->edit_can_copy();
 				const auto view = focused_text_view();
 				return view && view->can_cut_text();
 			},
 			nullptr,
-			bind_command_handler(*this, app_command_handler::edit_cut)
-		},
+			[this]
+			{
+				if (auto* const edit_owner = focused_edit_box_owner())
+				{
+					edit_owner->edit_cut();
+					return;
+				}
+				const auto view = focused_text_view();
+				if (view && view->cut_text_to_clipboard())
+					invalidate(invalid::doc);
+			}		},
 		{
 			"Copy selection or selected path to clipboard",
 			"&Copy", static_cast<int>(command_id::edit_copy), {'C', pf::key_mod::ctrl},
@@ -169,18 +162,30 @@ std::vector<command_def> app_state::make_commands()
 				return can_copy_current_focus();
 			},
 			nullptr,
-			bind_command_handler(*this, app_command_handler::edit_copy)
+			[this] { (void)copy_current_focus_to_clipboard(); }
 		},
 		{
 			"Paste from clipboard",
 			"&Paste", static_cast<int>(command_id::edit_paste), {'V', pf::key_mod::ctrl},
 			[this]
 			{
+				if (inline_edit_has_focus())
+					return document::can_paste();
 				const auto view = focused_text_view();
 				return view && view->can_paste_text();
 			},
 			nullptr,
-			bind_command_handler(*this, app_command_handler::edit_paste)
+			[this]
+			{
+				if (auto* const edit_owner = focused_edit_box_owner())
+				{
+					edit_owner->edit_paste();
+					return;
+				}
+				const auto view = focused_text_view();
+				if (view && view->paste_text_from_clipboard())
+					invalidate(invalid::doc);
+			}
 		},
 		{
 			"Delete selection or selected file",
@@ -190,32 +195,57 @@ std::vector<command_def> app_state::make_commands()
 				return can_delete_current_focus();
 			},
 			nullptr,
-			bind_command_handler(*this, app_command_handler::edit_delete)
+			[this]
+			{
+				if (delete_current_focus())
+					invalidate(invalid::doc);
+			}
 		},
 		{
 			"Search in files",
 			"Search in &Files", static_cast<int>(command_id::edit_search_files),
 			{'F', pf::key_mod::ctrl | pf::key_mod::shift},
-			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_search_files)
+			nullptr, [this] { return is_search(get_mode()); },
+			[this] { toggle_search_mode(); }
 		},
 		{
 			"Select all text",
 			"Select &All", static_cast<int>(command_id::edit_select_all), {'A', pf::key_mod::ctrl},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_select_all)
+			[this]
+			{
+				if (auto* const edit_owner = focused_edit_box_owner())
+				{
+					edit_owner->edit_select_all();
+					invalidate(invalid::search_layout | invalid::files_layout);
+					return;
+				}
+				if (const auto view = focused_text_view())
+				{
+					view->select_all_text();
+					invalidate(invalid::doc);
+				}
+			}
 		},
 		{
 			"Reformat JSON document",
 			"&Reformat", static_cast<int>(command_id::edit_reformat), {'R', pf::key_mod::ctrl},
-			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_reformat)
+			[this] { return can_edit_document(); }, nullptr,
+			[this]
+			{
+				on_edit_reformat();
+				set_message("Document reformatted.");
+			}
 		},
 		{
 			"Sort lines and remove duplicates",
 			"Sort && Remove Duplicates", static_cast<int>(command_id::edit_sort_remove_duplicates), {},
-			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::edit_sort_remove_duplicates)
+			[this] { return can_edit_document(); }, nullptr,
+			[this]
+			{
+				on_edit_remove_duplicates();
+				set_message("Sorted and removed duplicates.");
+			}
 		},
 		{
 			"Calculate selected expression",
@@ -223,50 +253,63 @@ std::vector<command_def> app_state::make_commands()
 			{'E', pf::key_mod::ctrl},
 			[this]
 			{
-				return doc()->has_selection();
+				return can_edit_document() && doc()->has_selection();
 			},
 			nullptr,
-			bind_command_handler(*this, app_command_handler::edit_calc_selection)
+			[this] { calc_selection(); }
 		},
 		{
 			"Toggle spell check",
 			"&Spell Check", static_cast<int>(command_id::edit_spell_check),
 			{'P', pf::key_mod::ctrl | pf::key_mod::shift},
-			nullptr, [this] { return doc()->spell_check(); },
-			bind_command_handler(*this, app_command_handler::edit_spell_check)
+			[this] { return !inline_edit_has_focus() && is_edit_text(get_mode()); },
+			[this] { return doc()->spell_check(); },
+			[this]
+			{
+				doc()->toggle_spell_check();
+				const auto on = doc()->spell_check();
+				set_spell_check_mode(on ? spell_check_mode::enabled : spell_check_mode::disabled);
+			}
 		},
 
 		// ── View ───────────────────────────────────────────────────────
 		{
 			"Toggle word wrap",
 			"&Word Wrap", static_cast<int>(command_id::view_word_wrap), {'Z', pf::key_mod::alt},
-			nullptr, [this] { return _doc_view->word_wrap(); },
-			bind_command_handler(*this, app_command_handler::view_word_wrap)
+			[this] { return is_edit_text(get_mode()); }, [this] { return word_wrap(); },
+			[this] { toggle_word_wrap(); }
 		},
 		{
 			"Toggle markdown preview",
 			"&Markdown Preview", static_cast<int>(command_id::view_toggle_markdown), {'M', pf::key_mod::ctrl},
 			nullptr, [this] { return is_markdown(get_mode()); },
-			bind_command_handler(*this, app_command_handler::view_toggle_markdown)
+			[this] { toggle_markdown_view(); }
 		},
 		{
-			"Refresh folder index",
+			"Refresh the folder index or the current search",
 			"&Refresh", static_cast<int>(command_id::view_refresh_folder), {pf::platform_key::F5, pf::key_mod::none},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::view_refresh_folder)
+			[this] { on_refresh_focused_panel(); }
 		},
 		{
-			"Navigate to next search result",
+			"Navigate to next search result, or start a search",
 			"&Next Result", static_cast<int>(command_id::view_next_result), {pf::platform_key::F8, pf::key_mod::none},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::view_next_result)
+			[this]
+			{
+				if (!is_search(get_mode()))
+					toggle_search_mode(); // switches to search mode and focuses the search box
+				else
+					on_navigate_next(true);
+			},
+			{pf::platform_key::F3, pf::key_mod::none}
 		},
 		{
 			"Navigate to previous search result",
 			"&Previous Result", static_cast<int>(command_id::view_prev_result),
 			{pf::platform_key::F8, pf::key_mod::shift},
-			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::view_prev_result)
+			[this] { return is_search(get_mode()); }, nullptr,
+			[this] { on_navigate_next(false); }
 		},
 
 		// ── Help ───────────────────────────────────────────────────────
@@ -274,16 +317,56 @@ std::vector<command_def> app_state::make_commands()
 			"Run all tests",
 			"Run &Tests", static_cast<int>(command_id::help_run_tests), {'T', pf::key_mod::ctrl},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::help_run_tests)
+			[this] { on_run_tests(); }
 		},
 		{
 			"Show about / help",
 			"&About", static_cast<int>(command_id::app_about), {pf::platform_key::F1, pf::key_mod::none},
 			nullptr, nullptr,
-			bind_command_handler(*this, app_command_handler::app_about)
+			[this] { on_about(); }
 		},
 	};
 	return defs;
+}
+
+void app_state::calc_selection()
+{
+	if (!doc()->has_selection())
+	{
+		set_message("No selection.");
+		return;
+	}
+
+	const auto text = doc()->copy();
+	if (text.empty())
+	{
+		set_message("No selection.");
+		return;
+	}
+
+	calc_parser parser(text);
+	const auto result = parser.parse();
+	if (!result.has_value())
+	{
+		set_message("Invalid expression: " + parser.error());
+		return;
+	}
+
+	const auto value = result.value();
+	std::string result_text;
+	if (std::isfinite(value)
+		&& value >= static_cast<double>(std::numeric_limits<int64_t>::min())
+		&& value <= static_cast<double>(std::numeric_limits<int64_t>::max())
+		&& value == static_cast<int64_t>(value))
+		result_text = std::to_string(static_cast<int64_t>(value));
+	else
+		result_text = std::to_string(value);
+
+	const auto sel = doc()->selection();
+	undo_group ug(doc());
+	doc()->replace_text(ug, sel, result_text);
+	invalidate(invalid::doc);
+	set_message("= " + result_text);
 }
 
 

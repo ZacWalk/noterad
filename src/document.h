@@ -14,12 +14,8 @@ class document_events;
 constexpr auto invalid_length = -1;
 constexpr uint32_t invalid_cookie = UINT32_MAX;
 
-constexpr char8_t TAB_CHARACTER = 0xBB;
-constexpr char8_t SPACE_CHARACTER = 0x95;
-
 bool is_binary_extension(const pf::file_path& path);
 bool is_binary_data(std::span<const uint8_t> data);
-bool is_binary_file(const pf::file_path& path);
 
 inline bool is_markdown_path(const pf::file_path& path)
 {
@@ -241,56 +237,47 @@ public:
 
 	[[nodiscard]] bool empty() const
 	{
-		if (_buffer && _text.empty()) return _length == 0;
-		return _text.empty();
+		return _buffer ? _length == 0 : _text.empty();
 	}
 
+	// Byte length of the rendered UTF-8 text; O(1) after the first call.
 	[[nodiscard]] size_t size() const
 	{
-		std::string line_text;
-		render(line_text);
-		return line_text.size();
+		if (_byte_length == invalid_length)
+			_byte_length = static_cast<int>(compute_byte_length());
+		return static_cast<size_t>(_byte_length);
 	}
 
 	int icmp(const document_line& other) const;
 	void render(std::string& out) const;
 	void update(std::string_view text);
 
-	bool operator==(const document_line& other) const
-	{
-		return icmp(other) == 0;
-	}
-
-	std::strong_ordering operator<=>(const document_line& other) const
-	{
-		const auto result = icmp(other);
-		if (result < 0) return std::strong_ordering::less;
-		if (result > 0) return std::strong_ordering::greater;
-		return std::strong_ordering::equal;
-	}
-
 	void invalidate_expanded_length() const { _expanded_length = invalid_length; }
 	[[nodiscard]] int expanded_length_cache() const { return _expanded_length; }
 	void set_expanded_length(const int len) const { _expanded_length = len; }
 
-	void release_cache() const
+private:
+	[[nodiscard]] size_t compute_byte_length() const
 	{
-		if (_buffer && !_text.empty())
+		if (!_buffer)
+			return _text.size();
+
+		if (_buffer->encoding == file_encoding::utf16 || _buffer->encoding == file_encoding::utf16be)
 		{
-			_text.clear();
-			_text.shrink_to_fit();
-			_expanded_length = invalid_length;
+			std::string line_text;
+			render(line_text);
+			return line_text.size();
 		}
+
+		return _length;
 	}
 
-	[[nodiscard]] bool is_buffer_backed() const { return _buffer != nullptr; }
-
-private:
-	mutable std::string _text;
-	mutable file_buffer_ptr _buffer;
-	mutable uint32_t _offset = 0;
-	mutable uint32_t _length = 0;
+	std::string _text;
+	file_buffer_ptr _buffer;
+	uint32_t _offset = 0;
+	uint32_t _length = 0;
 	mutable int _expanded_length = invalid_length;
+	mutable int _byte_length = invalid_length;
 };
 
 
@@ -377,8 +364,6 @@ class document : public std::enable_shared_from_this<document>
 	text_location _anchor_loc;
 	text_location _cursor_loc;
 	text_selection _selection;
-	bool _auto_indent = false;
-	bool _view_tabs = false;
 	bool _read_only = false;
 	bool _spell_check = false;
 	int _ideal_char_pos = 0;
@@ -512,7 +497,6 @@ public:
 		return !_selection.empty();
 	}
 
-	[[nodiscard]] bool get_auto_indent() const;
 	[[nodiscard]] bool query_editable() const;
 
 	std::string edit_cut();
@@ -524,7 +508,6 @@ public:
 	void edit_undo();
 	void edit_untab();
 	void edit_paste(std::string_view text);
-	void set_auto_indent(bool bAutoIndent);
 
 	[[nodiscard]] bool is_json() const;
 	void reformat_json();
@@ -567,18 +550,13 @@ public:
 		return _tab_size;
 	}
 
-	void tab_size(int nTabSize);
-	void view_tabs(bool bViewTabs);
 	int max_line_length() const;
 	text_location word_to_left(text_location pt) const;
 	text_location word_to_right(text_location pt) const;
 
-	[[nodiscard]] bool view_tabs() const;
-
 	int calc_offset(int lineIndex, int nCharIndex) const;
 	int calc_offset_approx(int lineIndex, int nOffset) const;
 	int expanded_line_length(int line_index) const;
-	std::string expanded_chars(std::string_view text, int offset_in, int count_in) const;
 	void expanded_chars(std::string_view text, int offset_in, int count_in, std::string& result) const;
 
 	[[nodiscard]] const text_location& cursor_pos() const

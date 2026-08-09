@@ -7,12 +7,6 @@
 
 class app_state;
 
-struct command_result
-{
-	std::string output;
-	bool success = true;
-};
-
 struct command_def
 {
 	std::string description;
@@ -21,7 +15,8 @@ struct command_def
 	pf::key_binding accel;
 	std::function<bool()> is_enabled;
 	std::function<bool()> is_checked;
-	std::function<command_result()> execute;
+	std::function<void()> execute;
+	pf::key_binding accel_alt; // second binding for the same command; the menu still shows accel
 
 	command_def() = default;
 
@@ -31,14 +26,16 @@ struct command_def
 	            const pf::key_binding in_accel,
 	            std::function<bool()> in_is_enabled,
 	            std::function<bool()> in_is_checked,
-	            std::function<command_result()> in_execute)
+	            std::function<void()> in_execute,
+	            const pf::key_binding in_accel_alt = {})
 		: description(std::move(in_description)),
 		  menu_text(std::move(in_menu_text)),
 		  menu_id(in_menu_id),
 		  accel(in_accel),
 		  is_enabled(std::move(in_is_enabled)),
 		  is_checked(std::move(in_is_checked)),
-		  execute(std::move(in_execute))
+		  execute(std::move(in_execute)),
+		  accel_alt(in_accel_alt)
 	{
 	}
 };
@@ -82,35 +79,6 @@ enum class command_id : int
 	view_prev_result,
 };
 
-enum class app_command_handler : uint8_t
-{
-	file_new,
-	file_open,
-	file_save,
-	file_save_as,
-	file_save_all,
-	app_exit,
-	edit_undo,
-	edit_redo,
-	edit_cut,
-	edit_copy,
-	edit_paste,
-	edit_delete,
-	edit_search_files,
-	edit_select_all,
-	edit_reformat,
-	edit_sort_remove_duplicates,
-	edit_calc_selection,
-	edit_spell_check,
-	view_word_wrap,
-	view_toggle_markdown,
-	view_refresh_folder,
-	view_next_result,
-	view_prev_result,
-	help_run_tests,
-	app_about,
-};
-
 class commands
 {
 public:
@@ -126,6 +94,4 @@ private:
 	std::vector<command_def> _defs;
 };
 
-std::function<command_result()> bind_command_handler(
-	app_state& app, app_command_handler handler);
 index_item_ptr find_item_recursively(const index_item_ptr& item, const pf::file_path& path);

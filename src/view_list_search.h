@@ -15,7 +15,7 @@ class search_list_view final : public list_view
 
 	pf::irect edit_box_rect() const
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto m = styles.edit_box_margin;
 		const auto ef = styles.edit_font;
 		const auto h = ef.size + styles.edit_box_inner_pad * 2;
@@ -25,12 +25,6 @@ class search_list_view final : public list_view
 	int edit_inner_pad() const
 	{
 		return _events.styles().edit_box_inner_pad;
-	}
-
-	void update_caret(const pf::window_frame_ptr& window)
-	{
-		_input.reset_caret(window);
-		_events.invalidate(invalid::search_layout);
 	}
 
 	uint32_t on_timer(pf::window_frame_ptr& window, const uint32_t id) override
@@ -73,7 +67,7 @@ protected:
 
 	int calc_header_height() const
 	{
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto m = styles.edit_box_margin;
 		const auto ef = styles.edit_font;
 		const auto h = ef.size + styles.edit_box_inner_pad * 2;
@@ -92,7 +86,7 @@ protected:
 		const auto has_focus = window->has_focus();
 		edit_box::draw_border(dc, eb, has_focus);
 
-		const auto styles = _events.styles();
+		const auto& styles = _events.styles();
 		const auto pad = styles.edit_box_inner_pad;
 		const auto text_rect = eb.inflate(-pad, -pad);
 
@@ -119,7 +113,9 @@ protected:
 		// Draw result count below edit box
 		if (!_last_searched.empty())
 		{
-			const auto count_text = std::format("{} results", _result_count);
+			const auto count_text = _result_count >= max_search_results
+				                        ? std::format("{} results (limit reached)", _result_count)
+				                        : std::format("{} results", _result_count);
 			auto count_rect = header_rect;
 			count_rect.top = eb.bottom + 2;
 			count_rect.left = eb.left + pad;
@@ -161,9 +157,17 @@ protected:
 		list_view::update_focus(window);
 	}
 
-	uint32_t on_char(pf::window_frame_ptr& window, const char ch) override
+	edit_box_widget* active_edit_box() override { return &_input; }
+
+	void on_edit_text_changed() override
 	{
-		if (ch == u8'\r' || ch == u8'\n')
+		_events.invalidate(invalid::search_layout);
+		trigger_search();
+	}
+
+	uint32_t on_char(pf::window_frame_ptr& window, const char32_t ch) override
+	{
+		if (ch == U'\r' || ch == U'\n')
 		{
 			if (_selected_item && _selected_item->is_group)
 			{
@@ -185,9 +189,6 @@ protected:
 	uint32_t on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
 	{
 		namespace pk = pf::platform_key;
-
-		if (_selected_item && _events.invoke_menu_accelerator(window, build_context_menu_items(_selected_item), vk))
-			return 0;
 
 		bool text_modified = false;
 		if (_input.on_key_down(window, vk, text_modified))
@@ -212,16 +213,6 @@ protected:
 		if (vk == pk::Escape)
 		{
 			_events.on_escape();
-			return 0;
-		}
-
-		if (vk == pk::F5)
-		{
-			if (!_input.edit.text.empty())
-			{
-				_last_searched = _input.edit.text;
-				_events.on_search(_input.edit.text);
-			}
 			return 0;
 		}
 
@@ -356,14 +347,18 @@ public:
 		return i;
 	}
 
+	// Only files with matches get list items; the tree may hold tens of thousands of files
 	void map_index_items_recursive(std::unordered_map<search_key, list_view_item_ptr, search_key_hash>& items_by_path,
 	                               const index_item_ptr& item)
 	{
-		items_by_path[make_key(item)] = make_list_item(item);
-
-		for (const auto& s : item->search_results)
+		if (!item->search_results.empty())
 		{
-			items_by_path[make_key(item, s)] = make_list_item(item, s);
+			items_by_path[make_key(item)] = make_list_item(item);
+
+			for (const auto& s : item->search_results)
+			{
+				items_by_path[make_key(item, s)] = make_list_item(item, s);
+			}
 		}
 
 		for (const auto& i : item->children)
@@ -377,11 +372,10 @@ public:
 	{
 		for (const auto& child : children)
 		{
-			auto found = _key_to_item.find(make_key(child));
-
-			if (found != _key_to_item.end())
+			if (!child->is_folder && !child->search_results.empty())
 			{
-				if (!child->is_folder && !child->search_results.empty())
+				const auto found = _key_to_item.find(make_key(child));
+				if (found != _key_to_item.end())
 				{
 					found->second->depth = 0;
 					items.push_back(found->second);
@@ -396,9 +390,9 @@ public:
 						}
 					}
 				}
-
-				build_folder_items(items, child->children);
 			}
+
+			build_folder_items(items, child->children);
 		}
 	}
 
@@ -412,7 +406,7 @@ public:
 			map_index_items_recursive(existing, root);
 		}
 
-		_key_to_item = existing;
+		_key_to_item = std::move(existing);
 
 		std::vector<list_view_item_ptr> items;
 		if (root)
@@ -425,16 +419,6 @@ public:
 
 		_events.invalidate(invalid::search_layout);
 		layout_list();
-	}
-
-
-	void refresh_search()
-	{
-		if (!_input.edit.text.empty())
-		{
-			_last_searched = _input.edit.text;
-			_events.on_search(_input.edit.text);
-		}
 	}
 
 private:
