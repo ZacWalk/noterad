@@ -23,6 +23,13 @@ public:
 
 	[[nodiscard]] std::string_view input_text() const { return _input.edit.text; }
 
+	// True when the newest content is on screen, so streaming should keep following it
+	[[nodiscard]] bool at_bottom() const
+	{
+		const auto max_y = std::max(0, _content_extent.cy - (_view_extent.cy - text_top()));
+		return _scroll_offset.y >= max_y - _font_extent.cy;
+	}
+
 	void scroll_to_end() { scroll_content_to_end(); }
 
 	void set_input_text(std::string text)
@@ -266,6 +273,48 @@ private:
 		return true;
 	}
 
+	// Misspellings are coloured rather than underlined, matching the editor
+	void draw_run(pf::draw_context& draw, int& x, const int y, const pf::irect& box,
+	              const std::string_view text, const pf::font& font, const pf::color_t bg) const
+	{
+		if (text.empty())
+			return;
+
+		if (!_doc || !_doc->spell_check())
+		{
+			draw.draw_text(x, y, box, text, font, ui::text_color, bg);
+			x += draw.measure_text(text, font).cx;
+			return;
+		}
+
+		size_t pos = 0;
+
+		while (pos < text.size())
+		{
+			auto next = pos + 1;
+			auto color = ui::text_color;
+
+			if (is_spell_word_byte(text[pos]))
+			{
+				while (next < text.size() && is_spell_word_byte(text[next]))
+					++next;
+
+				if (!spell_check_word(text.substr(pos, next - pos)))
+					color = style_to_color(style::error_text);
+			}
+			else
+			{
+				while (next < text.size() && !is_spell_word_byte(text[next]))
+					++next;
+			}
+
+			const auto run = text.substr(pos, next - pos);
+			draw.draw_text(x, y, box, run, font, color, bg);
+			x += draw.measure_text(run, font).cx;
+			pos = next;
+		}
+	}
+
 	void draw_input(const pf::window_frame_ptr& window, pf::draw_context& draw) const
 	{
 		const auto& styles = _events.styles();
@@ -304,7 +353,8 @@ private:
 				                               ? std::string_view::npos
 				                               : newline - start);
 
-			draw.draw_text(text_x, y, box, piece, font, ui::text_color, bg);
+			auto x = text_x;
+			draw_run(draw, x, y, box, piece, font, bg);
 
 			const auto cursor = static_cast<size_t>(_input.edit.cursor_pos);
 

@@ -1725,6 +1725,7 @@ index_item_ptr app_state::session_item()
 	_session_item = std::make_shared<index_item>(path, std::string(agent_session::file_name), false);
 	_session_item->doc = std::make_shared<document>(*_agent_doc_events, load_session_text(path));
 	_session_item->doc->path(path);
+	apply_spell_check_mode(_session_item->doc);
 	_session_saved_time = pf::file_modified_time(path);
 	_session_listed = false;
 
@@ -1788,6 +1789,9 @@ void app_state::reload_session_if_changed()
 
 	_session_saved_time = modified;
 	invalidate(invalid::agent_layout);
+
+	if (_agent_host)
+		_agent_host->adopt(agent_session::to_lines(doc->str()));
 }
 
 void app_state::save_session()
@@ -1875,6 +1879,9 @@ void app_state::apply_transcript_change(const int first, const std::span<const s
 	const auto last_len = line_count > 0 ? static_cast<int>((*doc)[last].size()) : 0;
 	const auto from = std::clamp(first, 0, line_count);
 
+	// Following the stream is only welcome when the newest line is already on screen
+	const auto pinned = !_agent_view || _agent_view->at_bottom();
+
 	auto text = agent_session::to_text(replacement);
 
 	const auto target = from >= line_count
@@ -1891,7 +1898,7 @@ void app_state::apply_transcript_change(const int first, const std::span<const s
 
 	invalidate(invalid::agent_layout);
 
-	if (_agent_view)
+	if (_agent_view && pinned)
 		_agent_view->scroll_to_end();
 }
 
@@ -2037,6 +2044,7 @@ void app_state::ensure_agent_host()
 void app_state::on_agent_input(std::string text)
 {
 	ensure_agent_host();
+	_agent_host->set_working_dir(_root_folder ? _root_folder->path : pf::current_directory());
 	reload_session_if_changed();
 
 	// The file is the transcript, so whatever it holds now is what the agent continues from
@@ -2537,6 +2545,85 @@ namespace
 		return exit_code;
 	}
 
+	// Drives the real agent_host, so the path the panel uses is exercised without a window
+	int run_agent_diagnostics(const std::string_view prompt)
+	{
+		struct console_sink final : agent_host::events
+		{
+			std::vector<std::string> lines;
+
+			void transcript_changed(const int first, const std::span<const std::string> replacement) override
+			{
+				lines.resize(static_cast<size_t>(std::clamp(first, 0, static_cast<int>(lines.size()))));
+
+				for (const auto& line : replacement)
+					lines.push_back(line);
+			}
+
+			void agent_status_changed(const std::string_view status) override
+			{
+				pf::write_stdout(std::format("[{}]\n", status));
+			}
+
+			bool read_file(const pf::file_path& path, std::string&, std::string& error) override
+			{
+				error = "reads are not offered by this diagnostic";
+				pf::write_stdout(std::format("[refused read] {}\n", path.view()));
+				return false;
+			}
+
+			bool write_file(const pf::file_path& path, std::string_view, std::string& error) override
+			{
+				error = "writes are not offered by this diagnostic";
+				pf::write_stdout(std::format("[refused write] {}\n", path.view()));
+				return false;
+			}
+
+			void transcript_settled() override
+			{
+			}
+		};
+
+		console_sink sink;
+		agent_host host(sink);
+
+		host.set_working_dir(pf::current_directory());
+		host.submit(prompt);
+
+		const auto start = std::chrono::steady_clock::now();
+		auto saw_work = false;
+
+		// The turn is over once the host has been busy and has stopped again
+		for (;;)
+		{
+			pf::pump_ui_tasks(100);
+
+			if (host.busy())
+			{
+				saw_work = true;
+			}
+			else if (saw_work)
+			{
+				break;
+			}
+
+			const auto elapsed = std::chrono::steady_clock::now() - start;
+
+			if (!saw_work && !host.connected() && elapsed > std::chrono::seconds(45))
+				break;
+
+			if (elapsed > std::chrono::seconds(180))
+				break;
+		}
+
+		pf::write_stdout("\n----- transcript -----\n");
+		pf::write_stdout(agent_session::to_text(sink.lines));
+		pf::write_stdout("\n");
+
+		host.shutdown();
+		return saw_work ? 0 : 1;
+	}
+
 	// Handles the non-GUI command-line modes; also reports any file argument to open.
 	cli_mode_result run_cli_mode(const std::span<const std::string_view> params, std::string_view& file_to_open)
 	{
@@ -2569,6 +2656,9 @@ namespace
 
 			if (const auto text = try_prefix("/acp:", "--acp:"); !text.empty())
 				return {true, {.start_gui = false, .exit_code = run_acp_diagnostics(text)}};
+
+			if (const auto text = try_prefix("/agent:", "--agent:"); !text.empty())
+				return {true, {.start_gui = false, .exit_code = run_agent_diagnostics(text)}};
 
 			if (!param.starts_with(u8'/') && !param.starts_with(u8'-'))
 			{

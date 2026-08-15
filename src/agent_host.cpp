@@ -206,6 +206,13 @@ void agent_host::ensure_started()
 	if (_client)
 		return;
 
+	if (_working_dir.empty())
+	{
+		note(agent_entry_kind::error, {}, "Open a folder before starting the agent.");
+		set_status("Not connected");
+		return;
+	}
+
 	const auto exe = locate ? locate() : pf::file_path{};
 
 	if (exe.empty())

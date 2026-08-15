@@ -49,6 +49,9 @@ public:
 	// Takes the transcript the document currently holds, so edits made between turns are kept
 	void adopt(std::vector<std::string> lines);
 
+	// The folder the agent runs in. Must be set before the first message.
+	void set_working_dir(pf::file_path dir) { _working_dir = std::move(dir); }
+
 	[[nodiscard]] const std::vector<std::string>& lines() const { return _lines; }
 	[[nodiscard]] bool connected() const;
 	[[nodiscard]] bool busy() const;
