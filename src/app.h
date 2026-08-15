@@ -81,6 +81,7 @@ namespace invalid
 	constexpr auto files_populate = 1 << 9;
 	constexpr auto search_populate = 1 << 11;
 	constexpr auto index = 1 << 15;
+	constexpr auto agent_layout = 1 << 16;
 }
 
 enum class view_mode
@@ -162,6 +163,7 @@ enum class view_focus
 {
 	text,
 	list,
+	agent,
 };
 
 enum class spell_check_mode
@@ -195,10 +197,12 @@ struct view_styles
 
 	int list_font_height = 20;
 	int text_font_height = 24;
+	int agent_font_height = 20;
 
 	pf::font list_font = {20, pf::font_name::calibri};
 	pf::font edit_font = {30, pf::font_name::calibri};
 	pf::font text_font = {24, pf::font_name::consolas};
+	pf::font agent_font = {20, pf::font_name::consolas};
 
 	int padding_x = 5;
 	int padding_y = 5;
@@ -213,7 +217,7 @@ struct view_styles
 	int list_scroll_pad = 64;
 };
 
-enum class zoom_target { text, list };
+enum class zoom_target { text, list, agent };
 
 // app_events — Full application event interface used by views and panels.
 class app_events : public document_events

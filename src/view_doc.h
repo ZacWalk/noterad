@@ -2052,9 +2052,9 @@ protected:
 
 			if (y + nLineHeight > clip.top && y < clip.bottom)
 			{
-				draw_margin(draw, pf::irect(0, y, margin_w, y + nLineHeight), nCurrentLine, styles.text_font);
+				draw_margin(draw, pf::irect(0, y, margin_w, y + nLineHeight), nCurrentLine, body_font());
 				draw_line(draw, pf::irect(pad_left, y, rcClient.right, y + nLineHeight), nCurrentLine,
-				          styles.text_font);
+				          body_font());
 			}
 
 			nCurrentLine++;

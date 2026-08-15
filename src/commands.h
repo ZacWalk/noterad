@@ -77,6 +77,8 @@ enum class command_id : int
 	view_refresh_folder,
 	view_next_result,
 	view_prev_result,
+	view_toggle_agent,
+	agent_focus_input,
 };
 
 class commands

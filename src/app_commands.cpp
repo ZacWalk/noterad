@@ -310,6 +310,20 @@ std::vector<command_def> app_state::make_commands()
 			[this] { return is_search(get_mode()); }, nullptr,
 			[this] { on_navigate_next(false); }
 		},
+		{
+			"Show or hide the agent panel",
+			"&Agent Panel", static_cast<int>(command_id::view_toggle_agent),
+			{'A', pf::key_mod::ctrl | pf::key_mod::shift},
+			nullptr, [this] { return _agent_visible; },
+			[this] { toggle_agent_panel(); }
+		},
+		{
+			"Type a message to the agent",
+			"&Message Agent", static_cast<int>(command_id::agent_focus_input),
+			{pf::platform_key::F4, pf::key_mod::none},
+			nullptr, nullptr,
+			[this] { focus_agent_input(); }
+		},
 
 		// ── Help ───────────────────────────────────────────────────────
 		{
@@ -414,6 +428,9 @@ std::vector<pf::menu_command> app_state::build_menu()
 			"&View", 0, nullptr, nullptr, nullptr, {
 				command_menu_item(cid::view_word_wrap),
 				command_menu_item(cid::view_toggle_markdown),
+				sep(),
+				command_menu_item(cid::view_toggle_agent),
+				command_menu_item(cid::agent_focus_input),
 				sep(),
 				command_menu_item(cid::view_refresh_folder),
 				sep(),

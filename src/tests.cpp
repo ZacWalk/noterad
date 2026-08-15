@@ -6,6 +6,7 @@
 #include "app_state.h"
 #include "view_doc.h"
 #include "view_list_search.h"
+#include "view_agent.h"
 #include "calc.h"
 #include "json.h"
 #include "acp.h"
@@ -3138,6 +3139,101 @@ static void should_ignore_unknown_updates()
 	should::is_equal(size_t{0}, lines.size(), "nothing written");
 }
 
+// The document pane must keep at least a usable width however the splitters are dragged
+static void should_clamp_agent_splitter_to_the_document_pane()
+{
+	const auto state = create_test_app();
+	const pf::irect bounds{0, 0, 1000, 800};
+
+	state->_panel_splitter._ratio = 0.2;
+	auto agent_area = state->agent_splitter_bounds(bounds);
+	should::is_equal_true(agent_area.left >= state->_panel_splitter.split_pos(bounds), "starts after the list");
+
+	// Dragging the list splitter far right collapses the agent area rather than pushing it off screen
+	state->_panel_splitter._ratio = splitter::max_ratio;
+	agent_area = state->agent_splitter_bounds(bounds);
+	should::is_equal_true(agent_area.left > state->_panel_splitter.split_pos(bounds), "never crosses");
+	should::is_equal_true(agent_area.right >= agent_area.left, "never inverts");
+	should::is_equal_true(agent_area.right <= bounds.right, "stays inside the window");
+
+	// Dragging the agent splitter to either extreme still leaves both panes on screen
+	for (const auto ratio : {splitter::min_ratio, 0.5, splitter::max_ratio})
+	{
+		state->_agent_splitter._ratio = ratio;
+		const auto split = state->_agent_splitter.split_pos(state->agent_splitter_bounds(bounds));
+		should::is_equal_true(split > state->_panel_splitter.split_pos(bounds), "document pane survives");
+		should::is_equal_true(split <= bounds.right, "agent pane stays on screen");
+	}
+}
+
+static void should_grow_agent_input_to_six_rows()
+{
+	const auto state = create_test_app();
+	agent_view view(*state);
+
+	should::is_equal(1, view.input_rows(), "empty is one row");
+
+	view.set_input_text("one line");
+	should::is_equal(1, view.input_rows(), "single line");
+
+	view.set_input_text("one\ntwo\nthree");
+	should::is_equal(3, view.input_rows(), "three lines");
+
+	view.set_input_text("1\n2\n3\n4\n5\n6");
+	should::is_equal(agent_view::max_input_rows, view.input_rows(), "six lines");
+
+	// Beyond the cap the box stops growing and the text scrolls instead
+	view.set_input_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+	should::is_equal(agent_view::max_input_rows, view.input_rows(), "capped at six");
+}
+
+// Editing the transcript must not disturb the document pane's caches
+static void should_keep_the_session_document_separate_from_the_editor()
+{
+	const auto state = create_test_app();
+	const auto editor_doc = state->doc();
+
+	const auto session = state->session_item();
+	should::is_equal_true(session != nullptr, "session item exists");
+	should::is_equal_true(session->doc != editor_doc, "a document of its own");
+	should::is_equal(std::string(agent_session::file_name), session->name, "named session.md");
+
+	const auto editor_lines = static_cast<int>(editor_doc->size());
+	state->on_agent_input("hello agent");
+
+	should::is_equal(editor_lines, static_cast<int>(editor_doc->size()), "editor untouched");
+	should::is_equal_true(static_cast<int>(session->doc->size()) > editor_lines, "transcript grew");
+	should::is_equal_true(state->doc() == editor_doc, "active document unchanged");
+}
+
+static void should_handle_agent_slash_commands_in_the_panel()
+{
+	const auto state = create_test_app();
+
+	state->on_agent_input("/help");
+	auto text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("/clear") != std::string::npos, "help lists the commands");
+
+	state->on_agent_input("/nonsense");
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("Unknown command /nonsense") != std::string::npos, "unknown reported");
+
+	// A plain message is recorded as the user's turn
+	state->on_agent_input("do the thing");
+	const auto entries = agent_session::parse(agent_session::to_lines(state->session_item()->doc->str()));
+	const auto user_entries = std::ranges::count_if(entries, [](const agent_entry& e)
+	{
+		return e.kind == agent_entry_kind::user;
+	});
+	should::is_equal_true(user_entries >= 1, "user turn recorded");
+
+	// Clearing starts a fresh transcript
+	state->on_agent_input("/clear");
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("do the thing") == std::string::npos, "history cleared");
+	should::is_equal_true(text.starts_with(agent_session::file_header), "header restored");
+}
+
 tests::run_result run_all_tests_result(){
 	tests tests;
 
@@ -3220,6 +3316,15 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should track tool call lifecycle", should_track_tool_call_lifecycle);
 	tests.register_test("should write plans as options", should_write_plans_as_options);
 	tests.register_test("should ignore unknown updates", should_ignore_unknown_updates);
+
+	// Agent panel tests
+	tests.register_test("should clamp agent splitter to the document pane",
+	                    should_clamp_agent_splitter_to_the_document_pane);
+	tests.register_test("should grow agent input to six rows", should_grow_agent_input_to_six_rows);
+	tests.register_test("should keep the session document separate from the editor",
+	                    should_keep_the_session_document_separate_from_the_editor);
+	tests.register_test("should handle agent slash commands in the panel",
+	                    should_handle_agent_slash_commands_in_the_panel);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);

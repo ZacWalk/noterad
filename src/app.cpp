@@ -14,6 +14,7 @@
 #include "view_doc_markdown.h"
 #include "view_doc_hex.h"
 #include "view_doc_csv.h"
+#include "view_agent.h"
 
 #include "app_state.h"
 #include "acp.h"
@@ -491,15 +492,57 @@ namespace
 	}
 }
 
+// agent_doc_events — Routes the session document's events to the agent pane.
+// Sharing app_state would send them to the document pane and corrupt its wrap cache.
+class agent_doc_events final : public document_events
+{
+public:
+	app_state& _app;
+
+	explicit agent_doc_events(app_state& app) : _app(app)
+	{
+	}
+
+	void invalidate(const uint32_t i) override { _app.invalidate(i); }
+
+	void invalidate_lines(const int start, const int end) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->invalidate_lines(_app._agent_window, start, end);
+	}
+
+	void lines_changed(const int start, const int end) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->lines_changed(_app._agent_window, start, end);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void line_count_changed(const int at, const int delta) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->line_count_changed(_app._agent_window, at, delta);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void ensure_visible(const text_location&) override
+	{
+	}
+};
+
 app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared<edit_doc_view>(*this)),
                                                       _files_view(std::make_shared<file_list_view>(*this)),
                                                       _search_view(std::make_shared<search_list_view>(*this)),
+                                                      _agent_view(std::make_shared<agent_view>(*this)),
                                                       _scheduler(std::move(scheduler))
 {
 	_active_item = std::make_shared<index_item>();
 	_active_item->doc = std::make_shared<document>(*this);
 	_root_folder = std::make_shared<index_item>();
 	_doc_view->set_document(active_item()->doc);
+	_agent_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
 	get_commands().set_commands(make_commands());
 }
 
@@ -762,8 +805,18 @@ void app_state::set_focus(const view_focus v)
 {
 	if (v == view_focus::list)
 		_list_window->set_focus();
+	else if (v == view_focus::agent)
+	{
+		if (_agent_window && _agent_visible)
+			_agent_window->set_focus();
+	}
 	else
 		_doc_window->set_focus();
+}
+
+bool app_state::agent_has_focus() const
+{
+	return _agent_window && _agent_window->has_focus();
 }
 
 text_view_ptr app_state::focused_text_view() const
@@ -911,6 +964,7 @@ void app_state::update_styles()
 	_styles.list_font = {_styles.list_font_height, pf::font_name::calibri};
 	_styles.edit_font = {(_styles.list_font_height * 3) / 2, pf::font_name::calibri};
 	_styles.text_font = {_styles.text_font_height, pf::font_name::consolas};
+	_styles.agent_font = {_styles.agent_font_height, pf::font_name::consolas};
 
 	_styles.padding_x = static_cast<int>(5 * _styles.dpi_scale);
 	_styles.padding_y = static_cast<int>(5 * _styles.dpi_scale);
@@ -931,12 +985,18 @@ void app_state::on_zoom(const int delta, const zoom_target target)
 	case zoom_target::list:
 		_styles.list_font_height = pf::clamp(_styles.list_font_height + delta, 8, 72);
 		break;
+	case zoom_target::agent:
+		_styles.agent_font_height = pf::clamp(_styles.agent_font_height + delta, 8, 72);
+		break;
 	}
 
 	update_styles();
 
 	_doc_window->notify_size();
 	_list_window->notify_size();
+
+	if (_agent_window)
+		_agent_window->notify_size();
 }
 
 pf::file_path app_state::save_folder() const
@@ -1402,33 +1462,40 @@ uint32_t app_state::handle_mouse(const pf::window_frame_ptr window,
 	_app_window = window;
 	using mt = pf::mouse_message_type;
 
+	const auto rect = window->get_client_rect();
+	const auto agent_rect = agent_splitter_bounds(rect);
+
 	if (msg == mt::left_button_down)
 	{
-		const auto rect = window->get_client_rect();
-		_panel_splitter.begin_tracking(rect, params.point, window);
+		if (!(_agent_visible && _agent_splitter.begin_tracking(agent_rect, params.point, window)))
+			_panel_splitter.begin_tracking(rect, params.point, window);
 	}
 
 	if (msg == mt::mouse_leave)
 	{
 		_panel_splitter.clear_hover(window);
+		_agent_splitter.clear_hover(window);
 	}
 
 	if (msg == mt::mouse_move)
 	{
-		const auto rect = window->get_client_rect();
-
 		if (params.left_button)
 		{
-			if (_panel_splitter.track_to(rect, params.point, window))
+			if (_panel_splitter.track_to(rect, params.point, window) ||
+				(_agent_visible && _agent_splitter.track_to(agent_rect, params.point, window)))
 				layout_views();
 		}
 
 		_panel_splitter.update_hover(rect, params.point, window);
+
+		if (_agent_visible)
+			_agent_splitter.update_hover(agent_rect, params.point, window);
 	}
 
 	if (msg == mt::left_button_up)
 	{
 		_panel_splitter.end_tracking(window);
+		_agent_splitter.end_tracking(window);
 	}
 
 	return 0;
@@ -1455,6 +1522,11 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	_list_window->accept_drop_files(true);
 	_list_window->set_reactor(_files_view);
 
+	_agent_window = window->create_child("AGENT_FRAME",
+	                                     pf::window_style::child | pf::window_style::clip_children,
+	                                     ui::window_background);
+	_agent_window->set_reactor(_agent_view);
+
 	// Restore font sizes from config
 	const auto text_size = pf::config_read("Font", "TextSize");
 	const auto list_size = pf::config_read("Font", "ListSize");
@@ -1476,6 +1548,17 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 
 	if (double ratio = 0.0; parse_double_value(panel_ratio, ratio))
 		_panel_splitter._ratio = std::clamp(ratio, splitter::min_ratio, splitter::max_ratio);
+
+	if (double ratio = 0.0; parse_double_value(pf::config_read("Agent", "SplitterRatio"), ratio))
+		_agent_splitter._ratio = std::clamp(ratio, splitter::min_ratio, splitter::max_ratio);
+
+	if (int size = 0; parse_int_value(pf::config_read("Agent", "FontSize"), size))
+		_styles.agent_font_height = std::clamp(size, 8, 72);
+	else
+		_styles.agent_font_height = _styles.list_font_height;
+
+	update_styles();
+	show_agent_panel(pf::config_read("Agent", "Visible") == "1");
 
 	if (!word_wrap.empty())
 		_word_wrap = word_wrap != "0";
@@ -1516,6 +1599,20 @@ void app_state::handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc)
 {
 	const auto bounds = window->get_client_rect();
 	_panel_splitter.draw(dc, bounds);
+
+	if (_agent_visible)
+		_agent_splitter.draw(dc, agent_splitter_bounds(bounds));
+}
+
+// The agent splitter divides only what is left of the document pane, so the two cannot cross.
+// With no room left it collapses against the right edge rather than leaving the window.
+pf::irect app_state::agent_splitter_bounds(const pf::irect& bounds) const
+{
+	auto rest = bounds;
+	const auto earliest = _panel_splitter.split_pos(bounds) + _panel_splitter.bar_width() + min_pane_width();
+	rest.left = std::min(earliest, bounds.right);
+	rest.right = std::max(rest.left, bounds.right);
+	return rest;
 }
 
 void app_state::layout_views() const
@@ -1529,6 +1626,17 @@ void app_state::layout_views() const
 
 	auto text_bounds = bounds;
 	text_bounds.left = panel_split + _panel_splitter.bar_width();
+
+	if (_agent_visible && _agent_window)
+	{
+		const auto agent_split = _agent_splitter.split_pos(agent_splitter_bounds(bounds));
+		text_bounds.right = std::max(text_bounds.left, agent_split - _agent_splitter.bar_width());
+
+		auto agent_bounds = bounds;
+		agent_bounds.left = std::min(agent_split + _agent_splitter.bar_width(), bounds.right);
+		_agent_window->move_window(agent_bounds);
+	}
+
 	_doc_window->move_window(text_bounds);
 
 	auto panel_bounds = bounds;
@@ -1538,6 +1646,132 @@ void app_state::layout_views() const
 	{
 		_list_window->move_window(panel_bounds);
 	}
+}
+
+void app_state::show_agent_panel(const bool visible)
+{
+	_agent_visible = visible;
+
+	if (_agent_window)
+		_agent_window->show(visible);
+
+	if (visible && _agent_view && !_session_item)
+	{
+		_agent_view->set_document(session_item()->doc);
+		_agent_view->layout();
+	}
+
+	layout_views();
+	invalidate(invalid::windows | invalid::agent_layout);
+}
+
+void app_state::toggle_agent_panel()
+{
+	show_agent_panel(!_agent_visible);
+
+	if (_agent_visible)
+		set_focus(view_focus::agent);
+	else
+		set_focus(view_focus::text);
+}
+
+void app_state::focus_agent_input()
+{
+	if (!_agent_visible)
+		show_agent_panel(true);
+
+	set_focus(view_focus::agent);
+}
+
+index_item_ptr app_state::session_item()
+{
+	if (_session_item)
+		return _session_item;
+
+	if (!_agent_doc_events)
+		_agent_doc_events = std::make_shared<agent_doc_events>(*this);
+
+	const auto folder = _root_folder && !_root_folder->path.empty()
+		                    ? _root_folder->path
+		                    : pf::current_directory();
+
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
+
+	_session_item = std::make_shared<index_item>(folder.combine(agent_session::file_name),
+	                                             std::string(agent_session::file_name), false);
+	_session_item->doc = std::make_shared<document>(*_agent_doc_events, agent_session::to_text(lines));
+	_session_item->doc->path(_session_item->path);
+
+	return _session_item;
+}
+
+void app_state::append_agent_lines(const std::vector<std::string>& lines)
+{
+	if (lines.empty())
+		return;
+
+	const auto& doc = session_item()->doc;
+	auto text = agent_session::to_lines(doc->str());
+
+	for (const auto& line : lines)
+		text.push_back(line);
+
+	{
+		undo_group ug(doc);
+		doc->replace_text(ug, doc->all(), agent_session::to_text(text));
+	}
+
+	invalidate(invalid::agent_layout);
+
+	if (_agent_view)
+		_agent_view->scroll_to_end();
+}
+
+void app_state::on_agent_input(std::string text)
+{
+	const auto parsed = agent_session::parse_command(text, _agent_commands);
+
+	std::vector<std::string> lines;
+
+	switch (parsed.command)
+	{
+	case agent_command::help:
+		agent_session::append_entry(lines, agent_entry_kind::note, {},
+		                            agent_session::help_text(_agent_commands));
+		break;
+
+	case agent_command::clear:
+		clear_agent_session();
+		return;
+
+	case agent_command::unknown:
+		agent_session::append_entry(lines, agent_entry_kind::error, {},
+		                            std::format("Unknown command /{} — try /help", parsed.name));
+		break;
+
+	default:
+		// Everything else needs a running agent, which arrives in a later stage
+		agent_session::append_entry(lines, agent_entry_kind::user, {}, text);
+		agent_session::append_entry(lines, agent_entry_kind::error, {},
+		                            "No agent is connected yet.");
+		break;
+	}
+
+	append_agent_lines(lines);
+}
+
+void app_state::clear_agent_session()
+{
+	_session_item.reset();
+
+	if (_agent_view)
+	{
+		_agent_view->set_document(session_item()->doc);
+		_agent_view->layout();
+	}
+
+	invalidate(invalid::agent_layout);
 }
 
 void app_state::save_config() const
@@ -1560,6 +1794,9 @@ void app_state::save_config() const
 
 	// Save splitter positions as ratios
 	pf::config_write("Splitter", "PanelRatio", to_str(_panel_splitter._ratio));
+	pf::config_write("Agent", "SplitterRatio", to_str(_agent_splitter._ratio));
+	pf::config_write("Agent", "FontSize", to_str(_styles.agent_font_height));
+	pf::config_write("Agent", "Visible", _agent_visible ? "1" : "0");
 	pf::config_write("View", "WordWrap", _word_wrap ? "1" : "0");
 	pf::config_write("View", "SpellCheck", spell_check_mode_config_value(_spell_check_mode));
 
@@ -1821,6 +2058,17 @@ void app_state::on_idle()
 	{
 		_search_view->layout_list();
 		_list_window->invalidate();
+	}
+
+	if (invalids & invalid::agent_layout)
+	{
+		if (_agent_view && _agent_window && _agent_visible)
+		{
+			_agent_view->layout();
+			_agent_view->recalc_vert_scrollbar();
+			_agent_window->notify_size();
+			_agent_window->invalidate();
+		}
 	}
 
 	if (invalids & invalid::windows)

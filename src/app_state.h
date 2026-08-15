@@ -6,6 +6,7 @@
 #include "document.h"
 #include "commands.h"
 #include "gitignore.h"
+#include "agent_session.h"
 #include "ui.h"
 
 
@@ -17,12 +18,14 @@ class list_view;
 class file_list_view;
 class search_list_view;
 class doc_view;
+class agent_view;
 struct list_view_item;
 
 using doc_view_ptr = std::shared_ptr<doc_view>;
 using text_view_ptr = std::shared_ptr<text_view>;
 using folder_view_ptr = std::shared_ptr<file_list_view>;
 using search_view_ptr = std::shared_ptr<search_list_view>;
+using agent_view_ptr = std::shared_ptr<agent_view>;
 using list_view_item_ptr = std::shared_ptr<list_view_item>;
 
 
@@ -40,10 +43,12 @@ public:
 	pf::window_frame_ptr _app_window;
 	pf::window_frame_ptr _doc_window;
 	pf::window_frame_ptr _list_window;
+	pf::window_frame_ptr _agent_window;
 
 	doc_view_ptr _doc_view;
 	folder_view_ptr _files_view;
 	search_view_ptr _search_view;
+	agent_view_ptr _agent_view;
 
 	async_scheduler_ptr _scheduler;
 
@@ -65,6 +70,25 @@ public:
 	std::atomic<uint32_t> _invalid = 0;
 
 	splitter _panel_splitter{splitter::orientation::vertical, 0.2};
+	splitter _agent_splitter{splitter::orientation::vertical, 0.72};
+	bool _agent_visible = false;
+
+	// The document pane never shrinks below this, however the splitters are dragged
+	[[nodiscard]] int min_pane_width() const { return static_cast<int>(160 * _styles.dpi_scale); }
+
+	void toggle_agent_panel();
+	void show_agent_panel(bool visible);
+	void focus_agent_input();
+	void on_agent_input(std::string text);
+	void clear_agent_session();
+	[[nodiscard]] bool agent_has_focus() const;
+	[[nodiscard]] index_item_ptr session_item();
+	void append_agent_lines(const std::vector<std::string>& lines);
+	[[nodiscard]] pf::irect agent_splitter_bounds(const pf::irect& bounds) const;
+
+	index_item_ptr _session_item;
+	std::shared_ptr<document_events> _agent_doc_events;
+	std::vector<advertised_command> _agent_commands;
 
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);
