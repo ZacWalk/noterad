@@ -2965,8 +2965,180 @@ static void should_session_survive_hand_mangled_files()
 	should::is_equal("", options.model, "no model");
 }
 
-tests::run_result run_all_tests_result()
+static void should_parse_slash_commands()
 {
+	using agent_session::parse_command;
+
+	should::is_equal_true(parse_command("hello there").command == agent_command::prompt, "plain text");
+	should::is_equal("hello there", parse_command("hello there").text, "prompt text");
+	should::is_equal_true(parse_command("what about a/b?").command == agent_command::prompt,
+	                      "slash inside text is not a command");
+
+	should::is_equal_true(parse_command("/help").command == agent_command::help, "help");
+	should::is_equal_true(parse_command("/h").command == agent_command::help, "help alias");
+	should::is_equal_true(parse_command("/clear").command == agent_command::clear, "clear");
+	should::is_equal_true(parse_command("/c").command == agent_command::clear, "clear alias");
+	should::is_equal_true(parse_command("/stop").command == agent_command::stop, "stop");
+	should::is_equal_true(parse_command("/s").command == agent_command::stop, "stop alias");
+	should::is_equal_true(parse_command("/models").command == agent_command::models, "models");
+	should::is_equal_true(parse_command("/m").command == agent_command::models, "models alias");
+	should::is_equal_true(parse_command("/yolo").command == agent_command::yolo, "yolo");
+
+	should::is_equal_true(parse_command("  /help  ").command == agent_command::help, "surrounding space");
+	should::is_equal("gpt-5", parse_command("/models gpt-5").text, "argument captured");
+
+	// Unknown unless the agent advertised it
+	should::is_equal_true(parse_command("/context").command == agent_command::unknown, "unknown by default");
+	should::is_equal("context", parse_command("/context").name, "unknown keeps the name");
+
+	const advertised_command advertised[] = {{"context", "Show token usage"}};
+	const auto forwarded = parse_command("/context detail", advertised);
+	should::is_equal_true(forwarded.command == agent_command::forward, "forwarded when advertised");
+	should::is_equal("/context detail", forwarded.text, "forwarded verbatim");
+}
+
+// The table is the single source of truth, so help can never drift from the parser
+static void should_generate_help_from_the_command_table()
+{
+	const auto text = agent_session::help_text();
+
+	for (const auto& def : agent_session::command_table())
+	{
+		should::is_equal_true(text.find(std::format("/{}", def.name)) != std::string::npos,
+		                      std::format("help lists /{}", def.name));
+		should::is_equal_true(text.find(def.description) != std::string::npos,
+		                      std::format("help describes /{}", def.name));
+
+		if (!def.alias.empty())
+			should::is_equal_true(text.find(std::format("/{}", def.alias)) != std::string::npos,
+			                      std::format("help lists the /{} alias", def.alias));
+
+		// Every listed command must actually parse
+		should::is_equal_true(agent_session::parse_command(std::format("/{}", def.name)).command == def.command,
+		                      "help entry parses");
+	}
+
+	const advertised_command advertised[] = {{"context", "Show token usage"}};
+	const auto with_agent = agent_session::help_text(advertised);
+	should::is_equal_true(with_agent.find("/context") != std::string::npos, "lists agent commands");
+	should::is_equal_true(with_agent.find("Show token usage") != std::string::npos, "describes them");
+}
+
+static void should_read_advertised_commands()
+{
+	const auto parsed = json::parse(
+		R"({"availableCommands":[{"name":"context","description":"Show usage"},{"name":"","description":"skip"},{"name":"plan"}]})");
+
+	const auto commands = agent_session::read_advertised_commands(parsed.root);
+
+	should::is_equal(size_t{2}, commands.size(), "nameless entry skipped");
+	should::is_equal("context", commands[0].name, "first name");
+	should::is_equal("Show usage", commands[0].description, "first description");
+	should::is_equal("plan", commands[1].name, "second name");
+	should::is_equal("", commands[1].description, "missing description is empty");
+}
+
+static json::value make_update(const std::string_view text)
+{
+	return json::parse(text).root;
+}
+
+// A token stream must extend one line rather than growing the file
+static void should_stream_chunks_into_one_line()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}})"));
+
+	const auto after_first = lines.size();
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo "}})"));
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"world"}})"));
+
+	should::is_equal(after_first, lines.size(), "later chunks add no lines");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "one entry");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::agent, "agent entry");
+	should::is_equal_true(agent_session::to_text(lines).find("Hello world") != std::string::npos, "joined");
+
+	// A thought opens its own entry, and a following message opens a fresh one
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering"}})"));
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}})"));
+
+	const auto kinds = agent_session::parse(lines);
+	should::is_equal(size_t{3}, kinds.size(), "three entries");
+	should::is_equal_true(kinds[1].kind == agent_entry_kind::thought, "thought entry");
+	should::is_equal_true(kinds[2].kind == agent_entry_kind::agent, "new agent entry");
+}
+
+static void should_track_tool_call_lifecycle()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call","toolCallId":"t1","title":"git status","kind":"execute","status":"pending"})"));
+
+	auto entries = agent_session::parse(lines);
+	should::is_equal_true(entries.back().kind == agent_entry_kind::tool_call, "tool entry");
+	should::is_equal("git status", entries.back().title, "title");
+	should::is_equal("pending", entries.back().status, "pending");
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"})"));
+
+	entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "updated in place, not appended");
+	should::is_equal("git status", entries.back().title, "title kept");
+	should::is_equal("completed", entries.back().status, "status updated");
+
+	// An update for a call we never saw changes nothing
+	const auto before = agent_session::to_text(lines);
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call_update","toolCallId":"nope","status":"failed"})"));
+	should::is_equal(before, agent_session::to_text(lines), "unknown tool call ignored");
+
+	// A title-less call falls back to its kind
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call","toolCallId":"t2","kind":"read","status":"pending"})"));
+	should::is_equal("read", agent_session::parse(lines).back().title, "kind used as the title");
+}
+
+static void should_write_plans_as_options()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"plan","entries":[{"content":"Read the file","status":"completed"},{"content":"Fix the bug","status":"pending"}]})"));
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal_true(entries.back().kind == agent_entry_kind::plan, "plan entry");
+	should::is_equal(size_t{2}, entries.back().options.size(), "two steps");
+	should::is_equal_true(entries.back().options[0].chosen, "completed step ticked");
+	should::is_equal(false, entries.back().options[1].chosen, "pending step not ticked");
+	should::is_equal("Fix the bug", entries.back().options[1].label, "step text");
+}
+
+static void should_ignore_unknown_updates()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(R"({"sessionUpdate":"something_new","data":1})"));
+	agent_session::apply_update(lines, state, make_update(R"({})"));
+
+	should::is_equal(size_t{0}, lines.size(), "nothing written");
+}
+
+tests::run_result run_all_tests_result(){
 	tests tests;
 
 	// Document tests
@@ -3040,6 +3212,14 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should session choose option", should_session_choose_option);
 	tests.register_test("should session append entries and chunks", should_session_append_entries_and_chunks);
 	tests.register_test("should session survive hand mangled files", should_session_survive_hand_mangled_files);
+	tests.register_test("should parse slash commands", should_parse_slash_commands);
+	tests.register_test("should generate help from the command table",
+	                    should_generate_help_from_the_command_table);
+	tests.register_test("should read advertised commands", should_read_advertised_commands);
+	tests.register_test("should stream chunks into one line", should_stream_chunks_into_one_line);
+	tests.register_test("should track tool call lifecycle", should_track_tool_call_lifecycle);
+	tests.register_test("should write plans as options", should_write_plans_as_options);
+	tests.register_test("should ignore unknown updates", should_ignore_unknown_updates);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);

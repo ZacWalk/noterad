@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "json.h"
+
 enum class agent_entry_kind
 {
 	note,
@@ -78,4 +80,76 @@ namespace agent_session
 
 	[[nodiscard]] std::string to_text(std::span<const std::string> lines);
 	[[nodiscard]] std::vector<std::string> to_lines(std::string_view text);
+}
+
+// ── Slash commands ──────────────────────────────────────────────────────────────
+
+enum class agent_command
+{
+	prompt, // ordinary text for the agent
+	help,
+	clear,
+	stop,
+	models,
+	yolo,
+	forward, // a slash command the agent advertised
+	unknown,
+};
+
+struct agent_command_def
+{
+	std::string_view name;
+	std::string_view alias;
+	std::string_view description;
+	agent_command command;
+};
+
+struct agent_command_parse
+{
+	agent_command command = agent_command::prompt;
+	std::string name; // for forward and unknown, without the leading slash
+	std::string text; // the prompt, or the argument that followed the command
+};
+
+// A command the agent advertised through available_commands_update
+struct advertised_command
+{
+	std::string name;
+	std::string description;
+};
+
+namespace agent_session
+{
+	// One table drives the parser, the help text and the unknown-command message
+	[[nodiscard]] std::span<const agent_command_def> command_table();
+
+	[[nodiscard]] agent_command_parse parse_command(std::string_view input,
+	                                                std::span<const advertised_command> advertised = {});
+
+	[[nodiscard]] std::string help_text(std::span<const advertised_command> advertised = {});
+
+	[[nodiscard]] std::vector<advertised_command> read_advertised_commands(const json::value& update);
+}
+
+// ── Streaming ───────────────────────────────────────────────────────────────────
+
+// Live state that has no place on disk: what the current turn is still writing
+struct agent_stream_state
+{
+	agent_entry_kind open_kind = agent_entry_kind::note;
+	bool entry_open = false;
+	std::map<std::string, int> tool_lines; // toolCallId -> heading line
+
+	void reset()
+	{
+		entry_open = false;
+		open_kind = agent_entry_kind::note;
+		tool_lines.clear();
+	}
+};
+
+namespace agent_session
+{
+	// Applies one session/update payload to the file. 'update' is params["update"].
+	void apply_update(std::vector<std::string>& lines, agent_stream_state& state, const json::value& update);
 }

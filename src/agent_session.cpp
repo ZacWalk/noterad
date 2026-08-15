@@ -267,11 +267,15 @@ namespace agent_session
 		for (;;)
 		{
 			const auto newline = body.find('\n', pos);
-			const auto piece = body.substr(pos, newline == std::string_view::npos
-				                               ? std::string_view::npos
-				                               : newline - pos);
+			auto piece = body.substr(pos, newline == std::string_view::npos
+				                         ? std::string_view::npos
+				                         : newline - pos);
 
-			result.push_back(escape_body_line(trim_end(piece)));
+			// Only the line ending is removed; a trailing space can be part of a streamed chunk
+			if (!piece.empty() && piece.back() == '\r')
+				piece.remove_suffix(1);
+
+			result.push_back(escape_body_line(piece));
 
 			if (newline == std::string_view::npos)
 				break;
@@ -444,5 +448,197 @@ namespace agent_session
 		}
 
 		return result;
+	}
+
+	// ── Slash commands ───────────────────────────────────────────────────────────
+
+	std::span<const agent_command_def> command_table()
+	{
+		static constexpr agent_command_def table[] = {
+			{"help", "h", "Show this help", agent_command::help},
+			{"clear", "c", "Clear the conversation and start a new session", agent_command::clear},
+			{"stop", "s", "Stop the agent", agent_command::stop},
+			{"models", "m", "List the available models and choose one", agent_command::models},
+			{"yolo", "", "Toggle running tools without asking", agent_command::yolo},
+		};
+
+		return table;
+	}
+
+	agent_command_parse parse_command(const std::string_view input,
+	                                  const std::span<const advertised_command> advertised)
+	{
+		const auto text = trim(input);
+
+		if (!text.starts_with('/'))
+			return {agent_command::prompt, {}, std::string(text)};
+
+		const auto body = text.substr(1);
+		const auto space = body.find(' ');
+		const auto name = body.substr(0, space);
+		const auto argument = space == std::string_view::npos ? std::string_view{} : trim(body.substr(space + 1));
+
+		for (const auto& def : command_table())
+		{
+			if (name == def.name || (!def.alias.empty() && name == def.alias))
+				return {def.command, std::string(def.name), std::string(argument)};
+		}
+
+		for (const auto& command : advertised)
+		{
+			if (name == command.name)
+				return {agent_command::forward, command.name, std::string(text)};
+		}
+
+		return {agent_command::unknown, std::string(name), std::string(argument)};
+	}
+
+	std::string help_text(const std::span<const advertised_command> advertised)
+	{
+		std::string result = "Type a message to the agent, or one of these commands.\n";
+
+		for (const auto& def : command_table())
+		{
+			auto names = std::format("/{}", def.name);
+
+			if (!def.alias.empty())
+				names += std::format(", /{}", def.alias);
+
+			result += std::format("\n- `{}` — {}", names, def.description);
+		}
+
+		if (!advertised.empty())
+		{
+			result += "\n\nThe agent also offers:\n";
+
+			for (const auto& command : advertised)
+				result += std::format("\n- `/{}` — {}", command.name, command.description);
+		}
+
+		return result;
+	}
+
+	std::vector<advertised_command> read_advertised_commands(const json::value& update)
+	{
+		std::vector<advertised_command> result;
+
+		for (const auto& item : update["availableCommands"].items())
+		{
+			auto name = std::string(item["name"].text());
+
+			if (name.empty())
+				continue;
+
+			result.push_back({std::move(name), std::string(item["description"].text())});
+		}
+
+		return result;
+	}
+
+	// ── Streaming ────────────────────────────────────────────────────────────────
+
+	namespace
+	{
+		void open_entry(std::vector<std::string>& lines, agent_stream_state& state,
+		                const agent_entry_kind kind, const std::string_view title = {})
+		{
+			if (state.entry_open && state.open_kind == kind && title.empty())
+				return;
+
+			append_entry(lines, kind, title, {});
+			state.open_kind = kind;
+			state.entry_open = true;
+		}
+
+		std::string_view content_text(const json::value& update)
+		{
+			return update["content"]["text"].text();
+		}
+
+		// A tool call is titled by whatever the agent gave us, falling back to its kind
+		std::string tool_title(const json::value& update)
+		{
+			const auto title = update["title"].text();
+			return std::string(title.empty() ? update["kind"].text("tool") : title);
+		}
+
+		void set_tool_status(std::vector<std::string>& lines, const int line, const std::string_view status)
+		{
+			if (line < 0 || line >= static_cast<int>(lines.size()))
+				return;
+
+			const std::string_view prefix = "### Tool: ";
+			auto& text = lines[line];
+
+			if (!text.starts_with(prefix))
+				return;
+
+			auto title = std::string_view(text).substr(prefix.size());
+
+			if (const auto open = title.rfind(" ("); open != std::string_view::npos && title.ends_with(')'))
+				title = title.substr(0, open);
+
+			text = std::format("{}{} ({})", prefix, title, status);
+		}
+	}
+
+	void apply_update(std::vector<std::string>& lines, agent_stream_state& state, const json::value& update)
+	{
+		const auto kind = update["sessionUpdate"].text();
+
+		if (kind == "agent_message_chunk")
+		{
+			open_entry(lines, state, agent_entry_kind::agent);
+			append_chunk(lines, content_text(update));
+			return;
+		}
+
+		if (kind == "agent_thought_chunk")
+		{
+			open_entry(lines, state, agent_entry_kind::thought);
+			append_chunk(lines, content_text(update));
+			return;
+		}
+
+		if (kind == "tool_call")
+		{
+			const auto status = update["status"].text("pending");
+			append_entry(lines, agent_entry_kind::tool_call,
+			             std::format("{} ({})", tool_title(update), status), {});
+
+			// The heading is the line before the blank one append_entry leaves
+			const auto heading_line = static_cast<int>(lines.size()) - 2;
+
+			if (const auto id = update["toolCallId"].text(); !id.empty())
+				state.tool_lines[std::string(id)] = heading_line;
+
+			state.entry_open = false;
+			return;
+		}
+
+		if (kind == "tool_call_update")
+		{
+			const auto id = std::string(update["toolCallId"].text());
+			const auto found = state.tool_lines.find(id);
+
+			if (found != state.tool_lines.end())
+				set_tool_status(lines, found->second, update["status"].text("completed"));
+
+			state.entry_open = false;
+			return;
+		}
+
+		if (kind == "plan")
+		{
+			append_entry(lines, agent_entry_kind::plan, {}, {});
+
+			for (const auto& item : update["entries"].items())
+			{
+				const auto done = item["status"].text() == "completed";
+				lines.push_back(std::format("- [{}] {}", done ? 'x' : ' ', item["content"].text()));
+			}
+
+			state.entry_open = false;
+		}
 	}
 }
