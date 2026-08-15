@@ -7,6 +7,7 @@
 #include "view_doc.h"
 #include "view_list_search.h"
 #include "calc.h"
+#include "json.h"
 #include "test.h"
 
 
@@ -2115,6 +2116,295 @@ static void should_search_no_match()
 	should::is_equal(0, static_cast<int>(item->search_results.size()), "no match");
 }
 
+static void should_json_round_trip()
+{
+	constexpr std::string_view text =
+		R"({"id":7,"ok":true,"none":null,"ratio":0.5,"tags":["a","b"],"nested":{"deep":[1,2,3]}})";
+
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal(text, parsed.root.to_string(), "round trip");
+}
+
+static void should_json_read_members()
+{
+	const auto parsed = json::parse(R"({"jsonrpc":"2.0","id":42,"params":{"sessionId":"s1"}})");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& root = parsed.root;
+	should::is_equal("2.0", root["jsonrpc"].text(), "string member");
+	should::is_equal(42, static_cast<int>(root["id"].integer()), "integer member");
+	should::is_equal("s1", root["params"]["sessionId"].text(), "nested member");
+	should::is_equal_true(root.contains("params"), "contains");
+	should::is_equal(size_t{3}, root.size(), "member count");
+}
+
+// Accessors are total so protocol handling never needs a type check before a read
+static void should_json_accessors_fall_back()
+{
+	const auto parsed = json::parse(R"({"n":1})");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& root = parsed.root;
+	should::is_equal_true(root["missing"].is_null(), "missing key is null");
+	should::is_equal("fallback", root["missing"].text("fallback"), "missing text");
+	should::is_equal(9, static_cast<int>(root["missing"].integer(9)), "missing integer");
+	should::is_equal_true(root["n"].boolean(true), "wrong type keeps fallback");
+	should::is_equal("", root["n"].text(), "number as text is empty");
+	should::is_equal_true(root[7].is_null(), "index on object is null");
+}
+
+static void should_json_parse_escapes()
+{
+	const auto parsed = json::parse(R"(["a\"b","c\\d","e\/f","g\nh","\u0041\u00e9\u4e2d","\ud83d\ude00"])");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& a = parsed.root;
+	should::is_equal("a\"b", a[0].text(), "quote");
+	should::is_equal("c\\d", a[1].text(), "backslash");
+	should::is_equal("e/f", a[2].text(), "solidus");
+	should::is_equal("g\nh", a[3].text(), "newline");
+	should::is_equal("A\xC3\xA9\xE4\xB8\xAD", a[4].text(), "bmp escapes as utf8");
+	should::is_equal("\xF0\x9F\x98\x80", a[5].text(), "surrogate pair as utf8");
+}
+
+// A lone surrogate cannot be encoded, so it becomes U+FFFD rather than failing the message
+static void should_json_replace_lone_surrogates()
+{
+	const auto lead = json::parse(R"(["\ud83d"])");
+	should::is_equal_true(lead.ok, "lead parsed");
+	should::is_equal("\xEF\xBF\xBD", lead.root[0].text(), "lone lead");
+
+	const auto trail = json::parse(R"(["\udc00"])");
+	should::is_equal_true(trail.ok, "trail parsed");
+	should::is_equal("\xEF\xBF\xBD", trail.root[0].text(), "lone trail");
+
+	const auto unpaired = json::parse(R"(["\ud83dZ"])");
+	should::is_equal_true(unpaired.ok, "unpaired parsed");
+	should::is_equal("\xEF\xBF\xBDZ", unpaired.root[0].text(), "lead then plain text");
+}
+
+// The transport is newline-delimited, so a serialised message must never contain a raw newline
+static void should_json_escape_control_characters()
+{
+	auto v = json::object();
+	v.set("text", std::string("line1\nline2\r\ttab\b\f\x01 end"));
+
+	const auto text = v.to_string();
+	should::is_equal(R"({"text":"line1\nline2\r\ttab\b\f\u0001 end"})", text, "escaped");
+	should::is_equal_true(text.find('\n') == std::string::npos, "no raw newline");
+
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "reparsed");
+	should::is_equal("line1\nline2\r\ttab\b\f\x01 end", parsed.root["text"].text(), "value survives");
+}
+
+static void should_json_keep_integers_exact()
+{
+	const auto parsed = json::parse(R"([0,-1,7,9007199254740993,-9007199254740993])");
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal("[0,-1,7,9007199254740993,-9007199254740993]", parsed.root.to_string(),
+	                 "large ids survive as integers");
+
+	const auto real = json::parse("1.5");
+	should::is_equal_true(real.ok, "real parsed");
+	should::is_equal("1.5", real.root.to_string(), "real round trip");
+
+	const auto exponent = json::parse("2e3");
+	should::is_equal_true(exponent.ok, "exponent parsed");
+	should::is_equal(2000, static_cast<int>(exponent.root.integer()), "exponent value");
+}
+
+static void should_json_reject_bad_numbers()
+{
+	constexpr std::string_view bad[] = {
+		"01", "-", "+1", ".5", "1.", "1.e3", "1e", "1e+", "--1", "0x10", "nan", "inf", "Infinity"
+	};
+
+	for (const auto& text : bad)
+	{
+		const auto parsed = json::parse(text);
+		should::is_equal(false, parsed.ok, std::format("rejects '{}'", text));
+	}
+
+	// Out of range rather than silently becoming infinity
+	should::is_equal(false, json::parse("1e309").ok, "rejects overflow");
+
+	// Too large for int64, so it degrades to a double rather than failing
+	const auto huge = json::parse("99999999999999999999");
+	should::is_equal_true(huge.ok, "huge parsed");
+	should::is_equal_true(huge.root.is_number(), "huge is number");
+}
+
+static void should_json_reject_malformed_input()
+{
+	constexpr std::string_view bad[] = {
+		"", "   ", "{", "}", "[", "]", "[1,]", "{\"a\":}", "{\"a\" 1}", "{a:1}", "{\"a\":1,}",
+		"\"unterminated", "\"bad\\escape\"", "tru", "nulll", "[1] extra", "{}{}", "\"\x01\""
+	};
+
+	for (const auto& text : bad)
+	{
+		const auto parsed = json::parse(text);
+		should::is_equal(false, parsed.ok, std::format("rejects '{}'", text));
+		should::is_equal_true(!parsed.error.empty(), "reports an error");
+		should::is_equal_true(parsed.root.is_null(), "yields null on failure");
+	}
+}
+
+// A hostile message must not be able to exhaust the stack
+static void should_json_limit_nesting_depth()
+{
+	const auto build = [](const int depth)
+	{
+		return std::string(depth, '[') + std::string(depth, ']');
+	};
+
+	should::is_equal_true(json::parse(build(json::max_parse_depth - 1)).ok, "accepts allowed depth");
+	should::is_equal(false, json::parse(build(json::max_parse_depth + 10)).ok, "rejects excessive depth");
+	should::is_equal(false, json::parse(build(10000)).ok, "rejects extreme depth");
+}
+
+static void should_json_build_messages()
+{
+	auto params = json::object();
+	params.set("sessionId", "abc");
+	params.set("prompt", json::array().add(json::object().set("type", "text").set("text", "hi")));
+
+	auto request = json::object();
+	request.set("jsonrpc", "2.0");
+	request.set("id", 1);
+	request.set("method", "session/prompt");
+	request.set("params", std::move(params));
+
+	should::is_equal(
+		R"({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"abc","prompt":[{"type":"text","text":"hi"}]}})",
+		request.to_string(), "built message");
+}
+
+// Members keep insertion order, and a repeated key updates in place rather than appending
+static void should_json_replace_duplicate_keys()
+{
+	auto v = json::object();
+	v.set("a", 1);
+	v.set("b", 2);
+	v.set("a", 3);
+
+	should::is_equal(size_t{2}, v.size(), "no duplicate member");
+	should::is_equal(R"({"a":3,"b":2})", v.to_string(), "updated in place");
+
+	const auto parsed = json::parse(R"({"a":1,"a":2})");
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal(2, static_cast<int>(parsed.root["a"].integer()), "last wins");
+}
+
+static void should_json_pass_through_utf8()
+{
+	// U+00E9 arrives escaped, the rest as raw UTF-8 bytes
+	const std::string text = "{\"s\":\"\\u00e9 \xE4\xB8\xAD \xF0\x9F\x98\x80\"}";
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "parsed");
+
+	// Non-ASCII is emitted raw, not re-escaped
+	should::is_equal("{\"s\":\"\xC3\xA9 \xE4\xB8\xAD \xF0\x9F\x98\x80\"}", parsed.root.to_string(), "raw utf8 out");
+}
+
+static std::vector<std::string> split_stream(const std::vector<std::string_view>& chunks,
+                                             const size_t max_line_bytes = pf::line_splitter::default_max_line_bytes)
+{
+	pf::line_splitter splitter;
+	splitter.max_line_bytes = max_line_bytes;
+
+	std::vector<std::string> lines;
+	const auto emit = [&lines](const std::string_view line) { lines.emplace_back(line); };
+
+	for (const auto& chunk : chunks)
+		splitter.feed(chunk, emit);
+
+	splitter.flush(emit);
+	return lines;
+}
+
+// A pipe read boundary can fall anywhere, including inside a multi-byte character
+static void should_split_lines_across_read_boundaries()
+{
+	const auto whole = split_stream({"one\ntwo\nthree\n"});
+	should::is_equal(size_t{3}, whole.size(), "three lines");
+	should::is_equal("one", whole[0], "first");
+	should::is_equal("three", whole[2], "third");
+
+	const auto split = split_stream({"on", "e\ntw", "o\nthr", "ee\n"});
+	should::is_equal(size_t{3}, split.size(), "three lines when split");
+	should::is_equal("one", split[0], "first when split");
+	should::is_equal("two", split[1], "second when split");
+	should::is_equal("three", split[2], "third when split");
+
+	const auto by_byte = split_stream({"a", "b", "\n", "c", "\n"});
+	should::is_equal(size_t{2}, by_byte.size(), "byte at a time");
+	should::is_equal("ab", by_byte[0], "byte at a time first");
+
+	const auto utf8 = split_stream({"caf\xC3", "\xA9\n"});
+	should::is_equal(size_t{1}, utf8.size(), "one line");
+	should::is_equal("caf\xC3\xA9", utf8[0], "codepoint spanning a boundary");
+}
+
+static void should_split_lines_handle_endings_and_blanks()
+{
+	const auto crlf = split_stream({"one\r\ntwo\r\n"});
+	should::is_equal(size_t{2}, crlf.size(), "crlf line count");
+	should::is_equal("one", crlf[0], "carriage return stripped");
+
+	const auto blanks = split_stream({"\n\na\n"});
+	should::is_equal(size_t{3}, blanks.size(), "blank lines kept");
+	should::is_equal("", blanks[0], "first blank");
+	should::is_equal("a", blanks[2], "third");
+
+	// A stream that ends without a newline still yields its last record
+	const auto partial = split_stream({"tail"});
+	should::is_equal(size_t{1}, partial.size(), "partial flushed");
+	should::is_equal("tail", partial[0], "partial content");
+
+	should::is_equal(size_t{0}, split_stream({""}).size(), "empty stream");
+}
+
+// A stream that never sends a newline must not grow the buffer without bound
+static void should_split_lines_discard_oversized_records()
+{
+	const std::string huge(64, 'x');
+	const auto lines = split_stream({huge, huge, "\nafter\n"}, 32);
+
+	should::is_equal(size_t{1}, lines.size(), "oversized record dropped");
+	should::is_equal("after", lines[0], "resynced at the next newline");
+
+	// The record is dropped whole, never truncated into a partial one
+	const auto joined = split_stream({"12345678\nshort\n"}, 6);
+	should::is_equal(size_t{1}, joined.size(), "only the short record survives");
+	should::is_equal("short", joined[0], "short record");
+}
+
+static void should_quote_command_arguments()
+{
+	should::is_equal("simple", pf::quote_command_arg("simple"), "no quoting needed");
+	should::is_equal("--acp", pf::quote_command_arg("--acp"), "option");
+	should::is_equal("\"\"", pf::quote_command_arg(""), "empty argument");
+	should::is_equal("\"a b\"", pf::quote_command_arg("a b"), "space");
+	should::is_equal("\"a\\\"b\"", pf::quote_command_arg("a\"b"), "embedded quote");
+	should::is_equal("C:\\path\\file", pf::quote_command_arg("C:\\path\\file"), "backslashes kept");
+	should::is_equal("\"C:\\my path\\\\\"", pf::quote_command_arg("C:\\my path\\"), "trailing backslash doubled");
+	should::is_equal("\"a\\\\\\\"b\"", pf::quote_command_arg("a\\\"b"), "backslash before quote");
+}
+
+static void should_detect_shell_metacharacters()
+{
+	should::is_equal(false, pf::has_shell_metacharacter("--acp"), "plain option");
+	should::is_equal(false, pf::has_shell_metacharacter("C:\\path\\file.txt"), "plain path");
+	should::is_equal_true(pf::has_shell_metacharacter("a & b"), "ampersand");
+	should::is_equal_true(pf::has_shell_metacharacter("a | b"), "pipe");
+	should::is_equal_true(pf::has_shell_metacharacter("%PATH%"), "environment expansion");
+	should::is_equal_true(pf::has_shell_metacharacter("a > b"), "redirect");
+	should::is_equal_true(pf::has_shell_metacharacter("a\nb"), "newline");
+}
+
 tests::run_result run_all_tests_result()
 {
 	tests tests;
@@ -2139,6 +2429,30 @@ tests::run_result run_all_tests_result()
 	// Calculator tests
 	tests.register_test("should calc expressions", should_calc_expressions);
 	tests.register_test("should calc reject bad input", should_calc_rejects_bad_input);
+
+	// JSON tests
+	tests.register_test("should json round trip", should_json_round_trip);
+	tests.register_test("should json read members", should_json_read_members);
+	tests.register_test("should json accessors fall back", should_json_accessors_fall_back);
+	tests.register_test("should json parse escapes", should_json_parse_escapes);
+	tests.register_test("should json replace lone surrogates", should_json_replace_lone_surrogates);
+	tests.register_test("should json escape control characters", should_json_escape_control_characters);
+	tests.register_test("should json keep integers exact", should_json_keep_integers_exact);
+	tests.register_test("should json reject bad numbers", should_json_reject_bad_numbers);
+	tests.register_test("should json reject malformed input", should_json_reject_malformed_input);
+	tests.register_test("should json limit nesting depth", should_json_limit_nesting_depth);
+	tests.register_test("should json build messages", should_json_build_messages);
+	tests.register_test("should json replace duplicate keys", should_json_replace_duplicate_keys);
+	tests.register_test("should json pass through utf8", should_json_pass_through_utf8);
+
+	// Child process plumbing tests
+	tests.register_test("should split lines across read boundaries", should_split_lines_across_read_boundaries);
+	tests.register_test("should split lines handle endings and blanks",
+	                    should_split_lines_handle_endings_and_blanks);
+	tests.register_test("should split lines discard oversized records",
+	                    should_split_lines_discard_oversized_records);
+	tests.register_test("should quote command arguments", should_quote_command_arguments);
+	tests.register_test("should detect shell metacharacters", should_detect_shell_metacharacters);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);

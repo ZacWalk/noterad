@@ -39,6 +39,7 @@ platform_add_app(rethinkify
         src/commands.cpp
         src/document.cpp
         src/document_syntax.cpp
+        src/json.cpp
         src/tests.cpp
         src/util.cpp
     ICON        src/res/app.ico

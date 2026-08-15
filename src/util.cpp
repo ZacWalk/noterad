@@ -1,4 +1,4 @@
-// util.cpp — Core utilities: string search, joining and replacement
+﻿// util.cpp — Core utilities: string search, joining and replacement
 
 #include "pch.h"
 #include "util.h"
@@ -113,3 +113,5 @@ std::string replace(const std::string_view s, const std::string_view find,
 
 	return result;
 }
+
+
