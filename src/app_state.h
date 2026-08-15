@@ -7,6 +7,7 @@
 #include "commands.h"
 #include "gitignore.h"
 #include "agent_session.h"
+#include "agent_host.h"
 #include "ui.h"
 
 
@@ -88,7 +89,13 @@ public:
 
 	index_item_ptr _session_item;
 	std::shared_ptr<document_events> _agent_doc_events;
-	std::vector<advertised_command> _agent_commands;
+	std::shared_ptr<agent_host::events> _agent_sink;
+	std::unique_ptr<agent_host> _agent_host;
+	std::string _agent_status;
+
+	[[nodiscard]] std::string_view agent_status_text() const override { return _agent_status; }
+	void apply_transcript_change(int first, std::span<const std::string> replacement);
+	void ensure_agent_host();
 
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);

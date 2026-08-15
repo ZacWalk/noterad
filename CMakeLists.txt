@@ -35,6 +35,7 @@ FetchContent_MakeAvailable(platform_h)
 platform_add_app(rethinkify
     SOURCES
         src/acp.cpp
+        src/agent_host.cpp
         src/agent_session.cpp
         src/app.cpp
         src/app_commands.cpp

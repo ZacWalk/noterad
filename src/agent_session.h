@@ -69,6 +69,9 @@ namespace agent_session
 	void append_entry(std::vector<std::string>& lines, agent_entry_kind kind,
 	                  std::string_view title, std::string_view body);
 
+	// Line index where append_entry would start writing
+	[[nodiscard]] int append_position(std::span<const std::string> lines);
+
 	// Appends to the last entry, continuing its final line when it is still open
 	void append_chunk(std::vector<std::string>& lines, std::string_view text);
 
@@ -140,11 +143,15 @@ struct agent_stream_state
 	bool entry_open = false;
 	std::map<std::string, int> tool_lines; // toolCallId -> heading line
 
+	// First line the last edit touched, so a view can patch instead of rebuilding
+	int dirty_from = -1;
+
 	void reset()
 	{
 		entry_open = false;
 		open_kind = agent_entry_kind::note;
 		tool_lines.clear();
+		dirty_from = -1;
 	}
 };
 

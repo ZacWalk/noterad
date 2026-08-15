@@ -224,6 +224,7 @@ class app_events : public document_events
 {
 public:
 	virtual std::string_view message_bar_text() const = 0;
+	virtual std::string_view agent_status_text() const = 0;
 	virtual index_item_ptr root_item() const = 0;
 	virtual index_item_ptr active_item() const = 0;
 	virtual const view_styles& styles() const = 0;

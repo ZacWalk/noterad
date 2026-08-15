@@ -19,6 +19,8 @@ public:
 
 	[[nodiscard]] pf::font body_font() const override { return _events.styles().agent_font; }
 
+	[[nodiscard]] std::string_view status_text() const override { return _events.agent_status_text(); }
+
 	[[nodiscard]] std::string_view input_text() const { return _input.edit.text; }
 
 	void scroll_to_end() { scroll_content_to_end(); }

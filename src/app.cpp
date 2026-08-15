@@ -1728,42 +1728,82 @@ void app_state::append_agent_lines(const std::vector<std::string>& lines)
 		_agent_view->scroll_to_end();
 }
 
-void app_state::on_agent_input(std::string text)
+// Rewrites only the tail the agent touched, so a streamed token does not rebuild the document
+void app_state::apply_transcript_change(const int first, const std::span<const std::string> replacement)
 {
-	const auto parsed = agent_session::parse_command(text, _agent_commands);
+	const auto& doc = session_item()->doc;
+	const auto line_count = static_cast<int>(doc->size());
+	const auto last = std::max(0, line_count - 1);
+	const auto last_len = line_count > 0 ? static_cast<int>((*doc)[last].size()) : 0;
+	const auto from = std::clamp(first, 0, line_count);
 
-	std::vector<std::string> lines;
+	auto text = agent_session::to_text(replacement);
 
-	switch (parsed.command)
+	const auto target = from >= line_count
+		                    ? text_selection(last_len, last, last_len, last)
+		                    : text_selection(0, from, last_len, last);
+
+	if (from >= line_count)
+		text.insert(text.begin(), '\n');
+
 	{
-	case agent_command::help:
-		agent_session::append_entry(lines, agent_entry_kind::note, {},
-		                            agent_session::help_text(_agent_commands));
-		break;
-
-	case agent_command::clear:
-		clear_agent_session();
-		return;
-
-	case agent_command::unknown:
-		agent_session::append_entry(lines, agent_entry_kind::error, {},
-		                            std::format("Unknown command /{} — try /help", parsed.name));
-		break;
-
-	default:
-		// Everything else needs a running agent, which arrives in a later stage
-		agent_session::append_entry(lines, agent_entry_kind::user, {}, text);
-		agent_session::append_entry(lines, agent_entry_kind::error, {},
-		                            "No agent is connected yet.");
-		break;
+		undo_group ug(doc);
+		doc->replace_text(ug, target, text);
 	}
 
-	append_agent_lines(lines);
+	invalidate(invalid::agent_layout);
+
+	if (_agent_view)
+		_agent_view->scroll_to_end();
+}
+
+// agent_sink — Connects the host's transcript edits and status to the pane
+class agent_sink final : public agent_host::events
+{
+public:
+	app_state& _app;
+
+	explicit agent_sink(app_state& app) : _app(app)
+	{
+	}
+
+	void transcript_changed(const int first, const std::span<const std::string> replacement) override
+	{
+		_app.apply_transcript_change(first, replacement);
+	}
+
+	void agent_status_changed(const std::string_view status) override
+	{
+		_app._agent_status = status;
+		_app.invalidate(invalid::agent_layout);
+	}
+};
+
+void app_state::ensure_agent_host()
+{
+	if (_agent_host)
+		return;
+
+	_agent_sink = std::make_shared<agent_sink>(*this);
+	_agent_host = std::make_unique<agent_host>(*_agent_sink);
+	_agent_host->on_clear = [this] { clear_agent_session(); };
+}
+
+void app_state::on_agent_input(std::string text)
+{
+	ensure_agent_host();
+
+	// The file is the transcript, so whatever it holds now is what the agent continues from
+	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
+	_agent_host->submit(text);
 }
 
 void app_state::clear_agent_session()
 {
 	_session_item.reset();
+
+	if (_agent_host)
+		_agent_host->adopt({});
 
 	if (_agent_view)
 	{

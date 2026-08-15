@@ -7,6 +7,7 @@
 #include "view_doc.h"
 #include "view_list_search.h"
 #include "view_agent.h"
+#include "agent_host.h"
 #include "calc.h"
 #include "json.h"
 #include "acp.h"
@@ -3209,6 +3210,10 @@ static void should_keep_the_session_document_separate_from_the_editor()
 static void should_handle_agent_slash_commands_in_the_panel()
 {
 	const auto state = create_test_app();
+	state->ensure_agent_host();
+
+	// Tests must never launch the real agent
+	state->_agent_host->locate = [] { return pf::file_path{}; };
 
 	state->on_agent_input("/help");
 	auto text = state->session_item()->doc->str();
@@ -3218,20 +3223,229 @@ static void should_handle_agent_slash_commands_in_the_panel()
 	text = state->session_item()->doc->str();
 	should::is_equal_true(text.find("Unknown command /nonsense") != std::string::npos, "unknown reported");
 
-	// A plain message is recorded as the user's turn
+	// A plain message is recorded as the user's turn, then reports that no agent was found
 	state->on_agent_input("do the thing");
-	const auto entries = agent_session::parse(agent_session::to_lines(state->session_item()->doc->str()));
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("do the thing") != std::string::npos, "user turn recorded");
+	should::is_equal_true(text.find("Could not find") != std::string::npos, "missing agent reported");
+
+	const auto entries = agent_session::parse(agent_session::to_lines(text));
 	const auto user_entries = std::ranges::count_if(entries, [](const agent_entry& e)
 	{
 		return e.kind == agent_entry_kind::user;
 	});
-	should::is_equal_true(user_entries >= 1, "user turn recorded");
+	should::is_equal_true(user_entries >= 1, "user entry present");
 
 	// Clearing starts a fresh transcript
 	state->on_agent_input("/clear");
 	text = state->session_item()->doc->str();
 	should::is_equal_true(text.find("do the thing") == std::string::npos, "history cleared");
 	should::is_equal_true(text.starts_with(agent_session::file_header), "header restored");
+}
+
+// collecting_sink — Records what the host writes, standing in for the pane
+struct collecting_sink final : agent_host::events
+{
+	std::vector<std::string> lines;
+	std::string status;
+
+	void transcript_changed(const int first, const std::span<const std::string> replacement) override
+	{
+		lines.resize(static_cast<size_t>(std::clamp(first, 0, static_cast<int>(lines.size()))));
+
+		for (const auto& line : replacement)
+			lines.push_back(line);
+	}
+
+	void agent_status_changed(const std::string_view text) override { status = text; }
+
+	[[nodiscard]] std::string text() const { return agent_session::to_text(lines); }
+};
+
+static std::unique_ptr<agent_host> connected_host(collecting_sink& sink, recording_transport*& wire_out)
+{
+	auto host = std::make_unique<agent_host>(sink);
+	auto wire = std::make_unique<recording_transport>();
+	wire_out = wire.get();
+
+	host->connect(std::move(wire), pf::file_path{"C:\\work"});
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire_out->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1"}}}})",
+	                                wire_out->last_id()));
+	return host;
+}
+
+static void should_run_an_agent_turn()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	should::is_equal_true(host->connected(), "connected");
+	should::is_equal("Ready", sink.status, "ready status");
+
+	host->submit("fix the bug");
+	should::is_equal_true(sink.text().find("fix the bug") != std::string::npos, "user turn written");
+	should::is_equal_true(host->busy(), "turn in flight");
+	should::is_equal_true(sink.status.find("/s to stop") != std::string::npos, "status offers a way out");
+
+	const auto prompt_id = wire->last_id();
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Look"}}}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ing"}}}})");
+
+	should::is_equal_true(sink.text().find("Looking") != std::string::npos, "chunks joined");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+	should::is_equal(false, host->busy(), "turn finished");
+	should::is_equal("Ready", sink.status, "back to ready");
+}
+
+// A streamed token must rewrite one line, not the whole transcript
+static void should_patch_only_the_tail_while_streaming()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("go");
+
+	auto smallest_first = std::numeric_limits<int>::max();
+
+	struct watching_sink final : agent_host::events
+	{
+		collecting_sink& inner;
+		int& smallest;
+
+		watching_sink(collecting_sink& s, int& f) : inner(s), smallest(f)
+		{
+		}
+
+		void transcript_changed(const int first, const std::span<const std::string> replacement) override
+		{
+			smallest = std::min(smallest, static_cast<int>(replacement.size()));
+			inner.transcript_changed(first, replacement);
+		}
+
+		void agent_status_changed(const std::string_view text) override { inner.agent_status_changed(text); }
+	};
+
+	watching_sink watcher(sink, smallest_first);
+	auto streaming = std::make_unique<agent_host>(watcher);
+	streaming->adopt(sink.lines);
+
+	auto wire2 = std::make_unique<recording_transport>();
+	streaming->connect(std::move(wire2), pf::file_path{"C:\\work"});
+
+	for (const auto* chunk : {"a", "b", "c"})
+	{
+		streaming->on_agent_line(std::format(
+			R"({{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{}"}}}}}}}})",
+			chunk));
+	}
+
+	should::is_equal(1, smallest_first, "a later chunk rewrites a single line");
+}
+
+static void should_ask_before_running_a_tool()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("check the repo");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{"toolCall":{"title":"git status"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	const auto text = sink.text();
+	should::is_equal_true(text.find("git status") != std::string::npos, "names the tool");
+	should::is_equal_true(text.find("1. Allow") != std::string::npos, "numbers the options");
+	should::is_equal_true(text.find("2. Reject") != std::string::npos, "lists every option");
+	should::is_equal_true(sink.status.find("Waiting") != std::string::npos, "status asks for an answer");
+
+	// Nothing was sent back until the user chose
+	should::is_equal_true(wire->last()["result"].is_null(), "no answer yet");
+
+	host->submit("2");
+
+	const auto reply = wire->last();
+	should::is_equal(77, static_cast<int>(reply["id"].integer()), "answers the right request");
+	should::is_equal("selected", reply["result"]["outcome"]["outcome"].text(), "selected outcome");
+	should::is_equal("no", reply["result"]["outcome"]["optionId"].text(), "the option the user picked");
+
+	// The choice is recorded in the file
+	const auto entries = agent_session::parse(sink.lines);
+	const auto question = std::ranges::find_if(entries, [](const agent_entry& e)
+	{
+		return e.kind == agent_entry_kind::question;
+	});
+	should::is_equal_true(question != entries.end(), "question entry written");
+	should::is_equal(1, question->chosen_option(), "second option ticked");
+}
+
+static void should_auto_approve_only_in_yolo_mode()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("/yolo");
+	should::is_equal_true(host->yolo(), "yolo on");
+	should::is_equal_true(sink.text().find("yolo: on") != std::string::npos, "recorded in the session block");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":88,"method":"session/request_permission","params":{"toolCall":{"title":"rm -rf"},"options":[{"optionId":"deny","name":"Reject","kind":"reject_once"},{"optionId":"ok","name":"Allow","kind":"allow_once"}]}})");
+
+	const auto reply = wire->last();
+	should::is_equal(88, static_cast<int>(reply["id"].integer()), "answered immediately");
+	should::is_equal("ok", reply["result"]["outcome"]["optionId"].text(), "chose the allow option");
+	should::is_equal_true(sink.text().find("Allowed automatically: rm -rf") != std::string::npos,
+	                      "still recorded in the transcript");
+
+	// Turning it back off restores the prompt
+	host->submit("/yolo");
+	should::is_equal(false, host->yolo(), "yolo off");
+	should::is_equal_true(sink.text().find("yolo: off") != std::string::npos, "recorded as off");
+}
+
+static void should_stop_a_running_turn()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("/s");
+	should::is_equal_true(sink.text().find("not working on anything") != std::string::npos, "nothing to stop");
+
+	host->submit("long task");
+	const auto prompt_id = wire->last_id();
+	host->submit("/s");
+
+	should::is_equal("session/cancel", wire->last()["method"].text(), "cancel sent");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal(false, host->busy(), "turn ended");
+	should::is_equal_true(sink.text().find("cancelled") != std::string::npos, "recorded in the transcript");
+}
+
+static void should_report_a_lost_agent()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("work");
+	host->on_agent_exit(1);
+
+	should::is_equal(false, host->connected(), "no longer connected");
+	should::is_equal(false, host->busy(), "no turn in flight");
+	should::is_equal("Not connected", sink.status, "status reports it");
+	should::is_equal_true(sink.text().find("the agent stopped") != std::string::npos, "written to the transcript");
 }
 
 tests::run_result run_all_tests_result(){
@@ -3325,6 +3539,13 @@ tests::run_result run_all_tests_result(){
 	                    should_keep_the_session_document_separate_from_the_editor);
 	tests.register_test("should handle agent slash commands in the panel",
 	                    should_handle_agent_slash_commands_in_the_panel);
+	tests.register_test("should run an agent turn", should_run_an_agent_turn);
+	tests.register_test("should patch only the tail while streaming",
+	                    should_patch_only_the_tail_while_streaming);
+	tests.register_test("should ask before running a tool", should_ask_before_running_a_tool);
+	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
+	tests.register_test("should stop a running turn", should_stop_a_running_turn);
+	tests.register_test("should report a lost agent", should_report_a_lost_agent);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);

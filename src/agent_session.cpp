@@ -301,6 +301,16 @@ namespace agent_session
 		lines.emplace_back("- yolo: off");
 	}
 
+	int append_position(const std::span<const std::string> lines)
+	{
+		auto keep = static_cast<int>(lines.size());
+
+		while (keep > 0 && is_blank(lines[keep - 1]))
+			--keep;
+
+		return keep;
+	}
+
 	void append_entry(std::vector<std::string>& lines, const agent_entry_kind kind,
 	                  const std::string_view title, const std::string_view body)
 	{
@@ -585,17 +595,20 @@ namespace agent_session
 	void apply_update(std::vector<std::string>& lines, agent_stream_state& state, const json::value& update)
 	{
 		const auto kind = update["sessionUpdate"].text();
+		const auto mark = [&state](const int line) { state.dirty_from = std::max(0, line); };
 
-		if (kind == "agent_message_chunk")
-		{
-			open_entry(lines, state, agent_entry_kind::agent);
-			append_chunk(lines, content_text(update));
-			return;
-		}
+		state.dirty_from = -1;
 
-		if (kind == "agent_thought_chunk")
+		if (kind == "agent_message_chunk" || kind == "agent_thought_chunk")
 		{
-			open_entry(lines, state, agent_entry_kind::thought);
+			const auto thinking = kind == "agent_thought_chunk";
+
+			if (!state.entry_open || state.open_kind != (thinking ? agent_entry_kind::thought : agent_entry_kind::agent))
+				mark(append_position(lines));
+			else
+				mark(static_cast<int>(lines.size()) - 1);
+
+			open_entry(lines, state, thinking ? agent_entry_kind::thought : agent_entry_kind::agent);
 			append_chunk(lines, content_text(update));
 			return;
 		}
@@ -603,6 +616,7 @@ namespace agent_session
 		if (kind == "tool_call")
 		{
 			const auto status = update["status"].text("pending");
+			mark(append_position(lines));
 			append_entry(lines, agent_entry_kind::tool_call,
 			             std::format("{} ({})", tool_title(update), status), {});
 
@@ -622,7 +636,10 @@ namespace agent_session
 			const auto found = state.tool_lines.find(id);
 
 			if (found != state.tool_lines.end())
+			{
+				mark(found->second);
 				set_tool_status(lines, found->second, update["status"].text("completed"));
+			}
 
 			state.entry_open = false;
 			return;
@@ -630,6 +647,7 @@ namespace agent_session
 
 		if (kind == "plan")
 		{
+			mark(append_position(lines));
 			append_entry(lines, agent_entry_kind::plan, {}, {});
 
 			for (const auto& item : update["entries"].items())

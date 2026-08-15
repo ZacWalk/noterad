@@ -26,9 +26,12 @@ public:
 	[[nodiscard]] int scroll_line() const { return _scroll_offset.y / _font_extent.cy; }
 	[[nodiscard]] int scroll_char() const { return _scroll_offset.x / _font_extent.cx; }
 
+	// The text a view shows in its bar; the agent pane reports the agent instead
+	[[nodiscard]] virtual std::string_view status_text() const { return _events.message_bar_text(); }
+
 	[[nodiscard]] int message_bar_height() const
 	{
-		return _events.message_bar_text().empty() ? 0 : _font_extent.cy + _font_extent.cy / 2;
+		return status_text().empty() ? 0 : _font_extent.cy + _font_extent.cy / 2;
 	}
 
 	text_view(app_events& events) : _events(events)
@@ -419,7 +422,7 @@ virtual void draw_view(pf::window_frame_ptr& window,
 
 	void draw_message_bar(pf::draw_context& draw) const
 	{
-		const auto text = _events.message_bar_text();
+		const auto text = status_text();
 		if (text.empty()) return;
 
 		const auto& styles = _events.styles();
