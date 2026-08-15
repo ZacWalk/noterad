@@ -16,6 +16,7 @@
 #include "view_doc_csv.h"
 
 #include "app_state.h"
+#include "acp.h"
 #include "test.h"
 
 std::string g_app_name = "Rethinkify";
@@ -1880,6 +1881,124 @@ namespace
 		return out;
 	}
 
+	// child_transport — Carries protocol lines to a spawned agent
+	class child_transport final : public acp::transport
+	{
+	public:
+		pf::child_process* process = nullptr;
+
+		bool send_line(const std::string_view line) override
+		{
+			return process && process->write_line(line);
+		}
+	};
+
+	void print_acp_update(const json::value& params)
+	{
+		const auto& update = params["update"];
+		const auto kind = update["sessionUpdate"].text();
+
+		if (kind == "agent_message_chunk")
+			pf::write_stdout(update["content"]["text"].text());
+		else if (kind == "agent_thought_chunk")
+			pf::write_stdout(std::format("\n[thinking] {}\n", update["content"]["text"].text()));
+		else if (kind == "tool_call")
+			pf::write_stdout(std::format("\n[tool] {}\n", update["title"].text(update["kind"].text())));
+		else if (kind == "plan")
+			pf::write_stdout(std::format("\n[plan] {} entries\n", update["entries"].size()));
+		else if (kind == "available_commands_update")
+			pf::write_stdout(std::format("\n[commands] {} available\n", update["availableCommands"].size()));
+	}
+
+	// Verifies the agent can be found, started and spoken to. Never approves a tool call.
+	int run_acp_diagnostics(const std::string_view prompt)
+	{
+		const auto exe = pf::find_executable("copilot");
+
+		if (exe.empty())
+		{
+			pf::write_stdout("copilot was not found on PATH. Install it with 'winget install GitHub.Copilot'.\n");
+			return 1;
+		}
+
+		pf::write_stdout(std::format("Executable: {}\n", exe.view()));
+
+		const auto working_dir = pf::current_directory();
+		child_transport wire;
+		acp::client client(wire);
+
+		auto finished = false;
+		auto exit_code = 0;
+
+		client.on_error = [&](const std::string_view message)
+		{
+			pf::write_stdout(std::format("\nError: {}\n", message));
+			finished = true;
+			exit_code = 1;
+		};
+
+		client.on_ready = [&]
+		{
+			pf::write_stdout(std::format("Session: {}\n", client.session_id()));
+
+			if (prompt.empty())
+				finished = true;
+			else if (!client.send_prompt(prompt))
+				finished = true;
+		};
+
+		client.on_session_update = [](const json::value& params) { print_acp_update(params); };
+
+		client.on_turn_end = [&](const acp::stop_reason reason)
+		{
+			pf::write_stdout(std::format("\nStopped: {}\n", acp::to_string(reason)));
+			finished = true;
+		};
+
+		client.on_permission_request = [&](const acp::request_id id, const json::value& params)
+		{
+			pf::write_stdout(std::format("\n[permission refused] {}\n", params["toolCall"]["title"].text()));
+			client.respond(id, json::object().set("outcome", json::object().set("outcome", "cancelled")));
+		};
+
+		pf::child_process_callbacks callbacks;
+		callbacks.on_stdout_line = [&client](const std::string_view line) { client.on_line(line); };
+		callbacks.on_stderr_line = [](const std::string_view line)
+		{
+			pf::write_stdout(std::format("[stderr] {}\n", line));
+		};
+		callbacks.on_exit = [&](const int code)
+		{
+			client.on_disconnect(std::format("the agent exited with code {}", code));
+			finished = true;
+		};
+
+		const std::string args[] = {"--acp", "--stdio"};
+		const auto process = pf::spawn_child_process(exe, args, working_dir, std::move(callbacks));
+
+		if (!process)
+		{
+			pf::write_stdout("Could not start the agent.\n");
+			return 1;
+		}
+
+		wire.process = process.get();
+		client.start(working_dir.view());
+
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+
+		while (!finished && std::chrono::steady_clock::now() < deadline)
+			pf::pump_ui_tasks(100);
+
+		if (!finished)
+		{
+			pf::write_stdout("\nTimed out waiting for the agent.\n");
+			exit_code = 1;
+		}
+
+		return exit_code;
+	}
+
 	// Handles the non-GUI command-line modes; also reports any file argument to open.
 	cli_mode_result run_cli_mode(const std::span<const std::string_view> params, std::string_view& file_to_open)
 	{
@@ -1891,6 +2010,9 @@ namespace
 				pf::write_stdout(results.output);
 				return {true, {.start_gui = false, .exit_code = results.fail_count == 0 ? 0 : 1}};
 			}
+
+			if (pf::icmp(param, "/acp") == 0 || pf::icmp(param, "--acp") == 0)
+				return {true, {.start_gui = false, .exit_code = run_acp_diagnostics({})}};
 
 			auto try_prefix = [&](const std::string_view p1, const std::string_view p2) -> std::string_view
 			{
@@ -1906,6 +2028,9 @@ namespace
 				pf::write_stdout(spell_check_diagnostics(word));
 				return {true, {.start_gui = false}};
 			}
+
+			if (const auto text = try_prefix("/acp:", "--acp:"); !text.empty())
+				return {true, {.start_gui = false, .exit_code = run_acp_diagnostics(text)}};
 
 			if (!param.starts_with(u8'/') && !param.starts_with(u8'-'))
 			{

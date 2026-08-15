@@ -8,6 +8,7 @@
 #include "view_list_search.h"
 #include "calc.h"
 #include "json.h"
+#include "acp.h"
 #include "test.h"
 
 
@@ -2405,6 +2406,328 @@ static void should_detect_shell_metacharacters()
 	should::is_equal_true(pf::has_shell_metacharacter("a\nb"), "newline");
 }
 
+// recording_transport — Captures what the client sends and lets a test reply as the agent
+struct recording_transport final : acp::transport
+{
+	std::vector<std::string> sent;
+	bool fail_sends = false;
+
+	bool send_line(const std::string_view line) override
+	{
+		if (fail_sends)
+			return false;
+
+		sent.emplace_back(line);
+		return true;
+	}
+
+	[[nodiscard]] json::value last() const
+	{
+		return sent.empty() ? json::value() : json::parse(sent.back()).root;
+	}
+
+	[[nodiscard]] json::value message(const size_t index) const
+	{
+		return index < sent.size() ? json::parse(sent[index]).root : json::value();
+	}
+
+	[[nodiscard]] int64_t last_id() const { return last()["id"].integer(); }
+};
+
+// Drives the handshake so a test can start from a ready session
+static void complete_handshake(acp::client& client, recording_transport& wire,
+                               const std::string_view session_id = "sess-1")
+{
+	client.start("C:\\work");
+
+	client.on_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true}}}}}})",
+		wire.last_id()));
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"{}"}}}})",
+	                           wire.last_id(), session_id));
+}
+
+static void should_acp_complete_handshake()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	auto ready_count = 0;
+	client.on_ready = [&ready_count] { ++ready_count; };
+
+	client.start("C:\\work", {.read_text_file = true, .write_text_file = true});
+
+	const auto init = wire.message(0);
+	should::is_equal("2.0", init["jsonrpc"].text(), "jsonrpc version");
+	should::is_equal("initialize", init["method"].text(), "first method");
+	should::is_equal(acp::protocol_version, static_cast<int>(init["params"]["protocolVersion"].integer()),
+	                 "protocol version");
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["readTextFile"].boolean(),
+	                      "advertises reads");
+	should::is_equal(false, init["params"]["clientCapabilities"]["terminal"].boolean(true),
+	                 "declines terminal");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                           init["id"].integer()));
+
+	const auto new_session = wire.message(1);
+	should::is_equal("session/new", new_session["method"].text(), "second method");
+	should::is_equal("C:\\work", new_session["params"]["cwd"].text(), "working directory");
+
+	should::is_equal(0, ready_count, "not ready until the session exists");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"abc"}}}})",
+	                           new_session["id"].integer()));
+
+	should::is_equal(1, ready_count, "ready once");
+	should::is_equal_true(client.ready(), "state is ready");
+	should::is_equal("abc", client.session_id(), "session id");
+}
+
+static void should_acp_report_handshake_failure()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	std::string reported;
+	client.on_error = [&reported](const std::string_view text) { reported = text; };
+
+	client.start("C:\\work");
+	client.on_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"error":{{"code":-32000,"message":"not logged in"}}}})", wire.last_id()));
+
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal_true(reported.find("not logged in") != std::string::npos, "reports the agent message");
+
+	// A session with no id is a failure even though the call succeeded
+	recording_transport wire2;
+	acp::client client2(wire2);
+	client2.on_error = [&reported](const std::string_view text) { reported = text; };
+	client2.start("C:\\work");
+	client2.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{}}}})", wire2.last_id()));
+	client2.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{}}}})", wire2.last_id()));
+
+	should::is_equal(false, client2.ready(), "no session id means not ready");
+}
+
+static void should_acp_send_prompt_and_end_turn()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	auto ended = 0;
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&](const acp::stop_reason r)
+	{
+		++ended;
+		reason = r;
+	};
+
+	should::is_equal_true(client.send_prompt("fix the bug"), "prompt sent");
+	should::is_equal_true(client.turn_in_flight(), "turn in flight");
+
+	const auto prompt = wire.last();
+	should::is_equal("session/prompt", prompt["method"].text(), "method");
+	should::is_equal("sess-1", prompt["params"]["sessionId"].text(), "session id");
+	should::is_equal("text", prompt["params"]["prompt"][0]["type"].text(), "content type");
+	should::is_equal("fix the bug", prompt["params"]["prompt"][0]["text"].text(), "content text");
+
+	// A second prompt is refused while one is in flight
+	should::is_equal(false, client.send_prompt("another"), "one turn at a time");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})",
+	                           prompt["id"].integer()));
+
+	should::is_equal(1, ended, "turn ended once");
+	should::is_equal_true(reason == acp::stop_reason::end_turn, "end_turn");
+	should::is_equal(false, client.turn_in_flight(), "no longer in flight");
+	should::is_equal_true(client.send_prompt("another"), "next turn allowed");
+}
+
+static void should_acp_refuse_prompt_before_ready()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	should::is_equal(false, client.send_prompt("too early"), "refused before start");
+	should::is_equal(size_t{0}, wire.sent.size(), "nothing sent");
+
+	client.start("C:\\work");
+	should::is_equal(false, client.send_prompt("still too early"), "refused mid handshake");
+	should::is_equal(size_t{1}, wire.sent.size(), "only the initialize");
+}
+
+static void should_acp_cancel_turn()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	client.cancel();
+	should::is_equal(size_t{2}, wire.sent.size(), "nothing to cancel");
+
+	should::is_equal_true(client.send_prompt("long task"), "prompt sent");
+	const auto prompt_id = wire.last_id();
+	client.cancel();
+	const auto cancel = wire.last();
+	should::is_equal("session/cancel", cancel["method"].text(), "cancel method");
+	should::is_equal("sess-1", cancel["params"]["sessionId"].text(), "cancel session");
+	should::is_equal_true(cancel["id"].is_null(), "cancel is a notification");
+
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&reason](const acp::stop_reason r) { reason = r; };
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal_true(reason == acp::stop_reason::cancelled, "cancelled reason");
+}
+
+static void should_acp_dispatch_session_updates()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	std::vector<std::string> chunks;
+	client.on_session_update = [&chunks](const json::value& params)
+	{
+		chunks.emplace_back(params["update"]["content"]["text"].text());
+	};
+
+	client.on_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}})");
+	client.on_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}})");
+
+	should::is_equal(size_t{2}, chunks.size(), "two chunks");
+	should::is_equal("Hel", chunks[0], "first chunk");
+	should::is_equal("lo", chunks[1], "second chunk");
+
+	// An unknown notification is ignored rather than treated as an error
+	auto errors = 0;
+	client.on_error = [&errors](std::string_view) { ++errors; };
+	client.on_line(R"({"jsonrpc":"2.0","method":"session/unheard_of","params":{}})");
+	should::is_equal(0, errors, "unknown notification ignored");
+}
+
+static void should_acp_answer_permission_requests()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	acp::request_id received = 0;
+	std::string tool;
+	client.on_permission_request = [&](const acp::request_id id, const json::value& params)
+	{
+		received = id;
+		tool = params["toolCall"]["title"].text();
+	};
+
+	client.on_line(
+		R"({"jsonrpc":"2.0","id":"req-7","method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"git status"},"options":[{"optionId":"allow","name":"Allow"}]}})");
+
+	should::is_equal_true(received != 0, "handler called");
+	should::is_equal("git status", tool, "tool title");
+	should::is_equal(size_t{1}, client.pending_reply_count(), "awaiting our answer");
+
+	auto outcome = json::object();
+	outcome.set("outcome", "selected");
+	outcome.set("optionId", "allow");
+	client.respond(received, json::object().set("outcome", std::move(outcome)));
+
+	const auto reply = wire.last();
+	should::is_equal("req-7", reply["id"].text(), "string id echoed verbatim");
+	should::is_equal("allow", reply["result"]["outcome"]["optionId"].text(), "selected option");
+	should::is_equal(size_t{0}, client.pending_reply_count(), "no longer awaiting");
+
+	// Answering twice sends nothing more
+	const auto count = wire.sent.size();
+	client.respond(received, json::object());
+	should::is_equal(count, wire.sent.size(), "second answer ignored");
+}
+
+// An unimplemented method must still get a reply, or the agent waits forever
+static void should_acp_reject_unknown_requests()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	client.on_line(R"({"jsonrpc":"2.0","id":31,"method":"terminal/create","params":{}})");
+
+	const auto reply = wire.last();
+	should::is_equal(31, static_cast<int>(reply["id"].integer()), "id echoed");
+	should::is_equal(acp::error_code::method_not_found, static_cast<int>(reply["error"]["code"].integer()),
+	                 "method not found");
+	should::is_equal_true(reply["error"]["message"].text().find("terminal/create") != std::string_view::npos,
+	                      "names the method");
+	should::is_equal(size_t{0}, client.pending_reply_count(), "nothing left outstanding");
+}
+
+static void should_acp_survive_malformed_input()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	std::vector<std::string> errors;
+	client.on_error = [&errors](const std::string_view text) { errors.emplace_back(text); };
+
+	client.on_line("");
+	client.on_line("   ");
+	should::is_equal(size_t{0}, errors.size(), "blank lines ignored");
+
+	client.on_line("{not json");
+	client.on_line("[1,2,3]");
+	client.on_line(R"({"jsonrpc":"2.0"})");
+	should::is_equal(size_t{3}, errors.size(), "each bad line reported once");
+
+	// A response to an id we never sent is ignored, not an error
+	client.on_line(R"({"jsonrpc":"2.0","id":9999,"result":{}})");
+	should::is_equal(size_t{3}, errors.size(), "stale response ignored");
+
+	// Still usable afterwards
+	should::is_equal_true(client.send_prompt("still working"), "client still usable");
+}
+
+static void should_acp_fail_pending_requests_on_disconnect()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	auto ended = 0;
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&](const acp::stop_reason r)
+	{
+		++ended;
+		reason = r;
+	};
+
+	should::is_equal_true(client.send_prompt("work"), "prompt sent");
+	should::is_equal(size_t{1}, client.pending_request_count(), "prompt pending");
+
+	client.on_disconnect("the agent stopped");
+
+	should::is_equal(1, ended, "turn ended");
+	should::is_equal_true(reason == acp::stop_reason::error, "ended with an error");
+	should::is_equal(size_t{0}, client.pending_request_count(), "nothing left pending");
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal(false, client.turn_in_flight(), "no turn in flight");
+}
+
+static void should_acp_parse_stop_reasons()
+{
+	should::is_equal_true(acp::parse_stop_reason("end_turn") == acp::stop_reason::end_turn, "end_turn");
+	should::is_equal_true(acp::parse_stop_reason("cancelled") == acp::stop_reason::cancelled, "cancelled");
+	should::is_equal_true(acp::parse_stop_reason("refusal") == acp::stop_reason::refusal, "refusal");
+	should::is_equal_true(acp::parse_stop_reason("max_tokens") == acp::stop_reason::max_tokens, "max_tokens");
+	should::is_equal_true(acp::parse_stop_reason("something_new") == acp::stop_reason::unknown, "unknown");
+	should::is_equal("end_turn", acp::to_string(acp::stop_reason::end_turn), "to_string");
+}
+
 tests::run_result run_all_tests_result()
 {
 	tests tests;
@@ -2453,6 +2776,20 @@ tests::run_result run_all_tests_result()
 	                    should_split_lines_discard_oversized_records);
 	tests.register_test("should quote command arguments", should_quote_command_arguments);
 	tests.register_test("should detect shell metacharacters", should_detect_shell_metacharacters);
+
+	// ACP protocol tests
+	tests.register_test("should acp complete handshake", should_acp_complete_handshake);
+	tests.register_test("should acp report handshake failure", should_acp_report_handshake_failure);
+	tests.register_test("should acp send prompt and end turn", should_acp_send_prompt_and_end_turn);
+	tests.register_test("should acp refuse prompt before ready", should_acp_refuse_prompt_before_ready);
+	tests.register_test("should acp cancel turn", should_acp_cancel_turn);
+	tests.register_test("should acp dispatch session updates", should_acp_dispatch_session_updates);
+	tests.register_test("should acp answer permission requests", should_acp_answer_permission_requests);
+	tests.register_test("should acp reject unknown requests", should_acp_reject_unknown_requests);
+	tests.register_test("should acp survive malformed input", should_acp_survive_malformed_input);
+	tests.register_test("should acp fail pending requests on disconnect",
+	                    should_acp_fail_pending_requests_on_disconnect);
+	tests.register_test("should acp parse stop reasons", should_acp_parse_stop_reasons);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);
