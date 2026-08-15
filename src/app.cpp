@@ -15,6 +15,7 @@
 #include "view_doc_hex.h"
 #include "view_doc_csv.h"
 #include "view_agent.h"
+#include "view_agent_input.h"
 
 #include "app_state.h"
 #include "acp.h"
@@ -559,19 +560,88 @@ public:
 	}
 };
 
+// agent_input_doc_events — Routes the prompt document's events to the prompt window.
+// It is a document of its own so editing a prompt cannot touch either other pane's caches.
+class agent_input_doc_events final : public document_events
+{
+public:
+	app_state& _app;
+
+	explicit agent_input_doc_events(app_state& app) : _app(app)
+	{
+	}
+
+	void invalidate(uint32_t) override { _app.invalidate(invalid::agent_layout); }
+
+	void invalidate_lines(const int start, const int end) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->invalidate_lines(_app._agent_input_window, start, end);
+	}
+
+	void lines_changed(const int start, const int end) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->lines_changed(_app._agent_input_window, start, end);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void line_count_changed(const int at, const int delta) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->line_count_changed(_app._agent_input_window, at, delta);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void ensure_visible(const text_location& pt) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->ensure_visible(_app._agent_input_window, pt);
+	}
+};
+
 app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared<edit_doc_view>(*this)),
                                                       _files_view(std::make_shared<file_list_view>(*this)),
                                                       _search_view(std::make_shared<search_list_view>(*this)),
                                                       _agent_view(std::make_shared<agent_view>(*this)),
+                                                      _agent_input_view(std::make_shared<agent_input_view>(*this)),
                                                       _scheduler(std::move(scheduler))
 {
 	_active_item = std::make_shared<index_item>();
 	_active_item->doc = std::make_shared<document>(*this);
 	_root_folder = std::make_shared<index_item>();
 	_doc_view->set_document(active_item()->doc);
-	_agent_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
+
+	_agent_input_doc_events = std::make_shared<agent_input_doc_events>(*this);
+	_agent_input_doc = std::make_shared<document>(*_agent_input_doc_events);
+	_agent_input_view->set_document(_agent_input_doc);
+	_agent_input_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
+
 	_agent_view->on_answer = [this](const size_t index) { on_agent_answer(index); };
+	_agent_view->on_type = [this](const char32_t ch) { type_into_agent_input(ch); };
 	get_commands().set_commands(make_commands());
+}
+
+int app_state::agent_input_height() const
+{
+	return _agent_input_view ? _agent_input_view->desired_height() : 0;
+}
+
+bool app_state::agent_input_has_focus() const
+{
+	return _agent_input_window && _agent_input_view && _agent_visible && _agent_input_window->has_focus();
+}
+
+// A key pressed at the transcript was meant for the agent, so it lands in the prompt
+void app_state::type_into_agent_input(const char32_t ch)
+{
+	if (!_agent_input_view || !_agent_input_window)
+		return;
+
+	set_focus(view_focus::agent);
+	_agent_input_view->type(_agent_input_window, ch);
 }
 
 void app_state::ensure_visible(const text_location& pt)
@@ -823,6 +893,7 @@ void app_state::set_spell_check_mode(const spell_check_mode mode, const bool per
 {
 	_spell_check_mode = mode;
 	apply_spell_check_mode(doc());
+	apply_spell_check_mode(_agent_input_doc);
 	if (mode == spell_check_mode::disabled)
 		reset_spell_checker();
 	if (persist)
@@ -835,22 +906,20 @@ void app_state::set_focus(const view_focus v)
 		_list_window->set_focus();
 	else if (v == view_focus::agent)
 	{
-		if (_agent_window && _agent_visible)
-			_agent_window->set_focus();
+		// The prompt is the agent pane's keyboard target; the transcript is read-only
+		if (_agent_input_window && _agent_visible)
+			_agent_input_window->set_focus();
 	}
 	else
 		_doc_window->set_focus();
-}
-
-bool app_state::agent_has_focus() const
-{
-	return _agent_window && _agent_window->has_focus();
 }
 
 text_view_ptr app_state::focused_text_view() const
 {
 	if (_doc_window && _doc_window->has_focus())
 		return std::static_pointer_cast<text_view>(_doc_view);
+	if (agent_input_has_focus())
+		return std::static_pointer_cast<text_view>(_agent_input_view);
 	return {};
 }
 
@@ -879,6 +948,17 @@ bool app_state::can_edit_document() const
 {
 	return !inline_edit_has_focus() && is_edit_text(get_mode()) && _active_item && _active_item->doc &&
 		!_active_item->doc->is_read_only();
+}
+
+// Editing commands act on whatever has focus, so the agent prompt gets its own undo
+document_ptr app_state::focused_document() const
+{
+	return agent_input_has_focus() && _agent_input_doc ? _agent_input_doc : doc();
+}
+
+bool app_state::can_edit_focused_document() const
+{
+	return agent_input_has_focus() || can_edit_document();
 }
 
 list_view_item_ptr app_state::selected_file_list_item() const
@@ -1025,6 +1105,12 @@ void app_state::on_zoom(const int delta, const zoom_target target)
 
 	if (_agent_window)
 		_agent_window->notify_size();
+
+	if (_agent_input_window)
+	{
+		_agent_input_window->notify_size();
+		invalidate(invalid::agent_layout);
+	}
 }
 
 pf::file_path app_state::save_folder() const
@@ -1555,6 +1641,11 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	                                     ui::window_background);
 	_agent_window->set_reactor(_agent_view);
 
+	_agent_input_window = window->create_child("AGENT_INPUT_FRAME",
+	                                           pf::window_style::child | pf::window_style::clip_children,
+	                                           ui::window_background);
+	_agent_input_window->set_reactor(_agent_input_view);
+
 	// Restore font sizes from config
 	const auto text_size = pf::config_read("Font", "TextSize");
 	const auto list_size = pf::config_read("Font", "ListSize");
@@ -1594,6 +1685,7 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 
 	_spell_check_mode = parse_spell_check_mode(spell_check);
 	apply_spell_check_mode(doc());
+	apply_spell_check_mode(_agent_input_doc);
 
 	// Restore window placement from config
 	if (_has_startup_placement)
@@ -1662,7 +1754,17 @@ void app_state::layout_views() const
 
 		auto agent_bounds = bounds;
 		agent_bounds.left = std::min(agent_split + _agent_splitter.bar_width(), bounds.right);
+
+		// The prompt takes what it needs from the bottom; the transcript keeps the rest
+		auto input_bounds = agent_bounds;
+		input_bounds.top = std::clamp(agent_bounds.bottom - agent_input_height(),
+		                              agent_bounds.top, agent_bounds.bottom);
+		agent_bounds.bottom = input_bounds.top;
+
 		_agent_window->move_window(agent_bounds);
+
+		if (_agent_input_window)
+			_agent_input_window->move_window(input_bounds);
 	}
 
 	_doc_window->move_window(text_bounds);
@@ -1683,11 +1785,11 @@ void app_state::show_agent_panel(const bool visible)
 	if (_agent_window)
 		_agent_window->show(visible);
 
+	if (_agent_input_window)
+		_agent_input_window->show(visible);
+
 	if (visible && _agent_view)
-	{
 		_agent_view->set_document(session_item()->doc);
-		_agent_view->layout();
-	}
 
 	layout_views();
 	invalidate(invalid::windows | invalid::agent_layout);
@@ -1731,10 +1833,7 @@ index_item_ptr app_state::session_item()
 	_session_listed = false;
 
 	if (_agent_view)
-	{
 		_agent_view->set_document(_session_item->doc);
-		_agent_view->layout();
-	}
 
 	return _session_item;
 }
@@ -1827,8 +1926,13 @@ void app_state::roll_over_long_session()
 		return;
 
 	const auto stamp = pf::file_modified_time(_session_item->path);
-	const auto archive = _session_item->path.folder().combine(
+	auto archive = _session_item->path.folder().combine(
 		std::format("session-{}", stamp == 0 ? 1 : stamp), "md");
+
+	// Never overwrite an archive, however often this runs
+	for (auto suffix = 2; archive.exists() && suffix < 100; ++suffix)
+		archive = _session_item->path.folder().combine(
+			std::format("session-{}-{}", stamp == 0 ? 1 : stamp, suffix), "md");
 
 	if (const auto file = pf::open_file_for_write(archive))
 	{
@@ -1849,28 +1953,6 @@ void app_state::roll_over_long_session()
 	}
 }
 
-void app_state::append_agent_lines(const std::vector<std::string>& lines)
-{
-	if (lines.empty())
-		return;
-
-	const auto& doc = session_item()->doc;
-	auto text = agent_session::to_lines(doc->str());
-
-	for (const auto& line : lines)
-		text.push_back(line);
-
-	{
-		undo_group ug(doc);
-		doc->replace_text(ug, doc->all(), agent_session::to_text(text));
-	}
-
-	invalidate(invalid::agent_layout);
-
-	if (_agent_view)
-		_agent_view->scroll_to_end();
-}
-
 // Rewrites only the tail the agent touched, so a streamed token does not rebuild the document
 void app_state::apply_transcript_change(const int first, const std::span<const std::string> replacement)
 {
@@ -1880,8 +1962,10 @@ void app_state::apply_transcript_change(const int first, const std::span<const s
 	const auto last_len = line_count > 0 ? static_cast<int>((*doc)[last].size()) : 0;
 	const auto from = std::clamp(first, 0, line_count);
 
-	// Following the stream is only welcome when the newest line is already on screen
-	const auto pinned = !_agent_view || _agent_view->at_bottom();
+	// Following the stream is only welcome when the newest line is already on screen.
+	// The scroll itself has to wait for the layout that agent_layout will run.
+	if (!_agent_view || _agent_view->at_bottom())
+		_agent_follow_tail = true;
 
 	auto text = agent_session::to_text(replacement);
 
@@ -1898,9 +1982,6 @@ void app_state::apply_transcript_change(const int first, const std::span<const s
 	}
 
 	invalidate(invalid::agent_layout);
-
-	if (_agent_view && pinned)
-		_agent_view->scroll_to_end();
 }
 
 // agent_sink — Connects the host's transcript edits, status and file access to the app
@@ -1975,14 +2056,6 @@ bool app_state::agent_read_file(const pf::file_path& path, std::string& content,
 		return true;
 	}
 
-	const auto file = pf::open_for_read(path);
-
-	if (!file)
-	{
-		error = std::format("could not open '{}'", path.view());
-		return false;
-	}
-
 	if (!read_file_text(path, content, max_agent_file_size))
 	{
 		error = std::format("could not read '{}'", path.view());
@@ -2049,6 +2122,7 @@ void app_state::on_agent_input(std::string text)
 	reload_session_if_changed();
 	// The file is the transcript, so whatever it holds now is what the agent continues from
 	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
+	_agent_follow_tail = true; // whatever you just sent should be the thing you can see
 	_agent_host->submit(text);
 }
 
@@ -2368,9 +2442,35 @@ void app_state::on_idle()
 	{
 		if (_agent_view && _agent_window && _agent_visible)
 		{
+			// The prompt is measured before the transcript, because its height takes the room
+			if (_agent_input_view && _agent_input_window)
+			{
+				_agent_input_window->notify_size();
+
+				// The first real font measurement changes this too, not just typing another row
+				if (const auto height = _agent_input_view->desired_height(); height != _agent_input_height)
+				{
+					_agent_input_height = height;
+					layout_views();
+				}
+
+				_agent_input_view->recalc_vert_scrollbar();
+				_agent_input_view->update_caret(_agent_input_window);
+				_agent_input_window->invalidate();
+			}
+
+			// Sized first: the layout and the scrollbar both need the current extent
+			_agent_window->notify_size();
 			_agent_view->layout();
 			_agent_view->recalc_vert_scrollbar();
-			_agent_window->notify_size();
+
+			// Only now does the view know how tall the new content is
+			if (std::exchange(_agent_follow_tail, false))
+			{
+				_agent_view->scroll_to_end();
+				_agent_view->recalc_vert_scrollbar();
+			}
+
 			_agent_window->invalidate();
 		}
 	}
@@ -2379,6 +2479,15 @@ void app_state::on_idle()
 	{
 		_doc_window->invalidate();
 		_list_window->invalidate();
+
+		// Scrolling the transcript raises this bit, so the agent pane has to follow it
+		if (_agent_window && _agent_visible)
+		{
+			_agent_window->invalidate();
+
+			if (_agent_input_window)
+				_agent_input_window->invalidate();
+		}
 	}
 }
 
@@ -2432,18 +2541,6 @@ namespace
 
 		return out;
 	}
-
-	// child_transport — Carries protocol lines to a spawned agent
-	class child_transport final : public acp::transport
-	{
-	public:
-		pf::child_process* process = nullptr;
-
-		bool send_line(const std::string_view line) override
-		{
-			return process && process->write_line(line);
-		}
-	};
 
 	void print_acp_update(const json::value& params)
 	{
@@ -2603,6 +2700,10 @@ namespace
 		for (;;)
 		{
 			pf::pump_ui_tasks(100);
+
+			// Nothing here can answer a question, so stop rather than wait out the timeout
+			if (host.awaiting_answer())
+				break;
 
 			if (host.busy())
 			{

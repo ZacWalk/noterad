@@ -35,7 +35,6 @@ namespace acp
 	void client::start(const std::string_view working_dir, const client_capabilities capabilities)
 	{
 		_working_dir = working_dir;
-		_capabilities = capabilities;
 		_state = connection_state::initializing;
 
 		auto fs = json::object();
@@ -51,7 +50,7 @@ namespace acp
 		params.set("clientCapabilities", std::move(client_caps));
 
 		send_request("initialize", std::move(params),
-		             [this](const json::value& result, const json::value* error)
+		             [this](const json::value&, const json::value* error)
 		             {
 			             if (error)
 			             {
@@ -59,7 +58,6 @@ namespace acp
 				             return;
 			             }
 
-			             _agent_capabilities = result["agentCapabilities"];
 			             begin_session();
 		             });
 	}
@@ -91,9 +89,28 @@ namespace acp
 
 			             _state = connection_state::ready;
 
+			             read_models(result["models"]);
+
 			             if (on_ready)
 				             on_ready();
 		             });
+	}
+
+	void client::read_models(const json::value& models)
+	{
+		_models.clear();
+		_current_model_id = models["currentModelId"].text();
+
+		for (const auto& item : models["availableModels"].items())
+		{
+			auto id = std::string(item["modelId"].text());
+
+			if (id.empty())
+				continue;
+
+			_models.push_back({std::move(id), std::string(item["name"].text()),
+			                   std::string(item["description"].text())});
+		}
 	}
 
 	bool client::send_prompt(const std::string_view text)
@@ -155,10 +172,17 @@ namespace acp
 		params.set("modelId", model_id);
 
 		send_request("session/set_model", std::move(params),
-		             [this](const json::value&, const json::value* error)
+		             [this, id = std::string(model_id)](const json::value&, const json::value* error)
 		             {
-			             if (error && on_error)
-				             on_error((*error)["message"].text("could not select that model"));
+			             if (error)
+			             {
+				             if (on_error)
+					             on_error((*error)["message"].text("could not select that model"));
+
+				             return;
+			             }
+
+			             _current_model_id = id;
 		             });
 
 		return true;

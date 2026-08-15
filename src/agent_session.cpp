@@ -577,18 +577,17 @@ namespace agent_session
 			if (line < 0 || line >= static_cast<int>(lines.size()))
 				return;
 
-			const std::string_view prefix = "### Tool: ";
 			auto& text = lines[line];
 
-			if (!text.starts_with(prefix))
+			if (!text.starts_with(tool_prefix))
 				return;
 
-			auto title = std::string_view(text).substr(prefix.size());
+			auto title = std::string_view(text).substr(tool_prefix.size());
 
 			if (const auto open = title.rfind(" ("); open != std::string_view::npos && title.ends_with(')'))
 				title = title.substr(0, open);
 
-			text = std::format("{}{} ({})", prefix, title, status);
+			text = std::format("{}{} ({})", tool_prefix, title, status);
 		}
 	}
 

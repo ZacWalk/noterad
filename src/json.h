@@ -27,10 +27,6 @@ namespace json
 		{
 		}
 
-		value(const uint32_t n) : value(static_cast<int64_t>(n))
-		{
-		}
-
 		value(const int64_t n) : _kind(kind::number), _integral(true), _int(n),
 		                         _number(static_cast<double>(n))
 		{

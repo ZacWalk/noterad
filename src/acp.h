@@ -35,6 +35,14 @@ namespace acp
 		bool write_text_file = false;
 	};
 
+	// A model the agent offered in the session/new response
+	struct model_info
+	{
+		std::string id;
+		std::string name;
+		std::string description;
+	};
+
 	// The wire. Injectable so the protocol can be driven without a child process.
 	struct transport
 	{
@@ -73,7 +81,8 @@ namespace acp
 		[[nodiscard]] bool ready() const { return _state == connection_state::ready; }
 		[[nodiscard]] bool turn_in_flight() const { return _prompt_id != 0; }
 		[[nodiscard]] std::string_view session_id() const { return _session_id; }
-		[[nodiscard]] const json::value& agent_capabilities() const { return _agent_capabilities; }
+		[[nodiscard]] std::span<const model_info> models() const { return _models; }
+		[[nodiscard]] std::string_view current_model_id() const { return _current_model_id; }
 		[[nodiscard]] size_t pending_request_count() const { return _pending.size(); }
 		[[nodiscard]] size_t pending_reply_count() const { return _awaiting_reply.size(); }
 
@@ -92,10 +101,10 @@ namespace acp
 
 		transport& _wire;
 		connection_state _state = connection_state::idle;
-		client_capabilities _capabilities;
 		std::string _working_dir;
 		std::string _session_id;
-		json::value _agent_capabilities;
+		std::vector<model_info> _models;
+		std::string _current_model_id;
 		request_id _next_id = 1;
 		request_id _next_reply_handle = 1;
 		request_id _prompt_id = 0;
@@ -114,6 +123,7 @@ namespace acp
 		void handle_notification(std::string_view method, const json::value& params);
 
 		void begin_session();
+		void read_models(const json::value& models);
 		void fail(std::string_view message);
 	};
 }

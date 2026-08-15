@@ -401,9 +401,12 @@ public:
 
 		// A width change invalidates every break point
 		mark_wrap_dirty_all();
+		layout();
 
-		if (_word_wrap)
-			layout();
+		// invalid::doc_scrollbar names the document pane, so a view in its own window
+		// would never see its own scrollbar brought up to date
+		if (_doc)
+			recalc_vert_scrollbar();
 
 		_events.invalidate(invalid::doc_scrollbar | invalid::doc_layout);
 	}
@@ -1677,12 +1680,12 @@ private:
 	}
 
 protected:
-	[[nodiscard]] int top_content_padding() const
+	[[nodiscard]] virtual int top_content_padding() const
 	{
 		return _font_extent.cy > 0 ? std::max(1, _font_extent.cy / 2) : 0;
 	}
 
-	[[nodiscard]] int bottom_content_padding() const
+	[[nodiscard]] virtual int bottom_content_padding() const
 	{
 		return _font_extent.cy > 0 ? _font_extent.cy : 0;
 	}

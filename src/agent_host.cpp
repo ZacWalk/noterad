@@ -5,18 +5,6 @@
 
 namespace
 {
-	// child_transport — Carries protocol lines to the spawned agent
-	class child_transport final : public acp::transport
-	{
-	public:
-		pf::child_process* process = nullptr;
-
-		bool send_line(const std::string_view line) override
-		{
-			return process && process->write_line(line);
-		}
-	};
-
 	// An option that lets the agent proceed, as opposed to one that refuses
 	bool is_allow_option(const json::value& option)
 	{
@@ -61,12 +49,11 @@ void agent_host::mutate(const std::function<void()>& change)
 	_stream.dirty_from = -1;
 	change();
 
-	auto first = _stream.dirty_from;
+	// Nothing recorded a dirty line, so nothing changed and there is nothing to rewrite
+	if (_stream.dirty_from < 0)
+		return;
 
-	if (first < 0)
-		first = 0;
-
-	first = std::clamp(first, 0, static_cast<int>(_lines.size()));
+	const auto first = std::clamp(_stream.dirty_from, 0, static_cast<int>(_lines.size()));
 	_events.transcript_changed(first, std::span(_lines).subspan(first));
 }
 
@@ -101,6 +88,9 @@ void agent_host::wire_client()
 		if (const auto model = agent_session::read_options(_lines, agent_session::parse(_lines)).model;
 			!model.empty() && model != "default")
 			(void)_client->set_model(model);
+
+		if (std::exchange(_models_wanted, false))
+			show_models();
 
 		if (!_queued_prompt.empty())
 		{
@@ -264,6 +254,7 @@ void agent_host::on_agent_exit(const int code)
 	_wire.reset();
 	_process.reset();
 	_question.active = false;
+	_models_wanted = false;
 	set_status("Not connected");
 }
 
@@ -365,24 +356,9 @@ void agent_host::handle_command(const agent_command_parse& parsed, const std::st
 
 	case agent_command::models:
 		if (parsed.text.empty())
-		{
-			note(agent_entry_kind::user, {}, "/model");
-			send_or_queue("/model");
-		}
+			show_models();
 		else
-		{
-			mutate([&]
-			{
-				_stream.dirty_from = 0;
-				agent_session::set_option(_lines, "model", parsed.text);
-			});
-
-			if (_client && _client->set_model(parsed.text))
-				note(agent_entry_kind::note, {}, std::format("Model set to {}.", parsed.text));
-			else
-				note(agent_entry_kind::note, {},
-				     std::format("Model recorded as {}; it applies when the agent connects.", parsed.text));
-		}
+			apply_model(parsed.text);
 		return;
 
 	case agent_command::forward:
@@ -421,6 +397,7 @@ void agent_host::ask_permission(const acp::request_id id, const json::value& par
 		}
 	}
 
+	_question.kind = question_kind::permission;
 	_question.id = id;
 	_question.option_ids.clear();
 	_question.active = true;
@@ -448,36 +425,123 @@ void agent_host::ask_permission(const acp::request_id id, const json::value& par
 	set_status("Waiting for your answer");
 }
 
+// The agent only reports its models once the session exists, so /m may have to wait for one
+void agent_host::show_models()
+{
+	ensure_started();
+
+	if (!_client || !_client->ready())
+	{
+		if (_client)
+		{
+			_models_wanted = true;
+			note(agent_entry_kind::note, {}, "Connecting — the model list will follow.");
+		}
+
+		return;
+	}
+
+	const auto models = _client->models();
+
+	if (models.empty())
+	{
+		note(agent_entry_kind::note, {},
+		     "This agent did not offer a model list. Use `/m <id>` to name one.");
+		return;
+	}
+
+	_question.kind = question_kind::model;
+	_question.id = 0;
+	_question.option_ids.clear();
+	_question.active = true;
+
+	std::string body;
+	auto number = 1;
+
+	for (const auto& model : models)
+	{
+		_question.option_ids.push_back(model.id);
+		const auto label = model.name.empty() ? model.id : model.name;
+		const std::string_view mark = model.id == _client->current_model_id() ? " — current" : "";
+		body += std::format("- [ ] {}. {}{}\n", number, label, mark);
+		++number;
+	}
+
+	body += "\nReply with the number of the model you want.";
+	note(agent_entry_kind::question, "Choose a model", body);
+}
+
+void agent_host::apply_model(const std::string_view model_id)
+{
+	mutate([&]
+	{
+		_stream.dirty_from = 0;
+		agent_session::set_option(_lines, "model", model_id);
+	});
+
+	if (_client && _client->set_model(model_id))
+		note(agent_entry_kind::note, {}, std::format("Model set to {}.", model_id));
+	else
+		note(agent_entry_kind::note, {},
+		     std::format("Model recorded as {}; it applies when the agent connects.", model_id));
+}
+
 bool agent_host::try_answer(const std::string_view text)
 {
 	if (!_question.active)
 		return false;
 
-	const auto value = pf::stoi(text);
+	const auto first = text.find_first_not_of(" \t\r\n");
+
+	if (first == std::string_view::npos)
+		return false;
+
+	// Only a bare number is an answer, or a prompt that opens with a digit would be eaten
+	const auto digits = text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+
+	if (!std::ranges::all_of(digits, [](const char c) { return c >= '0' && c <= '9'; }))
+		return false;
+
+	const auto value = pf::stoi(digits);
 
 	if (value < 1 || static_cast<size_t>(value) > _question.option_ids.size())
 		return false;
 
-	answer_question(static_cast<size_t>(value) - 1);
+	answer(static_cast<size_t>(value) - 1);
 	return true;
 }
 
 void agent_host::answer(const size_t index)
 {
-	answer_question(index);
-}
+	if (!_question.active || index >= _question.option_ids.size())
+		return;
 
-void agent_host::answer_question(const size_t index)
-{
-	if (!_question.active || index >= _question.option_ids.size() || !_client)
+	const auto chosen = _question.option_ids[index];
+	const auto kind = _question.kind;
+
+	_question.active = false;
+	tick_last_question(index);
+
+	if (kind == question_kind::model)
+	{
+		apply_model(chosen);
+		return;
+	}
+
+	if (!_client)
 		return;
 
 	auto outcome = json::object();
 	outcome.set("outcome", "selected");
-	outcome.set("optionId", _question.option_ids[index]);
+	outcome.set("optionId", chosen);
 	_client->respond(_question.id, json::object().set("outcome", std::move(outcome)));
 
-	// Tick the choice in the file, so the record matches what was sent
+	set_status(busy() ? "Working... /s to stop" : "Ready");
+}
+
+// Tick the choice in the file, so the record matches what was sent
+void agent_host::tick_last_question(const size_t index)
+{
 	mutate([&]
 	{
 		const auto entries = agent_session::parse(_lines);
@@ -492,7 +556,4 @@ void agent_host::answer_question(const size_t index)
 			break;
 		}
 	});
-
-	_question.active = false;
-	set_status(busy() ? "Working... /s to stop" : "Ready");
 }

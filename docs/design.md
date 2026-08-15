@@ -33,7 +33,7 @@ Opening a document is also asynchronous, so anything that depends on the loaded 
 
 ### Invalidation
 
-Views never repaint directly. They set bits in an atomic mask (`invalid::doc`, `doc_layout`, `doc_caret`, `doc_scrollbar`, `list`, `windows`). The message loop calls `app_idle()` once per pump, which coalesces layout, scrollbar recalculation, caret update, list population and repaint into one pass.
+Views never repaint directly. They set bits in an atomic mask (`invalid::doc_layout`, `doc_caret`, `doc_scrollbar`, `files_layout`, `files_populate`, `search_layout`, `search_populate`, `agent_layout`, `index`, `windows`, `app_title`). The message loop calls `app_idle()` once per pump, which coalesces layout, scrollbar recalculation, caret update, list population and repaint into one pass.
 
 The document model distinguishes three notifications, and the difference is what keeps typing cheap:
 
@@ -46,12 +46,12 @@ The document model distinguishes three notifications, and the difference is what
 ## Window layout
 
 ```
-┌───────────────┬─┬─────────────────────────────┬─┬───────────────┐
+┌───────────────┬─┬───────────────────────────────┬─┬─────────────────┐
 │ left pane     │ │ document pane                 │ │ agent pane      │
 │ files  OR     │▓│ text / markdown / csv / hex   │▓│ session.md      │
 │ search        │ │                               │ ├─────────────────┤
 │               │ │                               │ │ input           │
-└───────────────┴─┴─────────────────────────────┴─┴───────────────┘
+└───────────────┴─┴───────────────────────────────┴─┴─────────────────┘
                  └ splitter (5px, DPI-scaled, ratio 0.05–0.95)
 ```
 
@@ -81,12 +81,13 @@ pf::frame_reactor
 └── view_base                  scroll offset and content extent, both in pixels
     ├── text_view              font metrics, screen lines, message bar, clipboard, zoom, Escape
     │   └── doc_view           document, caret, selection, word wrap, hit-testing, painting
-    │       ├── edit_doc_view          the only writable view
+    │       ├── edit_doc_view          writable: the document pane and the agent prompt
+    │       │   └── agent_input_view    the prompt, grown to fit up to five rows
     │       └── read_only_doc_view     no caret, no h-scroll, word wrap locked, keys scroll
     │           ├── markdown_doc_view
     │           ├── csv_doc_view
     │           ├── hex_doc_view
-    │           └── agent_view             transcript plus an input box
+    │           └── agent_view             the session.md transcript
     └── list_view              items, selection, hover, keyboard navigation
         ├── file_list_view     folder tree, inline rename, drag-drop
         └── search_list_view   search box, grouped results
@@ -154,9 +155,15 @@ Streamed output patches only the lines it touched, so a token costs one line re-
 
 The transcript has its own `document_events` sink. Sharing `app_state` would route its edits to the document pane and corrupt that pane's word-wrap cache.
 
+### The prompt is the editor again
+
+The pane is two windows, not one: the transcript above, and below it `agent_input_view` — an `edit_doc_view` over a document of its own. Reusing the editor rather than growing a widget is what gives the prompt mouse and keyboard selection, cut/copy/paste, word wrap, spell check and undo without writing any of them twice. Editing commands ask what has focus, so `Ctrl+Z` in the prompt cannot reach the document pane. Like the transcript, it has its own `document_events` sink.
+
+It grows to fit what you type, up to five rows, and scrolls past that. `layout_views` asks the view how tall it wants to be, so the height follows the wrapped row count and the agent font size. Typing at the transcript, which is read-only, hands the character to the prompt.
+
 ### Tools and files
 
-Every tool call the agent proposes arrives as a permission request and is shown with numbered options; nothing runs until you answer by typing the number or clicking it, and the choice is ticked in the file so the record matches what was sent. `/yolo` answers for you — it is recorded in the session block but **never resumed from a file**, so a session saved with it on comes back with it off and a note saying so.
+Every tool call the agent proposes arrives as a permission request and is shown with numbered options; nothing runs until you answer by typing the number or clicking it, and the choice is ticked in the file so the record matches what was sent. `/m` reuses the same numbered-option mechanism for choosing a model, answering locally instead of replying to the agent. `/yolo` answers for you — it is recorded in the session block but **never resumed from a file**, so a session saved with it on comes back with it off and a note saying so.
 
 Rethinkify advertises `fs/read_text_file` and `fs/write_text_file`, so an agent that honours them reads unsaved work from the open document and writes through `replace_text` inside an `undo_group`. Every path is refused unless it canonicalises to somewhere inside the open folder, which closes both `..` traversal and links.
 
@@ -167,7 +174,7 @@ Rethinkify advertises `fs/read_text_file` and `fs/write_text_file`, so an agent 
 | `/help`, `/h` | Prompt help, generated from the same table that drives the parser |
 | `/clear`, `/c` | Empty the transcript. An ordinary edit, so `Ctrl+Z` brings it back |
 | `/stop`, `/s` | Stop the current turn |
-| `/models`, `/m` | List models, or set one |
+| `/models`, `/m` | Offer the models the agent reported as numbered options, or set one by id |
 | `/yolo` | Toggle running tools without asking |
 
 Anything else beginning with `/` is forwarded when the agent advertised it, and reported locally when it did not.
@@ -212,7 +219,7 @@ Three modes — `auto_detect` (default; active for `.md` and `.txt`), `enabled`,
 
 ## Configuration
 
-An INI beside the executable when that folder is writable, otherwise `%LOCALAPPDATA%\Rethinkify\rethinkify.ini`. Written at shutdown; command-line modes (`/test`, `/spell:`) never write it.
+An INI beside the executable when that folder is writable, otherwise `%LOCALAPPDATA%\Rethinkify\rethinkify.ini`. Written at shutdown, so no command-line mode ever writes it.
 
 | Section | Keys |
 |---|---|
@@ -238,7 +245,7 @@ Restored paths are validated: UNC and non-existent roots are skipped. Passing a 
 | `rethinkify-64d.exe /agent:<prompt>` | Run one turn through the same host the panel uses, printing the transcript. Tests the whole agent path. No GUI. |
 | `rethinkify-64d.exe <path>` | Open a file. Arguments starting with `/` or `-` are ignored; the last plain argument wins. |
 
-Both `/x` and `--x` forms are accepted. The diagnostics never approve a tool call, and only `/agent:` writes nothing to disk beyond what the agent itself does.
+Both `/x` and `--x` forms are accepted. Neither agent diagnostic ever approves a tool call, and `/agent:` refuses the file bridge outright, so nothing is written on their behalf.
 
 ## Known limitations
 

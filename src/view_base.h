@@ -28,4 +28,8 @@ protected:
 	// Scrolling logic — operates on pixel offsets
 
 	int max_scroll_y() const { return std::max(0, _content_extent.cy - _view_extent.cy); }
+
+public:
+	// Exposed so a test can assert what the scrollbar was told without drawing
+	[[nodiscard]] const custom_scrollbar& vert_scrollbar() const { return _vscroll; }
 };

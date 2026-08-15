@@ -5,6 +5,18 @@
 #include "acp.h"
 #include "agent_session.h"
 
+// Carries protocol lines to a spawned agent
+class child_transport final : public acp::transport
+{
+public:
+	pf::child_process* process = nullptr;
+
+	bool send_line(const std::string_view line) override
+	{
+		return process && process->write_line(line);
+	}
+};
+
 class agent_host
 {
 public:
@@ -52,11 +64,9 @@ public:
 	// The folder the agent runs in. Must be set before the first message.
 	void set_working_dir(pf::file_path dir) { _working_dir = std::move(dir); }
 
-	[[nodiscard]] const std::vector<std::string>& lines() const { return _lines; }
 	[[nodiscard]] bool connected() const;
 	[[nodiscard]] bool busy() const;
 	[[nodiscard]] bool yolo() const { return _yolo; }
-	[[nodiscard]] std::string_view status() const { return _status; }
 
 	// Handles a line typed into the input, including slash commands
 	void submit(std::string_view text);
@@ -68,15 +78,19 @@ public:
 	void answer(size_t index);
 	[[nodiscard]] bool awaiting_answer() const { return _question.active; }
 
+
 	// Exposed for tests: drives the protocol without a process
 	void connect(std::unique_ptr<acp::transport> wire, const pf::file_path& working_dir);
 	void on_agent_line(std::string_view line);
 	void on_agent_exit(int code);
 
 private:
+	enum class question_kind { permission, model };
+
 	struct pending_question
 	{
-		acp::request_id id = 0;
+		question_kind kind = question_kind::permission;
+		acp::request_id id = 0; // only meaningful for a permission question
 		std::vector<std::string> option_ids;
 		bool active = false;
 	};
@@ -93,6 +107,7 @@ private:
 	std::string _status;
 	std::string _queued_prompt;
 	bool _yolo = false;
+	bool _models_wanted = false; // /m arrived before the session existed
 
 	void ensure_started();
 	void wire_client();
@@ -103,7 +118,9 @@ private:
 	void set_status(std::string text);
 
 	void ask_permission(acp::request_id id, const json::value& params);
-	void answer_question(size_t index);
+	void show_models();
+	void apply_model(std::string_view model_id);
+	void tick_last_question(size_t index);
 	[[nodiscard]] bool try_answer(std::string_view text);
 
 	void handle_read_file(acp::request_id id, const json::value& params);

@@ -29,3 +29,7 @@ exe/*.ini
 /exe/.env
 /.env
 
+# Agent conversations, written into whichever folder is open
+session.md
+session-*.md
+

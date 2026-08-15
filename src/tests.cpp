@@ -7,6 +7,7 @@
 #include "view_doc.h"
 #include "view_list_search.h"
 #include "view_agent.h"
+#include "view_agent_input.h"
 #include "agent_host.h"
 #include "calc.h"
 #include "json.h"
@@ -3167,25 +3168,135 @@ static void should_clamp_agent_splitter_to_the_document_pane()
 	}
 }
 
-static void should_grow_agent_input_to_six_rows()
+// A thumb held at its minimum length still has to fit inside the track at either end
+static void should_keep_the_scrollbar_thumb_inside_the_track()
+{
+	custom_scrollbar bar{custom_scrollbar::orientation::vertical};
+
+	constexpr auto track_top = 20;
+	constexpr auto track_extent = 400;
+	constexpr auto page = 400;
+	constexpr auto content = 40000; // long enough that the thumb hits its minimum length
+
+	bar.update(content, page, 0);
+	auto thumb = bar.thumb(track_top, track_extent);
+	should::is_equal(track_top, thumb.start, "starts at the top of the track");
+	should::is_equal(bar.thumb_thickness(), thumb.length, "clamped to the minimum length");
+
+	bar.update(content, page, content - page);
+	thumb = bar.thumb(track_top, track_extent);
+	should::is_equal(track_top + track_extent, thumb.start + thumb.length, "ends flush with the track");
+	should::is_equal_true(thumb.start >= track_top, "never above the track");
+
+	// Half way is still proportional
+	bar.update(content, page, (content - page) / 2);
+	thumb = bar.thumb(track_top, track_extent);
+	should::is_equal_true(thumb.start > track_top, "moved down");
+	should::is_equal_true(thumb.start + thumb.length < track_top + track_extent, "not yet at the end");
+
+	// Nothing to scroll means nothing to draw
+	bar.update(page, page, 0);
+	should::is_equal(0, bar.thumb(track_top, track_extent).length, "no thumb when it all fits");
+}
+
+// The transcript pane must offer a scrollbar once the conversation outgrows it
+static void should_scroll_the_agent_transcript()
 {
 	const auto state = create_test_app();
-	agent_view view(*state);
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
 
-	should::is_equal(1, view.input_rows(), "empty is one row");
+	std::string long_transcript;
+	for (auto i = 0; i < 200; ++i)
+		long_transcript += std::format("transcript line {}\n", i);
 
-	view.set_input_text("one line");
-	should::is_equal(1, view.input_rows(), "single line");
+	const auto doc = std::make_shared<document>(null_ev, long_transcript);
+	const auto view = std::make_shared<agent_view>(*state);
 
-	view.set_input_text("one\ntwo\nthree");
-	should::is_equal(3, view.input_rows(), "three lines");
+	view->set_document(doc);
 
-	view.set_input_text("1\n2\n3\n4\n5\n6");
-	should::is_equal(agent_view::max_input_rows, view.input_rows(), "six lines");
+	// Sizing alone must arm the scrollbar: the base only raises the document pane's bit
+	view->handle_size(window, pf::isize{400, 320}, measure);
+
+	const auto& bar = view->vert_scrollbar();
+	should::is_equal_true(bar.can_scroll(), "the transcript scrolls");
+
+	// The input box sits below the transcript, so the track must stop short of it
+	should::is_equal_true(bar._page_size <= 320, "track fits the pane");
+
+	view->scroll_to_end();
+	should::is_equal_true(view->at_bottom(), "reaches the end");
+	should::is_equal_true(view->vert_scrollbar().can_scroll(), "still scrolls at the end");
+}
+
+// The prompt is a document view, so it gets selection, clipboard and undo for free
+static void should_edit_the_agent_prompt_like_a_document()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	const auto& view = state->_agent_input_view;
+	view->handle_size(window, pf::isize{400, 64}, measure);
+	view->set_text("hello world");
+
+	should::is_equal("hello world", view->text(), "text set");
+
+	// Reached the way the command table reaches them, through the focused text view
+	const text_view_ptr focused = view;
+
+	focused->select_all_text();
+	should::is_equal_true(focused->can_copy_text(), "a selection can be copied");
+	should::is_equal_true(focused->can_cut_text(), "a selection can be cut");
+	should::is_equal_true(focused->cut_text_to_clipboard(), "cut");
+	should::is_equal("", view->text(), "cut emptied the prompt");
+
+	should::is_equal_true(focused->can_paste_text(), "the clipboard has the prompt");
+	should::is_equal_true(focused->paste_text_from_clipboard(), "paste");
+	should::is_equal("hello world", view->text(), "pasted back");
+
+	// The prompt has its own undo, so Ctrl+Z here cannot reach the document pane
+	const auto editor_text = state->doc()->str();
+	state->_agent_input_doc->edit_undo();
+	should::is_equal(editor_text, state->doc()->str(), "the editor document is untouched");
+}
+
+// The prompt grows with what is typed, then stops and scrolls instead
+static void should_grow_agent_input_to_five_rows()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	const auto& view = state->_agent_input_view;
+	view->handle_size(window, pf::isize{400, 64}, measure);
+
+	should::is_equal(1, view->rows(), "empty is one row");
+
+	view->set_text("one line");
+	view->layout();
+	should::is_equal(1, view->rows(), "single line");
+
+	view->set_text("one\ntwo\nthree");
+	view->layout();
+	should::is_equal(3, view->rows(), "three lines");
+
+	view->set_text("1\n2\n3\n4\n5");
+	view->layout();
+	should::is_equal(agent_input_view::max_rows, view->rows(), "five lines");
 
 	// Beyond the cap the box stops growing and the text scrolls instead
-	view.set_input_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
-	should::is_equal(agent_view::max_input_rows, view.input_rows(), "capped at six");
+	view->set_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+	view->layout();
+	should::is_equal(agent_input_view::max_rows, view->rows(), "capped at five");
+
+	view->handle_size(window, pf::isize{400, view->desired_height()}, measure);
+	should::is_equal_true(view->vert_scrollbar().can_scroll(), "scrolls past the cap");
+
+	// A long single line wraps rather than running off the edge
+	view->set_text(std::string(400, 'x'));
+	view->layout();
+	should::is_equal_true(view->rows() > 1, "a long line wraps onto more rows");
 }
 
 // Editing the transcript must not disturb the document pane's caches
@@ -3380,6 +3491,9 @@ static void should_run_an_agent_turn()
 	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
 	should::is_equal(false, host->busy(), "turn finished");
 	should::is_equal("Ready", sink.status, "back to ready");
+
+	// The transcript is offered for saving once the turn is over, not once per token
+	should::is_equal_true(sink.settled_count > 0, "transcript settled");
 }
 
 // A streamed token must rewrite one line, not the whole transcript
@@ -3459,6 +3573,12 @@ static void should_ask_before_running_a_tool()
 
 	// Nothing was sent back until the user chose
 	should::is_equal_true(wire->last()["result"].is_null(), "no answer yet");
+
+	// A prompt that merely opens with a digit is a prompt, not an answer
+	host->submit("2 files changed since then");
+	should::is_equal_true(host->awaiting_answer(), "still waiting for an answer");
+	should::is_equal_true(sink.text().find("2 files changed since then") != std::string::npos,
+	                      "the text was recorded as a prompt");
 
 	host->submit("2");
 
@@ -3548,6 +3668,41 @@ static void should_stop_a_running_turn()
 	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
 	should::is_equal(false, host->busy(), "turn ended");
 	should::is_equal_true(sink.text().find("cancelled") != std::string::npos, "recorded in the transcript");
+}
+
+// /m with no argument offers the agent's models; the reply picks one
+static void should_offer_a_model_choice()
+{
+	collecting_sink sink;
+	auto host = std::make_unique<agent_host>(sink);
+	auto owned_wire = std::make_unique<recording_transport>();
+	auto* wire = owned_wire.get();
+
+	host->connect(std::move(owned_wire), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire->last_id()));
+	host->on_agent_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1","models":{{"currentModelId":"fast",)"
+		R"("availableModels":[{{"modelId":"fast","name":"Fast"}},{{"modelId":"deep","name":"Deep"}}]}}}}}})",
+		wire->last_id()));
+
+	host->submit("/m");
+
+	const auto listed = sink.text();
+	should::is_equal_true(listed.find("1. Fast") != std::string::npos, "first model listed");
+	should::is_equal_true(listed.find("2. Deep") != std::string::npos, "second model listed");
+	should::is_equal_true(listed.find("current") != std::string::npos, "current model marked");
+	should::is_equal_true(host->awaiting_answer(), "waiting for a choice");
+
+	host->submit("2");
+
+	should::is_equal("session/set_model", wire->last()["method"].text(), "model change sent");
+	should::is_equal("deep", wire->last()["params"]["modelId"].text(), "chose the second model");
+	should::is_equal(false, host->awaiting_answer(), "question closed");
+
+	const auto answered = sink.text();
+	should::is_equal_true(answered.find("- [x] 2. Deep") != std::string::npos, "choice ticked in the file");
+	should::is_equal_true(answered.find("model: deep") != std::string::npos, "recorded in the session block");
 }
 
 static void should_report_a_lost_agent()
@@ -3759,7 +3914,12 @@ tests::run_result run_all_tests_result(){
 	// Agent panel tests
 	tests.register_test("should clamp agent splitter to the document pane",
 	                    should_clamp_agent_splitter_to_the_document_pane);
-	tests.register_test("should grow agent input to six rows", should_grow_agent_input_to_six_rows);
+	tests.register_test("should keep the scrollbar thumb inside the track",
+	                    should_keep_the_scrollbar_thumb_inside_the_track);
+	tests.register_test("should scroll the agent transcript", should_scroll_the_agent_transcript);
+	tests.register_test("should grow agent input to five rows", should_grow_agent_input_to_five_rows);
+	tests.register_test("should edit the agent prompt like a document",
+	                    should_edit_the_agent_prompt_like_a_document);
 	tests.register_test("should keep the session document separate from the editor",
 	                    should_keep_the_session_document_separate_from_the_editor);
 	tests.register_test("should handle agent slash commands in the panel",
@@ -3773,6 +3933,7 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should answer a question by selection", should_answer_a_question_by_selection);
 	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
 	tests.register_test("should stop a running turn", should_stop_a_running_turn);
+	tests.register_test("should offer a model choice", should_offer_a_model_choice);
 	tests.register_test("should report a lost agent", should_report_a_lost_agent);
 	tests.register_test("should serve agent file requests", should_serve_agent_file_requests);
 	tests.register_test("should refuse agent paths outside the root",

@@ -469,6 +469,27 @@ struct custom_scrollbar
 		_position = position;
 	}
 
+	struct thumb_span
+	{
+		int start = 0;
+		int length = 0;
+	};
+
+	// The minimum thumb length costs room the proportional position does not know about, so
+	// without the clamp the last page of a long document pushes the thumb off the end of the track
+	[[nodiscard]] thumb_span thumb(const int track_start, const int track_extent) const
+	{
+		if (!can_scroll())
+			return {track_start, 0};
+
+		const auto length = std::max(pf::mul_div(_page_size, track_extent, _content_size),
+		                             thumb_thickness());
+		const auto limit = std::max(track_start, track_start + track_extent - length);
+		const auto start = std::clamp(pf::mul_div(_position, track_extent, _content_size) + track_start,
+		                              track_start, limit);
+		return {start, length};
+	}
+
 	bool hit_test(const pf::ipoint& pt, const pf::irect& client) const
 	{
 		if (!can_scroll()) return false;
@@ -488,9 +509,7 @@ struct custom_scrollbar
 
 		if (_orient == orientation::vertical)
 		{
-			const auto extent = client.height();
-			const auto y = pf::mul_div(_position, extent, _content_size) + client.top;
-			const auto cy = std::max(pf::mul_div(_page_size, extent, _content_size), tt);
+			const auto [y, cy] = thumb(client.top, client.height());
 			const auto right = client.right;
 			auto x_pad = 0;
 
@@ -507,9 +526,7 @@ struct custom_scrollbar
 		}
 		else
 		{
-			const auto extent = client.width();
-			const auto x = pf::mul_div(_position, extent, _content_size) + client.left;
-			const auto cx = std::max(pf::mul_div(_page_size, extent, _content_size), tt);
+			const auto [x, cx] = thumb(client.left, client.width());
 			const auto bottom = client.bottom;
 			auto y_pad = 0;
 

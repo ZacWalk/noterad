@@ -107,30 +107,34 @@ std::vector<command_def> app_state::make_commands()
 		{
 			"Undo the last edit",
 			"&Undo", static_cast<int>(command_id::edit_undo), {'Z', pf::key_mod::ctrl},
-			[this] { return can_edit_document() && doc()->can_undo(); }, nullptr,
+			[this] { return can_edit_focused_document() && focused_document()->can_undo(); }, nullptr,
 			[this]
 			{
-				if (!doc()->can_undo())
+				const auto d = focused_document();
+
+				if (!d->can_undo())
 				{
 					set_message("Nothing to undo.");
 					return;
 				}
-				doc()->edit_undo();
+				d->edit_undo();
 			},
 			{pf::platform_key::Back, pf::key_mod::alt}
 		},
 		{
 			"Redo the last undone edit",
 			"&Redo", static_cast<int>(command_id::edit_redo), {'Y', pf::key_mod::ctrl},
-			[this] { return can_edit_document() && doc()->can_redo(); }, nullptr,
+			[this] { return can_edit_focused_document() && focused_document()->can_redo(); }, nullptr,
 			[this]
 			{
-				if (!doc()->can_redo())
+				const auto d = focused_document();
+
+				if (!d->can_redo())
 				{
 					set_message("Nothing to redo.");
 					return;
 				}
-				doc()->edit_redo();
+				d->edit_redo();
 			}
 		},
 		{

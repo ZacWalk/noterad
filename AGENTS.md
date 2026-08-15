@@ -27,7 +27,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 | Application | `app.h`, `app.cpp` (main window, panes, splitters, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (lines, selection, undo, load/save, JSON reformat, sort), `document_syntax.cpp` (C++, Rust, Python, PowerShell, Markdown, hex highlighters) |
-| Document views | `view_base.h` → `view_text.h` → `view_doc.h` → `view_doc_edit.h` (editable) and `view_doc_readonly.h` → `view_doc_markdown.h`, `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` |
+| Document views | `view_base.h` → `view_text.h` → `view_doc.h` → `view_doc_edit.h` (editable) → `view_agent_input.h`, and `view_doc_readonly.h` → `view_doc_markdown.h`, `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` |
 | Panel views | `view_list.h` → `view_list_files.h`, `view_list_search.h` |
 | Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
 | Widgets | `ui.h` (colours, `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |

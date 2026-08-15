@@ -20,6 +20,7 @@ class file_list_view;
 class search_list_view;
 class doc_view;
 class agent_view;
+class agent_input_view;
 struct list_view_item;
 
 using doc_view_ptr = std::shared_ptr<doc_view>;
@@ -27,6 +28,7 @@ using text_view_ptr = std::shared_ptr<text_view>;
 using folder_view_ptr = std::shared_ptr<file_list_view>;
 using search_view_ptr = std::shared_ptr<search_list_view>;
 using agent_view_ptr = std::shared_ptr<agent_view>;
+using agent_input_view_ptr = std::shared_ptr<agent_input_view>;
 using list_view_item_ptr = std::shared_ptr<list_view_item>;
 
 
@@ -45,11 +47,13 @@ public:
 	pf::window_frame_ptr _doc_window;
 	pf::window_frame_ptr _list_window;
 	pf::window_frame_ptr _agent_window;
+	pf::window_frame_ptr _agent_input_window;
 
 	doc_view_ptr _doc_view;
 	folder_view_ptr _files_view;
 	search_view_ptr _search_view;
 	agent_view_ptr _agent_view;
+	agent_input_view_ptr _agent_input_view;
 
 	async_scheduler_ptr _scheduler;
 
@@ -83,16 +87,28 @@ public:
 	void on_agent_input(std::string text);
 	void on_agent_answer(size_t index);
 	void clear_agent_session();
-	[[nodiscard]] bool agent_has_focus() const;
 	[[nodiscard]] index_item_ptr session_item();
-	void append_agent_lines(const std::vector<std::string>& lines);
 	[[nodiscard]] pf::irect agent_splitter_bounds(const pf::irect& bounds) const;
 
 	index_item_ptr _session_item;
 	std::shared_ptr<document_events> _agent_doc_events;
+	std::shared_ptr<document_events> _agent_input_doc_events;
+	document_ptr _agent_input_doc;
 	std::shared_ptr<agent_host::events> _agent_sink;
 	std::unique_ptr<agent_host> _agent_host;
 	std::string _agent_status;
+
+	// Set when a transcript change arrives with the tail already on screen; consumed after layout
+	bool _agent_follow_tail = false;
+
+	// Height the prompt last asked for, so a font or row-count change re-runs the layout
+	int _agent_input_height = 0;
+
+	[[nodiscard]] int agent_input_height() const;
+	[[nodiscard]] bool agent_input_has_focus() const;
+	[[nodiscard]] document_ptr focused_document() const;
+	[[nodiscard]] bool can_edit_focused_document() const;
+	void type_into_agent_input(char32_t ch);
 
 	[[nodiscard]] std::string_view agent_status_text() const override { return _agent_status; }
 	void apply_transcript_change(int first, std::span<const std::string> replacement);
@@ -225,6 +241,8 @@ public:
 		if (!prompt_save_all_modified())
 			return 0; // user cancelled
 
+		// The transcript is not in the index, so it is not covered by the prompt above
+		save_session();
 		save_config();
 		_app_window->close();
 		return 0;
@@ -685,6 +703,10 @@ public:
 	void set_root(const index_item_ptr& root)
 	{
 		_root_folder = root;
+
+		// Each folder has its own conversation, so the pane has to follow
+		if (_agent_visible)
+			(void)session_item();
 	}
 
 	// ── Search ─────────────────────────────────────────────────────────────

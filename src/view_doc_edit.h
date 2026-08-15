@@ -4,7 +4,7 @@
 
 #include "view_doc.h"
 
-class edit_doc_view final : public doc_view
+class edit_doc_view : public doc_view
 {
 public:
 	edit_doc_view(app_events& events) : doc_view(events)
@@ -138,7 +138,6 @@ protected:
 		}
 	}
 
-private:
 	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
 	{
 		namespace pk = pf::platform_key;
