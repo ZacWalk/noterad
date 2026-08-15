@@ -1,0 +1,81 @@
+// agent_session.h — session.md: the conversation as an editable markdown file
+
+#pragma once
+
+enum class agent_entry_kind
+{
+	note,
+	session,
+	user,
+	agent,
+	thought,
+	error,
+	tool_call,
+	question,
+	plan,
+};
+
+struct agent_option
+{
+	std::string label;
+	bool chosen = false;
+	int line = 0;
+};
+
+// An entry owns a range of lines; the text itself always stays in the file
+struct agent_entry
+{
+	agent_entry_kind kind = agent_entry_kind::note;
+	int first_line = 0;
+	int last_line = 0; // exclusive
+	std::string title;
+	std::string status;
+	std::vector<agent_option> options;
+
+	[[nodiscard]] bool has_options() const { return !options.empty(); }
+	[[nodiscard]] int chosen_option() const;
+};
+
+namespace agent_session
+{
+	inline constexpr std::string_view file_name = "session.md";
+	inline constexpr std::string_view file_header = "<!-- rethinkify agent session v1 -->";
+
+	// Only these exact headings open an entry, so a heading inside agent prose does not split it
+	[[nodiscard]] std::string_view role_heading(agent_entry_kind kind);
+
+	// Parsing is total: anything unrecognised stays in the entry it appears in
+	[[nodiscard]] std::vector<agent_entry> parse(std::span<const std::string> lines);
+
+	struct options
+	{
+		std::string model;
+		bool yolo = false;
+	};
+
+	[[nodiscard]] options read_options(std::span<const std::string> lines,
+	                                   const std::vector<agent_entry>& entries);
+
+	// Escapes a line that would otherwise be read as a heading
+	[[nodiscard]] std::string escape_body_line(std::string_view line);
+
+	[[nodiscard]] std::vector<std::string> split_body(std::string_view body);
+
+	void ensure_header(std::vector<std::string>& lines);
+
+	// Appends an entry, separated from what came before by exactly one blank line
+	void append_entry(std::vector<std::string>& lines, agent_entry_kind kind,
+	                  std::string_view title, std::string_view body);
+
+	// Appends to the last entry, continuing its final line when it is still open
+	void append_chunk(std::vector<std::string>& lines, std::string_view text);
+
+	// Writes a key in the Session block, adding the block or the key when missing.
+	// Any key it does not recognise is left untouched.
+	void set_option(std::vector<std::string>& lines, std::string_view key, std::string_view value);
+
+	void choose_option(std::vector<std::string>& lines, const agent_entry& entry, size_t index);
+
+	[[nodiscard]] std::string to_text(std::span<const std::string> lines);
+	[[nodiscard]] std::vector<std::string> to_lines(std::string_view text);
+}

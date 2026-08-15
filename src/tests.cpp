@@ -9,6 +9,7 @@
 #include "calc.h"
 #include "json.h"
 #include "acp.h"
+#include "agent_session.h"
 #include "test.h"
 
 
@@ -2728,6 +2729,242 @@ static void should_acp_parse_stop_reasons()
 	should::is_equal("end_turn", acp::to_string(acp::stop_reason::end_turn), "to_string");
 }
 
+static constexpr std::string_view sample_session =
+	"<!-- rethinkify agent session v1 -->\n"
+	"\n"
+	"## Session\n"
+	"- model: claude-sonnet-4.5\n"
+	"- yolo: off\n"
+	"\n"
+	"## You\n"
+	"\n"
+	"Fix the wrap cache splice bug.\n"
+	"\n"
+	"## Agent\n"
+	"\n"
+	"The dirty range is still in the old numbering.\n"
+	"\n"
+	"### Tool: git status (approved)\n"
+	"\n"
+	"    M src/view_doc.h\n"
+	"\n"
+	"### Question: which file should I change?\n"
+	"\n"
+	"- [x] src/view_doc.h\n"
+	"- [ ] src/document.cpp\n";
+
+// The file is the transcript, so writing it back must not disturb a single byte
+static void should_session_round_trip_exactly()
+{
+	constexpr std::string_view samples[] = {
+		sample_session,
+		"",
+		"\n",
+		"## You\nhello",
+		"no headings at all\njust text\n",
+		"## Nonsense\n### Also nonsense\n\ttabbed\n   \n## You\nreal\n",
+		"## Session\n- unknown-key: keep me\n- model: gpt-5\n",
+	};
+
+	for (const auto& text : samples)
+	{
+		const auto lines = agent_session::to_lines(text);
+		should::is_equal(text, agent_session::to_text(lines), "round trip");
+
+		// Parsing must never rewrite anything
+		const auto before = agent_session::to_text(lines);
+		const auto entries = agent_session::parse(lines);
+		should::is_equal(before, agent_session::to_text(lines), "parse does not mutate");
+		should::is_equal_true(entries.size() <= lines.size(), "entries bounded by lines");
+	}
+}
+
+static void should_session_parse_entries()
+{
+	const auto lines = agent_session::to_lines(sample_session);
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(size_t{5}, entries.size(), "entry count");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::session, "session first");
+	should::is_equal_true(entries[1].kind == agent_entry_kind::user, "then user");
+	should::is_equal_true(entries[2].kind == agent_entry_kind::agent, "then agent");
+	should::is_equal_true(entries[3].kind == agent_entry_kind::tool_call, "then tool");
+	should::is_equal_true(entries[4].kind == agent_entry_kind::question, "then question");
+
+	should::is_equal("git status", entries[3].title, "tool title");
+	should::is_equal("approved", entries[3].status, "tool status");
+	should::is_equal("which file should I change?", entries[4].title, "question title");
+
+	should::is_equal(size_t{2}, entries[4].options.size(), "option count");
+	should::is_equal("src/view_doc.h", entries[4].options[0].label, "first option");
+	should::is_equal_true(entries[4].options[0].chosen, "first chosen");
+	should::is_equal(false, entries[4].options[1].chosen, "second not chosen");
+	should::is_equal(0, entries[4].chosen_option(), "chosen index");
+
+	// Ranges are contiguous and cover the file after the leading header
+	for (size_t i = 1; i < entries.size(); ++i)
+		should::is_equal(entries[i - 1].last_line, entries[i].first_line, "entries are contiguous");
+
+	should::is_equal(static_cast<int>(lines.size()), entries.back().last_line, "last entry runs to the end");
+}
+
+// An agent writes markdown, so its own headings must not be mistaken for entry boundaries
+static void should_session_keep_agent_markdown_inside_its_entry()
+{
+	const auto lines = agent_session::to_lines(
+		"## Agent\n"
+		"\n"
+		"## Summary\n"
+		"### Details\n"
+		"#### Deeper\n"
+		"Some prose.\n");
+
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(size_t{1}, entries.size(), "one entry");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::agent, "agent entry");
+	should::is_equal(static_cast<int>(lines.size()), entries[0].last_line, "covers every line");
+}
+
+static void should_session_escape_heading_like_body()
+{
+	should::is_equal("\\## You", agent_session::escape_body_line("## You"), "role heading escaped");
+	should::is_equal("\\### Tool: x", agent_session::escape_body_line("### Tool: x"), "tool heading escaped");
+	should::is_equal("\\### Plan", agent_session::escape_body_line("### Plan"), "plan heading escaped");
+	should::is_equal("## Summary", agent_session::escape_body_line("## Summary"), "other heading untouched");
+	should::is_equal("plain", agent_session::escape_body_line("plain"), "plain text untouched");
+
+	std::vector<std::string> lines;
+	agent_session::append_entry(lines, agent_entry_kind::agent, {}, "## You\nnot a new entry");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "escaped body stays in one entry");
+}
+
+static void should_session_read_options()
+{
+	const auto lines = agent_session::to_lines(sample_session);
+	const auto options = agent_session::read_options(lines, agent_session::parse(lines));
+
+	should::is_equal("claude-sonnet-4.5", options.model, "model");
+	should::is_equal(false, options.yolo, "yolo off");
+
+	const auto on = agent_session::to_lines("## Session\n- yolo: on\n");
+	should::is_equal_true(agent_session::read_options(on, agent_session::parse(on)).yolo, "yolo on");
+
+	// Missing options fall back rather than failing
+	const auto empty = agent_session::to_lines("## You\nhi\n");
+	const auto fallback = agent_session::read_options(empty, agent_session::parse(empty));
+	should::is_equal("", fallback.model, "no model");
+	should::is_equal(false, fallback.yolo, "no yolo");
+}
+
+static void should_session_set_options_preserving_unknown_keys()
+{
+	auto lines = agent_session::to_lines(sample_session);
+	agent_session::set_option(lines, "yolo", "on");
+
+	auto options = agent_session::read_options(lines, agent_session::parse(lines));
+	should::is_equal_true(options.yolo, "yolo updated");
+	should::is_equal("claude-sonnet-4.5", options.model, "model untouched");
+	should::is_equal_true(agent_session::to_text(lines).find("Fix the wrap cache") != std::string::npos,
+	                      "conversation untouched");
+
+	// A key we do not know about survives a write
+	auto custom = agent_session::to_lines("## Session\n- unknown-key: keep me\n- model: gpt-5\n");
+	agent_session::set_option(custom, "model", "gpt-6");
+	const auto text = agent_session::to_text(custom);
+
+	should::is_equal_true(text.find("- unknown-key: keep me") != std::string::npos, "unknown key kept");
+	should::is_equal_true(text.find("- model: gpt-6") != std::string::npos, "known key updated");
+	should::is_equal_true(text.find("gpt-5") == std::string::npos, "old value gone");
+
+	// A missing key is added to the existing block
+	auto without = agent_session::to_lines("## Session\n- model: gpt-5\n\n## You\nhi\n");
+	agent_session::set_option(without, "yolo", "on");
+	should::is_equal_true(agent_session::read_options(without, agent_session::parse(without)).yolo, "key added");
+	should::is_equal_true(agent_session::to_text(without).find("## You\nhi") != std::string::npos,
+	                      "added inside the session block");
+
+	// An empty file grows a header
+	std::vector<std::string> fresh;
+	agent_session::set_option(fresh, "model", "gpt-5");
+	should::is_equal_true(agent_session::to_text(fresh).starts_with(agent_session::file_header), "header written");
+	should::is_equal("gpt-5", agent_session::read_options(fresh, agent_session::parse(fresh)).model, "model set");
+}
+
+static void should_session_choose_option()
+{
+	auto lines = agent_session::to_lines(sample_session);
+	auto entries = agent_session::parse(lines);
+
+	agent_session::choose_option(lines, entries.back(), 1);
+	entries = agent_session::parse(lines);
+
+	should::is_equal(1, entries.back().chosen_option(), "second option chosen");
+	should::is_equal(false, entries.back().options[0].chosen, "first cleared");
+	should::is_equal("src/document.cpp", entries.back().options[1].label, "label preserved");
+
+	// Out of range does nothing
+	const auto before = agent_session::to_text(lines);
+	agent_session::choose_option(lines, entries.back(), 99);
+	should::is_equal(before, agent_session::to_text(lines), "out of range ignored");
+}
+
+static void should_session_append_entries_and_chunks()
+{
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
+	agent_session::append_entry(lines, agent_entry_kind::user, {}, "hello there");
+	agent_session::append_entry(lines, agent_entry_kind::agent, {}, {});
+
+	agent_session::append_chunk(lines, "Hel");
+	agent_session::append_chunk(lines, "lo");
+	agent_session::append_chunk(lines, " world");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{3}, entries.size(), "session, user, agent");
+	should::is_equal_true(entries[2].kind == agent_entry_kind::agent, "last is the agent");
+	should::is_equal_true(agent_session::to_text(lines).find("Hello world") != std::string::npos,
+	                      "chunks joined into one line");
+
+	// A tool call carries its title into the heading and back out again
+	agent_session::append_entry(lines, agent_entry_kind::tool_call, "git status (approved)", {});
+	const auto with_tool = agent_session::parse(lines);
+	should::is_equal_true(with_tool.back().kind == agent_entry_kind::tool_call, "tool entry");
+	should::is_equal("git status", with_tool.back().title, "tool title");
+	should::is_equal("approved", with_tool.back().status, "tool status");
+
+	// Exactly one blank line separates entries however often we append
+	should::is_equal_true(agent_session::to_text(lines).find("\n\n\n") == std::string::npos, "no double blanks");
+}
+
+static void should_session_survive_hand_mangled_files()
+{
+	constexpr std::string_view mangled =
+		"## Session\n"
+		"- yolo\n"                       // no colon
+		"-[x] not an option\n"           // missing space
+		"## You\n"
+		"### Tool:\n"                    // no title
+		"### Question:\n"
+		"- [y] bad mark\n"
+		"- [ ]\n"                        // empty label
+		"##NoSpace\n"
+		"   ## Indented\n";
+
+	const auto lines = agent_session::to_lines(mangled);
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(mangled, agent_session::to_text(lines), "still round trips");
+	should::is_equal_true(entries.size() >= 2, "still finds the real headings");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::session, "session found");
+
+	const auto options = agent_session::read_options(lines, entries);
+	should::is_equal(false, options.yolo, "malformed bullet ignored");
+	should::is_equal("", options.model, "no model");
+}
+
 tests::run_result run_all_tests_result()
 {
 	tests tests;
@@ -2790,6 +3027,19 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should acp fail pending requests on disconnect",
 	                    should_acp_fail_pending_requests_on_disconnect);
 	tests.register_test("should acp parse stop reasons", should_acp_parse_stop_reasons);
+
+	// session.md tests
+	tests.register_test("should session round trip exactly", should_session_round_trip_exactly);
+	tests.register_test("should session parse entries", should_session_parse_entries);
+	tests.register_test("should session keep agent markdown inside its entry",
+	                    should_session_keep_agent_markdown_inside_its_entry);
+	tests.register_test("should session escape heading like body", should_session_escape_heading_like_body);
+	tests.register_test("should session read options", should_session_read_options);
+	tests.register_test("should session set options preserving unknown keys",
+	                    should_session_set_options_preserving_unknown_keys);
+	tests.register_test("should session choose option", should_session_choose_option);
+	tests.register_test("should session append entries and chunks", should_session_append_entries_and_chunks);
+	tests.register_test("should session survive hand mangled files", should_session_survive_hand_mangled_files);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);
