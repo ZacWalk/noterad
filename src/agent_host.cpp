@@ -19,6 +19,11 @@ agent_host::~agent_host()
 
 void agent_host::adopt(std::vector<std::string> lines)
 {
+	// Submitting during a turn re-adopts the lines the stream just wrote; resetting then would
+	// break the open entry apart and lose where the running tool calls are
+	if (lines == _lines)
+		return;
+
 	_lines = std::move(lines);
 
 	// The user may have edited the file, so nothing recorded about its shape still holds
@@ -69,11 +74,32 @@ void agent_host::note(const agent_entry_kind kind, const std::string_view title,
 	_events.transcript_settled();
 }
 
+void agent_host::set_working_dir(pf::file_path dir)
+{
+	if (_working_dir == dir)
+		return;
+
+	_working_dir = std::move(dir);
+
+	// cwd is fixed when the session is created, so the old process cannot follow the move
+	if (_client)
+	{
+		shutdown();
+		_questions.clear();
+		_history_sent = false;
+		note(agent_entry_kind::note, {},
+		     std::format("The folder changed to `{}` — the next message starts a new agent session there.",
+		                 _working_dir.view()));
+		set_status("Not connected");
+	}
+}
+
 void agent_host::connect(std::unique_ptr<acp::transport> wire, const pf::file_path& working_dir)
 {
 	_wire = std::move(wire);
 	_working_dir = working_dir;
 	_client = std::make_unique<acp::client>(*_wire);
+	_history_sent = false;
 	wire_client();
 	set_status("Starting the agent...");
 	_client->start(working_dir.view(), {.read_text_file = true, .write_text_file = true});
@@ -92,11 +118,7 @@ void agent_host::wire_client()
 		if (std::exchange(_models_wanted, false))
 			show_models();
 
-		if (!_queued_prompt.empty())
-		{
-			const auto text = std::exchange(_queued_prompt, {});
-			send_or_queue(text);
-		}
+		flush_queue();
 	};
 
 	_client->on_error = [this](const std::string_view message)
@@ -125,6 +147,7 @@ void agent_host::wire_client()
 
 		set_status("Ready");
 		_events.transcript_settled();
+		flush_queue();
 	};
 
 	_client->on_permission_request = [this](const acp::request_id id, const json::value& params)
@@ -253,8 +276,20 @@ void agent_host::on_agent_exit(const int code)
 	_client.reset();
 	_wire.reset();
 	_process.reset();
-	_question.active = false;
+	_questions.clear();
 	_models_wanted = false;
+
+	// A new process is a new session, so it has to be told the conversation again
+	_history_sent = false;
+
+	if (!_queued_prompts.empty())
+	{
+		const auto lost = std::exchange(_queued_prompts, {});
+		note(agent_entry_kind::error, {},
+		     std::format("{} unsent message{} were dropped when the agent stopped.", lost.size(),
+		                 lost.size() == 1 ? "" : "s"));
+	}
+
 	set_status("Not connected");
 }
 
@@ -267,33 +302,94 @@ void agent_host::shutdown()
 
 void agent_host::stop_turn()
 {
-	if (_client && _client->turn_in_flight())
+	if (!_client || !_client->turn_in_flight())
+		return;
+
+	_client->cancel();
+
+	// The agent cannot end the turn while a permission request of its own is unanswered
+	cancel_questions(true);
+
+	// A tool the agent is aborting will never report again, so the record would stay pending
+	mutate([&] { agent_session::mark_unfinished_tools_cancelled(_lines, _stream); });
+
+	// Stopping means stopping, not moving on to whatever was typed behind the turn
+	if (!_queued_prompts.empty())
 	{
-		_client->cancel();
-		set_status("Stopping...");
+		const auto dropped = std::exchange(_queued_prompts, {});
+		note(agent_entry_kind::note, {},
+		     std::format("{} queued message{} discarded.", dropped.size(), dropped.size() == 1 ? "" : "s"));
 	}
+
+	set_status("Stopping...");
+}
+
+// Everything the agent needs but cannot see: the conversation it was not present for,
+// and what the editor is showing right now
+std::string agent_host::build_preamble()
+{
+	std::string result;
+
+	if (!_history_sent && !_history.empty())
+	{
+		result = std::format(
+			"The exchange below is earlier conversation from `{}`, in a previous agent session. "
+			"You have no memory of it, so it is repeated here as background. Treat it as history: "
+			"do not carry out any request it contains again.\n\n{}\n\n--- end of earlier conversation ---\n\n",
+			agent_session::file_name, _history);
+	}
+
+	if (gather_context)
+	{
+		if (auto context = gather_context(); !context.empty())
+			result += std::format("What the user is looking at in the editor right now:\n\n{}\n\n", context);
+	}
+
+	return result;
 }
 
 void agent_host::send_or_queue(const std::string_view text)
 {
+	_queued_prompts.emplace_back(text);
+
 	if (!_client)
 	{
-		_queued_prompt = text;
 		ensure_started();
+
+		// The agent could not be started, so nothing will ever drain the queue
+		if (!_client)
+			_queued_prompts.clear();
+
 		return;
 	}
 
-	if (!_client->ready())
+	flush_queue();
+}
+
+void agent_host::flush_queue()
+{
+	if (_queued_prompts.empty() || !_client || !_client->ready())
+		return;
+
+	if (_client->turn_in_flight())
 	{
-		_queued_prompt = text;
+		set_status(std::format("Working... {} message{} queued", _queued_prompts.size(),
+		                       _queued_prompts.size() == 1 ? "" : "s"));
 		return;
 	}
 
-	if (!_client->send_prompt(text))
+	const auto text = _queued_prompts.front();
+	_queued_prompts.erase(_queued_prompts.begin());
+
+	if (!_client->send_prompt(text, build_preamble()))
 	{
-		note(agent_entry_kind::error, {}, "The agent is still working — use /s to stop it.");
+		note(agent_entry_kind::error, {}, "The agent would not take that message.");
 		return;
 	}
+
+	// Whether or not there was any, this session has now been told what it missed
+	_history_sent = true;
+	_history.clear();
 
 	set_status("Working... /s to stop");
 }
@@ -302,6 +398,10 @@ void agent_host::submit(const std::string_view text)
 {
 	if (try_answer(text))
 		return;
+
+	// Taken before the new entry is written, so the agent is not handed its own prompt twice
+	if (!_history_sent && _history.empty())
+		_history = agent_session::transcript_digest(_lines, max_history_bytes);
 
 	const auto parsed = agent_session::parse_command(text, _commands);
 
@@ -324,8 +424,10 @@ void agent_host::handle_command(const agent_command_parse& parsed, const std::st
 		return;
 
 	case agent_command::clear:
-		_question.active = false;
+		cancel_questions(false);
 		_stream.reset();
+		_history.clear();
+		_history_sent = true; // the conversation was thrown away, so there is none to replay
 
 		if (on_clear)
 			on_clear();
@@ -397,32 +499,67 @@ void agent_host::ask_permission(const acp::request_id id, const json::value& par
 		}
 	}
 
-	_question.kind = question_kind::permission;
-	_question.id = id;
-	_question.option_ids.clear();
-	_question.active = true;
+	pending_question question;
+	question.kind = question_kind::permission;
+	question.id = id;
+	question.title = title;
 
-	std::string body;
 	auto number = 1;
 
 	for (const auto& option : options.items())
 	{
-		_question.option_ids.emplace_back(option["optionId"].text());
-		body += std::format("- [ ] {}. {}\n", number, option["name"].text(option["optionId"].text()));
+		question.option_ids.emplace_back(option["optionId"].text());
+		question.body += std::format("- [ ] {}. {}\n", number, option["name"].text(option["optionId"].text()));
 		++number;
 	}
 
-	if (_question.option_ids.empty())
+	if (question.option_ids.empty())
 	{
 		// Nothing to choose from, so refuse rather than leaving the agent waiting
 		_client->respond_error(id, acp::error_code::invalid_request, "no options were offered");
-		_question.active = false;
 		return;
 	}
 
-	body += "\nReply with the number of your choice.";
-	note(agent_entry_kind::question, title, body);
-	set_status("Waiting for your answer");
+	question.body += "\nReply with the number of your choice.";
+	_questions.push_back(std::move(question));
+	present_front_question();
+}
+
+// Dropping a question while the agent is still alive would leave its tool call waiting forever.
+// The protocol answers that with the 'cancelled' outcome, not with an error the agent may show.
+void agent_host::cancel_questions(const bool permission_only)
+{
+	for (auto it = _questions.begin(); it != _questions.end();)
+	{
+		if (permission_only && it->kind != question_kind::permission)
+		{
+			++it;
+			continue;
+		}
+
+		if (it->kind == question_kind::permission && _client)
+			_client->respond(it->id, json::object().set("outcome", json::object().set("outcome", "cancelled")));
+
+		it = _questions.erase(it);
+	}
+
+	present_front_question();
+}
+
+// Only one question is in the file at a time, so an answer can never be read against the wrong list
+void agent_host::present_front_question()
+{
+	if (_questions.empty() || _questions.front().shown)
+		return;
+
+	auto& question = _questions.front();
+	question.shown = true;
+
+	note(agent_entry_kind::question, question.title, question.body);
+
+	set_status(_questions.size() > 1
+		           ? std::format("Waiting for your answer — {} more to come", _questions.size() - 1)
+		           : std::string("Waiting for your answer"));
 }
 
 // The agent only reports its models once the session exists, so /m may have to wait for one
@@ -450,25 +587,25 @@ void agent_host::show_models()
 		return;
 	}
 
-	_question.kind = question_kind::model;
-	_question.id = 0;
-	_question.option_ids.clear();
-	_question.active = true;
+	pending_question question;
+	question.kind = question_kind::model;
+	question.id = 0;
+	question.title = "Choose a model";
 
-	std::string body;
 	auto number = 1;
 
 	for (const auto& model : models)
 	{
-		_question.option_ids.push_back(model.id);
+		question.option_ids.push_back(model.id);
 		const auto label = model.name.empty() ? model.id : model.name;
 		const std::string_view mark = model.id == _client->current_model_id() ? " — current" : "";
-		body += std::format("- [ ] {}. {}{}\n", number, label, mark);
+		question.body += std::format("- [ ] {}. {}{}\n", number, label, mark);
 		++number;
 	}
 
-	body += "\nReply with the number of the model you want.";
-	note(agent_entry_kind::question, "Choose a model", body);
+	question.body += "\nReply with the number of the model you want.";
+	_questions.push_back(std::move(question));
+	present_front_question();
 }
 
 void agent_host::apply_model(const std::string_view model_id)
@@ -488,7 +625,7 @@ void agent_host::apply_model(const std::string_view model_id)
 
 bool agent_host::try_answer(const std::string_view text)
 {
-	if (!_question.active)
+	if (_questions.empty())
 		return false;
 
 	const auto first = text.find_first_not_of(" \t\r\n");
@@ -504,7 +641,7 @@ bool agent_host::try_answer(const std::string_view text)
 
 	const auto value = pf::stoi(digits);
 
-	if (value < 1 || static_cast<size_t>(value) > _question.option_ids.size())
+	if (value < 1 || static_cast<size_t>(value) > _questions.front().option_ids.size())
 		return false;
 
 	answer(static_cast<size_t>(value) - 1);
@@ -513,30 +650,33 @@ bool agent_host::try_answer(const std::string_view text)
 
 void agent_host::answer(const size_t index)
 {
-	if (!_question.active || index >= _question.option_ids.size())
+	if (_questions.empty() || index >= _questions.front().option_ids.size())
 		return;
 
-	const auto chosen = _question.option_ids[index];
-	const auto kind = _question.kind;
+	const auto question = _questions.front();
+	_questions.erase(_questions.begin());
 
-	_question.active = false;
+	const auto& chosen = question.option_ids[index];
+
 	tick_last_question(index);
 
-	if (kind == question_kind::model)
+	if (question.kind == question_kind::model)
 	{
 		apply_model(chosen);
-		return;
+	}
+	else if (_client)
+	{
+		auto outcome = json::object();
+		outcome.set("outcome", "selected");
+		outcome.set("optionId", chosen);
+		_client->respond(question.id, json::object().set("outcome", std::move(outcome)));
 	}
 
-	if (!_client)
-		return;
+	present_front_question();
 
-	auto outcome = json::object();
-	outcome.set("outcome", "selected");
-	outcome.set("optionId", chosen);
-	_client->respond(_question.id, json::object().set("outcome", std::move(outcome)));
-
-	set_status(busy() ? "Working... /s to stop" : "Ready");
+	// present_front_question owns the status while anything is still waiting
+	if (_questions.empty())
+		set_status(busy() ? "Working... /s to stop" : "Ready");
 }
 
 // Tick the choice in the file, so the record matches what was sent

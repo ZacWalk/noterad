@@ -58,6 +58,11 @@ namespace agent_session
 	[[nodiscard]] options read_options(std::span<const std::string> lines,
 	                                   const std::vector<agent_entry>& entries);
 
+	// The conversation so far, rendered for an agent that was not there for it. Bounded to
+	// 'max_bytes' keeping the most recent entries, because only the tail still informs the
+	// next turn. Local chatter — the session block, notes and thinking — is left out.
+	[[nodiscard]] std::string transcript_digest(std::span<const std::string> lines, size_t max_bytes);
+
 	// Escapes a line that would otherwise be read as a heading
 	[[nodiscard]] std::string escape_body_line(std::string_view line);
 
@@ -159,4 +164,8 @@ namespace agent_session
 {
 	// Applies one session/update payload to the file. 'update' is params["update"].
 	void apply_update(std::vector<std::string>& lines, agent_stream_state& state, const json::value& update);
+
+	// Marks every tool call still shown as pending or running as cancelled, for a turn the
+	// agent is abandoning and will therefore never report on again
+	void mark_unfinished_tools_cancelled(std::vector<std::string>& lines, agent_stream_state& state);
 }

@@ -2113,15 +2113,61 @@ void app_state::ensure_agent_host()
 	_agent_sink = std::make_shared<agent_sink>(*this);
 	_agent_host = std::make_unique<agent_host>(*_agent_sink);
 	_agent_host->on_clear = [this] { clear_agent_session(); };
+	_agent_host->gather_context = [this] { return agent_context(); };
+}
+
+// Only what the agent cannot discover for itself: which file is in front of the user, and where
+std::string app_state::agent_context() const
+{
+	const auto item = _active_item;
+
+	if (!item || !item->doc || item == _session_item)
+		return {};
+
+	const auto& doc = item->doc;
+	const auto root = _root_folder ? _root_folder->path.view() : std::string_view{};
+	auto shown = item->path.view();
+
+	if (!root.empty() && shown.size() > root.size() && pf::icmp(shown.substr(0, root.size()), root) == 0)
+	{
+		shown.remove_prefix(root.size());
+
+		while (!shown.empty() && (shown.front() == '\\' || shown.front() == '/'))
+			shown.remove_prefix(1);
+	}
+
+	const auto selection = doc->selection();
+	auto result = std::format("- open file: `{}`{}\n- caret: line {}\n", shown,
+	                          is_path_modified(item) ? " (unsaved changes)" : "",
+	                          selection._start.y + 1);
+
+	if (!doc->has_selection())
+		return result;
+
+	auto selected = doc->copy();
+
+	// A selection is a pointer to what matters, not a way to send the whole file
+	if (selected.size() > max_agent_selection_bytes)
+	{
+		const auto cut = selected.rfind('\n', max_agent_selection_bytes);
+		selected.erase(cut == std::string::npos ? max_agent_selection_bytes : cut);
+		selected += "\n[selection truncated]";
+	}
+
+	result += std::format("- selected lines {}-{}:\n\n```\n{}\n```\n", selection._start.y + 1,
+	                      selection._end.y + 1, selected);
+
+	return result;
 }
 
 void app_state::on_agent_input(std::string text)
 {
 	ensure_agent_host();
-	_agent_host->set_working_dir(_root_folder ? _root_folder->path : pf::current_directory());
 	reload_session_if_changed();
-	// The file is the transcript, so whatever it holds now is what the agent continues from
+	// Only the visible record; a new agent session is given it as history, a live one already has it
 	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
+	// After adopting, so anything this writes lands on the lines the document actually holds
+	_agent_host->set_working_dir(_root_folder ? _root_folder->path : pf::current_directory());
 	_agent_follow_tail = true; // whatever you just sent should be the thing you can see
 	_agent_host->submit(text);
 }

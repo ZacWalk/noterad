@@ -46,6 +46,13 @@ public:
 	// The transcript document belongs to the app, so clearing it is the app's job
 	std::function<void()> on_clear;
 
+	// What the editor can see and the agent cannot: the open file and any selection.
+	// Asked once per prompt, on the UI thread, and sent ahead of it.
+	std::function<std::string()> gather_context;
+
+	// How much earlier conversation a fresh agent process is given
+	static constexpr size_t max_history_bytes = 16 * 1024;
+
 	// Injectable so tests never launch a real process
 	using spawn_function = std::function<pf::child_process_ptr(const pf::file_path& exe,
 	                                                           std::span<const std::string> args,
@@ -61,8 +68,9 @@ public:
 	// Takes the transcript the document currently holds, so edits made between turns are kept
 	void adopt(std::vector<std::string> lines);
 
-	// The folder the agent runs in. Must be set before the first message.
-	void set_working_dir(pf::file_path dir) { _working_dir = std::move(dir); }
+	// The folder the agent runs in. Changing it after the agent started replaces the
+	// session, because cwd is fixed when the session is created.
+	void set_working_dir(pf::file_path dir);
 
 	[[nodiscard]] bool connected() const;
 	[[nodiscard]] bool busy() const;
@@ -74,9 +82,11 @@ public:
 	void stop_turn();
 	void shutdown();
 
-	// Answers the pending question, if there is one
+	// Answers the question at the head of the queue, if there is one
 	void answer(size_t index);
-	[[nodiscard]] bool awaiting_answer() const { return _question.active; }
+	[[nodiscard]] bool awaiting_answer() const { return !_questions.empty(); }
+	[[nodiscard]] size_t queued_prompt_count() const { return _queued_prompts.size(); }
+	[[nodiscard]] size_t pending_question_count() const { return _questions.size(); }
 
 
 	// Exposed for tests: drives the protocol without a process
@@ -87,37 +97,47 @@ public:
 private:
 	enum class question_kind { permission, model };
 
+	// An agent can ask several things at once, so they wait in turn rather than
+	// overwriting each other — an unanswered request would hang the agent forever
 	struct pending_question
 	{
 		question_kind kind = question_kind::permission;
 		acp::request_id id = 0; // only meaningful for a permission question
 		std::vector<std::string> option_ids;
-		bool active = false;
+		std::string title;
+		std::string body;
+		bool shown = false;
 	};
 
 	events& _events;
 	std::vector<std::string> _lines;
 	agent_stream_state _stream;
 	std::vector<advertised_command> _commands;
-	pending_question _question;
+	std::vector<pending_question> _questions;
 	pf::child_process_ptr _process;
 	std::unique_ptr<acp::transport> _wire;
 	std::unique_ptr<acp::client> _client;
 	pf::file_path _working_dir;
 	std::string _status;
-	std::string _queued_prompt;
+	std::vector<std::string> _queued_prompts;
+	std::string _history; // earlier conversation, waiting to be given to a fresh session
+	bool _history_sent = false;
 	bool _yolo = false;
 	bool _models_wanted = false; // /m arrived before the session existed
 
 	void ensure_started();
 	void wire_client();
 	void send_or_queue(std::string_view text);
+	void flush_queue();
+	[[nodiscard]] std::string build_preamble();
 
 	void note(agent_entry_kind kind, std::string_view title, std::string_view body);
 	void mutate(const std::function<void()>& change);
 	void set_status(std::string text);
 
 	void ask_permission(acp::request_id id, const json::value& params);
+	void present_front_question();
+	void cancel_questions(bool permission_only);
 	void show_models();
 	void apply_model(std::string_view model_id);
 	void tick_last_question(size_t index);

@@ -69,7 +69,9 @@ namespace acp
 		// The agent has gone away; every pending request fails
 		void on_disconnect(std::string_view reason);
 
-		[[nodiscard]] bool send_prompt(std::string_view text);
+		// 'preamble' rides in front of the prompt as its own text block, for context the
+		// agent cannot see for itself. Empty means the prompt is sent on its own.
+		[[nodiscard]] bool send_prompt(std::string_view text, std::string_view preamble = {});
 		void cancel();
 		[[nodiscard]] bool set_model(std::string_view model_id);
 
@@ -83,6 +85,7 @@ namespace acp
 		[[nodiscard]] std::string_view session_id() const { return _session_id; }
 		[[nodiscard]] std::span<const model_info> models() const { return _models; }
 		[[nodiscard]] std::string_view current_model_id() const { return _current_model_id; }
+		[[nodiscard]] int negotiated_version() const { return _negotiated_version; }
 		[[nodiscard]] size_t pending_request_count() const { return _pending.size(); }
 		[[nodiscard]] size_t pending_reply_count() const { return _awaiting_reply.size(); }
 
@@ -105,6 +108,7 @@ namespace acp
 		std::string _session_id;
 		std::vector<model_info> _models;
 		std::string _current_model_id;
+		int _negotiated_version = protocol_version;
 		request_id _next_id = 1;
 		request_id _next_reply_handle = 1;
 		request_id _prompt_id = 0;

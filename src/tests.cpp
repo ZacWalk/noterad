@@ -3670,6 +3670,69 @@ static void should_stop_a_running_turn()
 	should::is_equal_true(sink.text().find("cancelled") != std::string::npos, "recorded in the transcript");
 }
 
+// The protocol requires every outstanding permission request to be answered before a
+// cancelled turn can end, and a tool that is being abandoned to stop reading as running
+static void should_settle_everything_the_turn_left_open()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("long task");
+	const auto prompt_id = wire->last_id();
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"grep","status":"in_progress"}}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":91,"method":"session/request_permission","params":{"toolCall":{"title":"rm -rf"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+
+	// A second message typed while the agent worked, which stopping must not go on to send
+	host->submit("and then this");
+	should::is_equal(size_t{1}, host->queued_prompt_count(), "queued behind the turn");
+
+	host->submit("/s");
+
+	const auto answered = std::ranges::find_if(wire->sent, [](const std::string& line)
+	{
+		return json::parse(line).root["id"].integer(0) == 91;
+	});
+
+	should::is_equal_true(answered != wire->sent.end(), "the permission request was answered");
+	should::is_equal("cancelled", json::parse(*answered).root["result"]["outcome"]["outcome"].text(),
+	                 "answered with the cancelled outcome, not an error");
+	should::is_equal(false, host->awaiting_answer(), "nothing left to ask");
+	should::is_equal(size_t{0}, host->queued_prompt_count(), "the queue was discarded");
+	should::is_equal_true(sink.text().find("### Tool: grep (cancelled)") != std::string::npos,
+	                      "the abandoned tool no longer reads as running");
+
+	// Ending the turn must not resurrect the discarded message
+	const auto sent_before = wire->sent.size();
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal(sent_before, wire->sent.size(), "no queued message followed the cancel");
+}
+
+// Re-adopting the transcript mid-turn must not lose where the running tool calls are
+static void should_keep_streaming_across_a_queued_message()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("go");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t9","title":"build","status":"in_progress"}}})");
+
+	// What the app does on every submit: hand back the lines the document now holds
+	host->adopt(sink.lines);
+	host->submit("and this too");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"t9","status":"completed"}}})");
+
+	should::is_equal_true(sink.text().find("### Tool: build (completed)") != std::string::npos,
+	                      "the running tool still knew which line was its own");
+}
+
 // /m with no argument offers the agent's models; the reply picks one
 static void should_offer_a_model_choice()
 {
@@ -3703,6 +3766,7 @@ static void should_offer_a_model_choice()
 	const auto answered = sink.text();
 	should::is_equal_true(answered.find("- [x] 2. Deep") != std::string::npos, "choice ticked in the file");
 	should::is_equal_true(answered.find("model: deep") != std::string::npos, "recorded in the session block");
+	should::is_equal("Ready", sink.status, "the status stops asking once it is answered");
 }
 
 static void should_report_a_lost_agent()
@@ -3718,6 +3782,252 @@ static void should_report_a_lost_agent()
 	should::is_equal(false, host->busy(), "no turn in flight");
 	should::is_equal("Not connected", sink.status, "status reports it");
 	should::is_equal_true(sink.text().find("the agent stopped") != std::string::npos, "written to the transcript");
+}
+
+// A new agent process was not there for the conversation, so it is given it once
+// Only what a new agent can use: the exchange, most recent first to be cut, and never the settings
+static void should_digest_a_transcript()
+{
+	const auto lines = agent_session::to_lines(
+		"<!-- rethinkify agent session v1 -->\n\n## Session\n- model: fast\n- yolo: on\n\n"
+		"## You\n\nfirst question\n\n## Agent\n\nfirst answer\n\n"
+		"## Thinking\n\nprivate musing\n\n## You\n\nsecond question\n\n## Agent\n\nsecond answer\n");
+
+	const auto whole = agent_session::transcript_digest(lines, 4096);
+	should::is_equal_true(whole.find("first question") != std::string::npos, "keeps the exchange");
+	should::is_equal_true(whole.find("second answer") != std::string::npos, "keeps the latest reply");
+	should::is_equal_true(whole.find("private musing") == std::string::npos, "drops thinking");
+	should::is_equal_true(whole.find("yolo") == std::string::npos, "drops the settings block");
+	should::is_equal_true(whole.find("[earlier turns omitted]") == std::string::npos, "nothing omitted");
+
+	// A budget too small to hold it all keeps the end, which is the part still in play
+	const auto trimmed = agent_session::transcript_digest(lines, 64);
+	should::is_equal_true(trimmed.size() <= 64 + 32, "held to the budget");
+	should::is_equal_true(trimmed.find("second answer") != std::string::npos, "keeps the most recent");
+	should::is_equal_true(trimmed.find("first question") == std::string::npos, "drops the oldest");
+	should::is_equal_true(trimmed.find("[earlier turns omitted]") != std::string::npos, "says what it cut");
+
+	should::is_equal_true(agent_session::transcript_digest({}, 4096).empty(), "nothing to say about nothing");
+}
+
+// An agent speaking a protocol this build does not know is refused, not half-driven
+static void should_refuse_a_newer_protocol()
+{
+	{
+		recording_transport wire;
+		acp::client client(wire);
+		complete_handshake(client, wire);
+
+		should::is_equal(acp::protocol_version, client.negotiated_version(), "a version we speak is recorded");
+		should::is_equal_true(client.ready(), "and the session is made");
+	}
+
+	recording_transport wire;
+	acp::client client(wire);
+
+	std::string failure;
+	client.on_error = [&failure](const std::string_view message) { failure = message; };
+
+	client.start("C:\\work");
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":99}}}})", wire.last_id()));
+
+	should::is_equal_true(failure.find("v99") != std::string::npos, "names the version it cannot speak");
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal(size_t{1}, wire.sent.size(), "session/new never sent");
+}
+
+static void should_replay_earlier_conversation_to_a_new_session()
+{
+	collecting_sink sink;
+	auto host = std::make_unique<agent_host>(sink);
+	auto owned = std::make_unique<recording_transport>();
+	auto* wire = owned.get();
+
+	host->adopt(agent_session::to_lines(
+		"<!-- rethinkify agent session v1 -->\n\n## Session\n- model: fast\n\n"
+		"## You\n\nrename the widget\n\n## Thinking\n\nnoise nobody needs\n\n"
+		"## Agent\n\nRenamed it in widget.cpp.\n"));
+
+	host->connect(std::move(owned), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1"}}}})",
+	                                wire->last_id()));
+
+	host->submit("now update the tests");
+
+	const auto blocks = wire->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "history rides ahead of the prompt");
+
+	const auto history = blocks[0]["text"].text();
+	should::is_equal_true(history.find("rename the widget") != std::string_view::npos, "earlier prompt replayed");
+	should::is_equal_true(history.find("Renamed it in widget.cpp.") != std::string_view::npos, "earlier reply replayed");
+	should::is_equal_true(history.find("noise nobody needs") == std::string_view::npos, "thinking left out");
+	should::is_equal_true(history.find("model: fast") == std::string_view::npos, "settings left out");
+	should::is_equal_true(history.find("history") != std::string_view::npos, "says it is history, not a request");
+	should::is_equal("now update the tests", blocks[1]["text"].text(), "the prompt itself comes last");
+
+	// The live session remembers the rest of the turn, so it is never given it twice
+	const auto prompt_id = wire->last_id();
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+	host->submit("and the docs");
+
+	should::is_equal(size_t{1}, wire->last()["params"]["prompt"].size(), "second prompt carries no history");
+}
+
+// A dead agent loses everything it knew, so its replacement is told the conversation again
+static void should_replay_the_conversation_after_the_agent_dies()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("first question");
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})",
+	                                wire->last_id()));
+	host->on_agent_exit(1);
+
+	// Nothing can be sent without a process, so the next attempt is what proves the intent
+	auto second = std::make_unique<recording_transport>();
+	auto* wire2 = second.get();
+	host->connect(std::move(second), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire2->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s2"}}}})",
+	                                wire2->last_id()));
+
+	host->submit("second question");
+
+	const auto blocks = wire2->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "the replacement is told what it missed");
+	should::is_equal_true(blocks[0]["text"].text().find("first question") != std::string_view::npos,
+	                      "the earlier turn is in it");
+}
+
+// Two tool calls at once must not overwrite each other, or the first would never be answered
+static void should_queue_questions_asked_at_once()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"toolCall":{"title":"read a.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":42,"method":"session/request_permission","params":{"toolCall":{"title":"delete b.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	should::is_equal(size_t{2}, host->pending_question_count(), "both are waiting");
+
+	// Only one question is in the file, so a number can only mean the one on screen
+	should::is_equal_true(sink.text().find("read a.txt") != std::string::npos, "the first is asked");
+	should::is_equal_true(sink.text().find("delete b.txt") == std::string::npos, "the second waits its turn");
+
+	host->submit("1");
+
+	const auto first_reply = wire->last();
+	should::is_equal(41, static_cast<int>(first_reply["id"].integer()), "the first request is answered");
+	should::is_equal("yes", first_reply["result"]["outcome"]["optionId"].text(), "with the chosen option");
+	should::is_equal_true(sink.text().find("delete b.txt") != std::string::npos, "the second is now asked");
+
+	host->submit("2");
+
+	const auto second_reply = wire->last();
+	should::is_equal(42, static_cast<int>(second_reply["id"].integer()), "the second request is answered");
+	should::is_equal("no", second_reply["result"]["outcome"]["optionId"].text(), "with its own option");
+	should::is_equal(false, host->awaiting_answer(), "nothing left waiting");
+}
+
+// Clearing throws away the questions, so the agent has to be told they will never be answered
+static void should_refuse_pending_questions_when_cleared()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":51,"method":"session/request_permission","params":{"toolCall":{"title":"read a.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":52,"method":"session/request_permission","params":{"toolCall":{"title":"read b.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+
+	should::is_equal(size_t{2}, host->pending_question_count(), "both waiting");
+
+	host->submit("/clear");
+
+	should::is_equal(false, host->awaiting_answer(), "nothing left waiting");
+
+	auto refused = 0;
+
+	for (const auto& line : wire->sent)
+	{
+		const auto message = json::parse(line).root;
+
+		if (message["id"].integer() != 51 && message["id"].integer() != 52)
+			continue;
+
+		// The protocol spells an abandoned permission request 'cancelled', not an error
+		if (message["result"]["outcome"]["outcome"].text() == "cancelled")
+			++refused;
+	}
+
+	should::is_equal(2, refused, "every dropped question was answered");
+}
+
+// A second message while the agent is working is kept, not refused
+static void should_queue_prompts_while_the_agent_works()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("first");
+	const auto prompt_id = wire->last_id();
+	const auto sent = wire->sent.size();
+
+	host->submit("second");
+	should::is_equal(size_t{1}, host->queued_prompt_count(), "held until the turn ends");
+	should::is_equal(sent, wire->sent.size(), "nothing sent mid-turn");
+	should::is_equal_true(sink.status.find("queued") != std::string::npos, "the status says so");
+	should::is_equal_true(sink.text().find("second") != std::string::npos, "still recorded in the transcript");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+
+	const auto followed = wire->last();
+	should::is_equal("session/prompt", followed["method"].text(), "the queued message follows");
+	should::is_equal("second", followed["params"]["prompt"][0]["text"].text(), "and it is the one that waited");
+	should::is_equal(size_t{0}, host->queued_prompt_count(), "queue drained");
+}
+
+// cwd is fixed when the session is made, so a new folder has to mean a new session
+static void should_start_a_new_session_when_the_folder_changes()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->set_working_dir(pf::file_path{"C:\\work"});
+	should::is_equal_true(host->connected(), "the same folder changes nothing");
+
+	host->set_working_dir(pf::file_path{"C:\\other"});
+	should::is_equal(false, host->connected(), "the old session is dropped");
+	should::is_equal_true(sink.text().find("C:\\other") != std::string::npos, "and it is written down");
+}
+
+// What the user is looking at is sent with every prompt, since it changes between them
+static void should_send_editor_context_with_a_prompt()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->gather_context = [] { return std::string("- open file: `src/app.cpp`\n- caret: line 12\n"); };
+
+	host->submit("explain this");
+
+	const auto blocks = wire->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "context rides ahead of the prompt");
+	should::is_equal_true(blocks[0]["text"].text().find("src/app.cpp") != std::string_view::npos,
+	                      "the open file is named");
+	should::is_equal("explain this", blocks[1]["text"].text(), "the prompt itself is untouched");
 }
 
 static void should_serve_agent_file_requests()
@@ -3930,9 +4240,27 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should patch only the tail while streaming",
 	                    should_patch_only_the_tail_while_streaming);
 	tests.register_test("should ask before running a tool", should_ask_before_running_a_tool);
+	tests.register_test("should queue questions asked at once", should_queue_questions_asked_at_once);
+	tests.register_test("should refuse pending questions when cleared",
+	                    should_refuse_pending_questions_when_cleared);
+	tests.register_test("should queue prompts while the agent works",
+	                    should_queue_prompts_while_the_agent_works);
+	tests.register_test("should replay earlier conversation to a new session",
+	                    should_replay_earlier_conversation_to_a_new_session);
+	tests.register_test("should replay the conversation after the agent dies",
+	                    should_replay_the_conversation_after_the_agent_dies);
+	tests.register_test("should start a new session when the folder changes",
+	                    should_start_a_new_session_when_the_folder_changes);
+	tests.register_test("should send editor context with a prompt", should_send_editor_context_with_a_prompt);
+	tests.register_test("should digest a transcript", should_digest_a_transcript);
+	tests.register_test("should refuse a newer protocol", should_refuse_a_newer_protocol);
 	tests.register_test("should answer a question by selection", should_answer_a_question_by_selection);
 	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
 	tests.register_test("should stop a running turn", should_stop_a_running_turn);
+	tests.register_test("should settle everything the turn left open",
+	                    should_settle_everything_the_turn_left_open);
+	tests.register_test("should keep streaming across a queued message",
+	                    should_keep_streaming_across_a_queued_message);
 	tests.register_test("should offer a model choice", should_offer_a_model_choice);
 	tests.register_test("should report a lost agent", should_report_a_lost_agent);
 	tests.register_test("should serve agent file requests", should_serve_agent_file_requests);

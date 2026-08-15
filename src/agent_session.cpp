@@ -250,6 +250,78 @@ namespace agent_session
 		return result;
 	}
 
+	std::string transcript_digest(const std::span<const std::string> lines, const size_t max_bytes)
+	{
+		std::vector<std::string> blocks;
+
+		for (const auto& entry : parse(lines))
+		{
+			// Notes and thinking are local chatter, and the session block is settings
+			if (entry.kind == agent_entry_kind::session || entry.kind == agent_entry_kind::note ||
+				entry.kind == agent_entry_kind::thought)
+				continue;
+
+			std::string block;
+
+			for (auto i = entry.first_line; i < entry.last_line && i < static_cast<int>(lines.size()); ++i)
+			{
+				if (block.empty() && is_blank(lines[i]))
+					continue;
+
+				block += lines[i];
+				block += '\n';
+			}
+
+			while (!block.empty() && (block.back() == '\n' || block.back() == ' '))
+				block.pop_back();
+
+			if (!block.empty())
+				blocks.push_back(std::move(block));
+		}
+
+		// Taken from the end, since the most recent exchange is the part that still matters
+		size_t total = 0;
+		size_t first = blocks.size();
+
+		while (first > 0)
+		{
+			const auto cost = blocks[first - 1].size() + 2;
+
+			if (total + cost > max_bytes && first < blocks.size())
+				break;
+
+			total += cost;
+			--first;
+
+			if (total >= max_bytes)
+				break;
+		}
+
+		std::string result;
+
+		if (first > 0)
+			result = "[earlier turns omitted]\n\n";
+
+		for (auto i = first; i < blocks.size(); ++i)
+		{
+			result += blocks[i];
+			result += "\n\n";
+		}
+
+		while (!result.empty() && result.back() == '\n')
+			result.pop_back();
+
+		// One enormous entry can still overrun the budget, so cut it back on a line boundary
+		if (result.size() > max_bytes)
+		{
+			const auto cut = result.find('\n', result.size() - max_bytes);
+			result = std::format("[earlier turns omitted]\n\n{}",
+			                     cut == std::string::npos ? std::string_view{} : std::string_view(result).substr(cut + 1));
+		}
+
+		return result;
+	}
+
 	std::string escape_body_line(const std::string_view line)
 	{
 		return looks_like_heading(line) ? "\\" + std::string(line) : std::string(line);
@@ -657,5 +729,27 @@ namespace agent_session
 
 			state.entry_open = false;
 		}
+	}
+
+	void mark_unfinished_tools_cancelled(std::vector<std::string>& lines, agent_stream_state& state)
+	{
+		state.dirty_from = -1;
+
+		for (const auto& line : state.tool_lines | std::views::values)
+		{
+			if (line < 0 || line >= static_cast<int>(lines.size()) || !lines[line].starts_with(tool_prefix))
+				continue;
+
+			const auto heading = std::string_view(lines[line]);
+
+			if (!heading.ends_with("(pending)") && !heading.ends_with("(in_progress)"))
+				continue;
+
+			set_tool_status(lines, line, "cancelled");
+			state.dirty_from = state.dirty_from < 0 ? line : std::min(state.dirty_from, line);
+		}
+
+		// The ids are kept, so a status the agent still sends after cancelling can correct this
+		state.entry_open = false;
 	}
 }

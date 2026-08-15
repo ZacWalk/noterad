@@ -143,17 +143,29 @@ Offset (8 hex digits) | 16 bytes | ASCII.
 
 The agent pane hosts **GitHub Copilot CLI** as a child process (`copilot --acp --stdio`) and speaks the **Agent Client Protocol** to it — JSON-RPC 2.0 as newline-delimited JSON over the process's standard streams. The CLI owns authentication, model routing, MCP servers and the agent loop; Rethinkify is the client. `pf::find_executable` resolves `copilot` through PATHEXT only and never searches the current directory, so a file planted in the folder you opened cannot be launched in its place.
 
-The process starts on the first message, not at startup, because it is by far the largest thing in the address space — a Node single-file binary that costs a few hundred megabytes, against about thirteen for the editor itself.
+The process starts on the first message, not at startup, because it is by far the largest thing in the address space — a Node single-file binary that costs a few hundred megabytes, against about thirteen for the editor itself. The `initialize` reply names the protocol version the agent will speak; anything newer than this build understands is refused there rather than half-driven.
 
 ### The transcript is a file
 
-The conversation is `session.md` in the root folder: a real file, one per folder, loaded when the folder opens and reloaded when it changes underneath. That single decision provides history across restarts, an editable record the agent then continues from, undo of an agent turn, and markdown preview of the conversation — all from machinery that already existed.
+The conversation is `session.md` in the root folder: a real file, one per folder, loaded when the folder opens and reloaded when it changes underneath. That single decision provides history across restarts, an editable record, undo of an agent turn, and markdown preview of the conversation — all from machinery that already existed.
 
 The lines are authoritative and an `agent_entry` only describes a range of them, so serialising is byte-exact by construction. Parsing is total: anything unrecognised stays in the entry it appears in, so a hand-edited file can never fail to load. Only exact role headings (`## You`, `## Agent`, `## Session`, `## Thinking`, `## Error`) open an entry — otherwise the markdown headings an agent writes would split its own replies — and a body line that would look like one is escaped with a backslash. Options are markdown task-list items, so ticking one by hand does what clicking it does.
 
 Streamed output patches only the lines it touched, so a token costs one line re-layout rather than a document rebuild. The file is written when the transcript settles, never per token. **This is the one deliberate exception to "no background writes"**: one write per turn, to a file you can see, caused by something you asked for. Older history rolls into `session-<stamp>.md` before the document size cap can be reached.
 
 The transcript has its own `document_events` sink. Sharing `app_state` would route its edits to the document pane and corrupt that pane's word-wrap cache.
+
+### The file is ours, the memory is the agent's
+
+An ACP session lives in the agent process, so the transcript on disk and what the agent recalls are two different things. They part company whenever the process is new and the file is not: after a restart, after the agent dies, and after the folder changes — `cwd` is fixed when the session is created, so a new root folder has to mean a new session.
+
+Rather than show a full conversation to an agent that remembers none of it, `agent_host` gives a new session what it missed. `transcript_digest` renders the file back to prose — the exchange only, never the session block, local notes or thinking — keeps the most recent **16 KB** because only the tail still bears on the next turn, and rides in front of the first prompt of that session as its own content block, labelled as history rather than as a request. Edits you made to the file by hand travel with it, which is what makes the transcript worth editing. A live session is never told twice.
+
+`session/load` would be the protocol's own answer, and is deliberately not used: it replays the whole conversation back as `session/update` notifications, which this design would write into the file a second time. The digest costs one block and works against agents that never implement it.
+
+Each prompt also carries what the editor can see and the agent cannot — the open file, whether it has unsaved changes, the caret line, and up to **4 KB** of the selection. `app_state::agent_context` gathers it on the UI thread through `agent_host::gather_context`, so "explain this" means something.
+
+A turn is one prompt at a time. A message typed while the agent is working joins a queue and goes when the turn ends, and questions queue the same way: an agent that asks two things at once has both recorded, but only the one at the head is written to the file, so a typed number can only ever mean the question on screen. Anything still queued when the agent dies is reported as lost rather than sent to its replacement.
 
 ### The prompt is the editor again
 

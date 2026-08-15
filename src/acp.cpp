@@ -50,11 +50,22 @@ namespace acp
 		params.set("clientCapabilities", std::move(client_caps));
 
 		send_request("initialize", std::move(params),
-		             [this](const json::value&, const json::value* error)
+		             [this](const json::value& result, const json::value* error)
 		             {
 			             if (error)
 			             {
 				             fail(std::format("initialize failed: {}", (*error)["message"].text("unknown error")));
+				             return;
+			             }
+
+			             // The agent answers with the version it will speak, which can only be one
+			             // this build already understands
+			             _negotiated_version = static_cast<int>(result["protocolVersion"].integer(protocol_version));
+
+			             if (_negotiated_version > protocol_version)
+			             {
+				             fail(std::format("the agent speaks protocol v{}, this build speaks v{}",
+				                              _negotiated_version, protocol_version));
 				             return;
 			             }
 
@@ -113,16 +124,24 @@ namespace acp
 		}
 	}
 
-	bool client::send_prompt(const std::string_view text)
+	bool client::send_prompt(const std::string_view text, const std::string_view preamble)
 	{
 		if (!ready() || turn_in_flight())
 			return false;
 
+		auto prompt = json::array();
+
+		if (!preamble.empty())
+		{
+			auto lead = json::object();
+			lead.set("type", "text");
+			lead.set("text", preamble);
+			prompt.add(std::move(lead));
+		}
+
 		auto block = json::object();
 		block.set("type", "text");
 		block.set("text", text);
-
-		auto prompt = json::array();
 		prompt.add(std::move(block));
 
 		auto params = json::object();

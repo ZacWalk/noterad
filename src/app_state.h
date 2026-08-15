@@ -85,6 +85,9 @@ public:
 	void show_agent_panel(bool visible);
 	void focus_agent_input();
 	void on_agent_input(std::string text);
+
+	// The open document, its caret and its selection, for the agent's next prompt
+	[[nodiscard]] std::string agent_context() const;
 	void on_agent_answer(size_t index);
 	void clear_agent_session();
 	[[nodiscard]] index_item_ptr session_item();
@@ -116,6 +119,9 @@ public:
 
 	// Files the agent reads or writes are capped, so a huge file cannot exhaust memory
 	static constexpr uint32_t max_agent_file_size = 8 * 1024 * 1024;
+
+	// A selection is context, not a delivery mechanism for the whole file
+	static constexpr size_t max_agent_selection_bytes = 4 * 1024;
 
 	[[nodiscard]] bool agent_path_allowed(const pf::file_path& path, std::string& error) const;
 	bool agent_read_file(const pf::file_path& path, std::string& content, std::string& error);
