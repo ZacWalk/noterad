@@ -13,6 +13,9 @@ public:
 
 	std::function<void(std::string)> on_submit;
 
+	// Raised when a click lands on one of the pending question's options
+	std::function<void(size_t)> on_answer;
+
 	explicit agent_view(app_events& events) : read_only_doc_view(events)
 	{
 	}
@@ -161,14 +164,53 @@ public:
 	uint32_t handle_mouse(pf::window_frame_ptr window, const pf::mouse_message_type msg,
 	                      const pf::mouse_params& params) override
 	{
-		// A click anywhere in the pane focuses it; the input is always the keyboard target
-		if (msg == pf::mouse_message_type::left_button_down && params.point.y >= _view_extent.cy)
+		if (msg == pf::mouse_message_type::left_button_down)
 		{
+			// A click anywhere in the pane focuses it; the input is always the keyboard target
 			window->set_focus();
-			return 0;
+
+			if (params.point.y >= _view_extent.cy)
+				return 0;
+
+			if (answer_at(params.point))
+				return 0;
 		}
 
 		return read_only_doc_view::handle_mouse(window, msg, params);
+	}
+
+	// The pending question is always the last one, so an old block cannot be answered twice
+	[[nodiscard]] bool answer_at(const pf::ipoint& point)
+	{
+		if (!_doc || !on_answer)
+			return false;
+
+		const auto line = client_to_line(point);
+
+		if (line < 0 || line >= static_cast<int>(_doc->size()))
+			return false;
+
+		const auto lines = agent_session::to_lines(_doc->str());
+		const auto entries = agent_session::parse(lines);
+
+		for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+		{
+			if (entry->kind != agent_entry_kind::question)
+				continue;
+
+			for (size_t i = 0; i < entry->options.size(); ++i)
+			{
+				if (entry->options[i].line == line)
+				{
+					on_answer(i);
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		return false;
 	}
 
 private:

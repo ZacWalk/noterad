@@ -81,6 +81,7 @@ public:
 	void show_agent_panel(bool visible);
 	void focus_agent_input();
 	void on_agent_input(std::string text);
+	void on_agent_answer(size_t index);
 	void clear_agent_session();
 	[[nodiscard]] bool agent_has_focus() const;
 	[[nodiscard]] index_item_ptr session_item();

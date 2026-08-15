@@ -570,6 +570,7 @@ app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared
 	_root_folder = std::make_shared<index_item>();
 	_doc_view->set_document(active_item()->doc);
 	_agent_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
+	_agent_view->on_answer = [this](const size_t index) { on_agent_answer(index); };
 	get_commands().set_commands(make_commands());
 }
 
@@ -2046,10 +2047,15 @@ void app_state::on_agent_input(std::string text)
 	ensure_agent_host();
 	_agent_host->set_working_dir(_root_folder ? _root_folder->path : pf::current_directory());
 	reload_session_if_changed();
-
 	// The file is the transcript, so whatever it holds now is what the agent continues from
 	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
 	_agent_host->submit(text);
+}
+
+void app_state::on_agent_answer(const size_t index)
+{
+	if (_agent_host)
+		_agent_host->answer(index);
 }
 
 void app_state::clear_agent_session()

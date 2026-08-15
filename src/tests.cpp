@@ -3477,6 +3477,34 @@ static void should_ask_before_running_a_tool()
 	should::is_equal(1, question->chosen_option(), "second option ticked");
 }
 
+// Clicking an option answers it, which is the same path as typing its number
+static void should_answer_a_question_by_selection()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	should::is_equal(false, host->awaiting_answer(), "nothing pending");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":21,"method":"session/request_permission","params":{"toolCall":{"title":"write file"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	should::is_equal_true(host->awaiting_answer(), "waiting for an answer");
+
+	host->answer(0);
+
+	const auto reply = wire->last();
+	should::is_equal(21, static_cast<int>(reply["id"].integer()), "answers the request");
+	should::is_equal("yes", reply["result"]["outcome"]["optionId"].text(), "the option selected");
+	should::is_equal(false, host->awaiting_answer(), "no longer waiting");
+
+	// A selection out of range, or a second answer, changes nothing
+	const auto count = wire->sent.size();
+	host->answer(0);
+	host->answer(99);
+	should::is_equal(count, wire->sent.size(), "ignored once answered");
+}
+
 static void should_auto_approve_only_in_yolo_mode()
 {
 	collecting_sink sink;
@@ -3742,6 +3770,7 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should patch only the tail while streaming",
 	                    should_patch_only_the_tail_while_streaming);
 	tests.register_test("should ask before running a tool", should_ask_before_running_a_tool);
+	tests.register_test("should answer a question by selection", should_answer_a_question_by_selection);
 	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
 	tests.register_test("should stop a running turn", should_stop_a_running_turn);
 	tests.register_test("should report a lost agent", should_report_a_lost_agent);

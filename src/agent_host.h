@@ -64,6 +64,10 @@ public:
 	void stop_turn();
 	void shutdown();
 
+	// Answers the pending question, if there is one
+	void answer(size_t index);
+	[[nodiscard]] bool awaiting_answer() const { return _question.active; }
+
 	// Exposed for tests: drives the protocol without a process
 	void connect(std::unique_ptr<acp::transport> wire, const pf::file_path& working_dir);
 	void on_agent_line(std::string_view line);

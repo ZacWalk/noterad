@@ -462,6 +462,11 @@ bool agent_host::try_answer(const std::string_view text)
 	return true;
 }
 
+void agent_host::answer(const size_t index)
+{
+	answer_question(index);
+}
+
 void agent_host::answer_question(const size_t index)
 {
 	if (!_question.active || index >= _question.option_ids.size() || !_client)
