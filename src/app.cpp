@@ -1757,7 +1757,7 @@ void app_state::apply_transcript_change(const int first, const std::span<const s
 		_agent_view->scroll_to_end();
 }
 
-// agent_sink — Connects the host's transcript edits and status to the pane
+// agent_sink — Connects the host's transcript edits, status and file access to the app
 class agent_sink final : public agent_host::events
 {
 public:
@@ -1777,7 +1777,124 @@ public:
 		_app._agent_status = status;
 		_app.invalidate(invalid::agent_layout);
 	}
+
+	bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+	{
+		return _app.agent_read_file(path, content, error);
+	}
+
+	bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+	{
+		return _app.agent_write_file(path, content, error);
+	}
 };
+
+// The agent may only touch the folder that is open, checked after canonicalisation
+bool app_state::agent_path_allowed(const pf::file_path& path, std::string& error) const
+{
+	if (path.empty())
+	{
+		error = "no path was given";
+		return false;
+	}
+
+	const auto root = _root_folder ? _root_folder->path : pf::file_path{};
+
+	if (root.empty())
+	{
+		error = "no folder is open";
+		return false;
+	}
+
+	if (!pf::is_path_within(root, path))
+	{
+		error = std::format("'{}' is outside the open folder", path.view());
+		return false;
+	}
+
+	return true;
+}
+
+bool app_state::agent_read_file(const pf::file_path& path, std::string& content, std::string& error)
+{
+	if (!agent_path_allowed(path, error))
+		return false;
+
+	// An open document may hold unsaved work, which is what the agent should see
+	if (const auto item = find_item_recursively(_root_folder, path); item && item->doc)
+	{
+		content = item->doc->str();
+		return true;
+	}
+
+	const auto file = pf::open_for_read(path);
+
+	if (!file)
+	{
+		error = std::format("could not open '{}'", path.view());
+		return false;
+	}
+
+	const auto size = file->size();
+
+	if (size > max_agent_file_size)
+	{
+		error = std::format("'{}' is too large to read", path.view());
+		return false;
+	}
+
+	content.resize(size);
+	uint32_t read = 0;
+
+	if (size > 0 && !file->read(reinterpret_cast<uint8_t*>(content.data()), size, &read))
+	{
+		error = std::format("could not read '{}'", path.view());
+		return false;
+	}
+
+	content.resize(read);
+	return true;
+}
+
+bool app_state::agent_write_file(const pf::file_path& path, const std::string_view content, std::string& error)
+{
+	if (!agent_path_allowed(path, error))
+		return false;
+
+	// An open document takes the change through undo, so it can be reviewed and reversed
+	if (const auto item = find_item_recursively(_root_folder, path); item && item->doc)
+	{
+		const auto& doc = item->doc;
+
+		if (doc->is_read_only())
+		{
+			error = std::format("'{}' is read only", path.view());
+			return false;
+		}
+
+		{
+			undo_group ug(doc);
+			doc->replace_text(ug, doc->all(), content);
+		}
+
+		invalidate(invalid::doc | invalid::files_layout | invalid::app_title);
+		return true;
+	}
+
+	const auto file = pf::open_file_for_write(path);
+
+	if (!file)
+	{
+		error = std::format("could not write '{}'", path.view());
+		return false;
+	}
+
+	if (!content.empty())
+		file->write(reinterpret_cast<const uint8_t*>(content.data()), static_cast<uint32_t>(content.size()));
+
+	invalidate(invalid::index);
+	return true;
+}
 
 void app_state::ensure_agent_host()
 {

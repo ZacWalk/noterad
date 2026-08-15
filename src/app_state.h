@@ -97,6 +97,13 @@ public:
 	void apply_transcript_change(int first, std::span<const std::string> replacement);
 	void ensure_agent_host();
 
+	// Files the agent reads or writes are capped, so a huge file cannot exhaust memory
+	static constexpr uint32_t max_agent_file_size = 8 * 1024 * 1024;
+
+	[[nodiscard]] bool agent_path_allowed(const pf::file_path& path, std::string& error) const;
+	bool agent_read_file(const pf::file_path& path, std::string& content, std::string& error);
+	bool agent_write_file(const pf::file_path& path, std::string_view content, std::string& error);
+
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);
 

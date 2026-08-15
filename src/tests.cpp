@@ -3248,6 +3248,8 @@ struct collecting_sink final : agent_host::events
 {
 	std::vector<std::string> lines;
 	std::string status;
+	std::map<std::string, std::string> files;
+	bool refuse_files = false;
 
 	void transcript_changed(const int first, const std::span<const std::string> replacement) override
 	{
@@ -3258,6 +3260,38 @@ struct collecting_sink final : agent_host::events
 	}
 
 	void agent_status_changed(const std::string_view text) override { status = text; }
+
+	bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+	{
+		if (refuse_files)
+		{
+			error = "outside the open folder";
+			return false;
+		}
+
+		const auto found = files.find(std::string(path.view()));
+
+		if (found == files.end())
+		{
+			error = "no such file";
+			return false;
+		}
+
+		content = found->second;
+		return true;
+	}
+
+	bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+	{
+		if (refuse_files)
+		{
+			error = "outside the open folder";
+			return false;
+		}
+
+		files[std::string(path.view())] = content;
+		return true;
+	}
 
 	[[nodiscard]] std::string text() const { return agent_session::to_text(lines); }
 };
@@ -3332,6 +3366,16 @@ static void should_patch_only_the_tail_while_streaming()
 		}
 
 		void agent_status_changed(const std::string_view text) override { inner.agent_status_changed(text); }
+
+		bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+		{
+			return inner.read_file(path, content, error);
+		}
+
+		bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+		{
+			return inner.write_file(path, content, error);
+		}
 	};
 
 	watching_sink watcher(sink, smallest_first);
@@ -3448,6 +3492,114 @@ static void should_report_a_lost_agent()
 	should::is_equal_true(sink.text().find("the agent stopped") != std::string::npos, "written to the transcript");
 }
 
+static void should_serve_agent_file_requests()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	sink.files["C:\\work\\a.txt"] = "one\ntwo\nthree\nfour";
+
+	// The capabilities we advertised are what make the agent ask us at all
+	const auto init = wire->message(0);
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["readTextFile"].boolean(), "reads offered");
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["writeTextFile"].boolean(), "writes offered");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt"}})");
+	should::is_equal("one\ntwo\nthree\nfour", wire->last()["result"]["content"].text(), "whole file");
+
+	// A window into the file, counted in 1-based lines
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":6,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt","line":2,"limit":2}})");
+	should::is_equal("two\nthree", wire->last()["result"]["content"].text(), "line window");
+
+	// A window running past the end is clamped rather than failing
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":7,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt","line":4,"limit":99}})");
+	should::is_equal("four", wire->last()["result"]["content"].text(), "clamped window");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":8,"method":"fs/write_text_file","params":{"path":"C:\\work\\b.txt","content":"written"}})");
+	should::is_equal("written", sink.files["C:\\work\\b.txt"], "file written");
+	should::is_equal_true(wire->last()["error"].is_null(), "reported success");
+
+	// A refused path is an error the agent can act on, not silence
+	sink.refuse_files = true;
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{"path":"C:\\elsewhere\\secrets"}})");
+	should::is_equal(acp::error_code::invalid_request, static_cast<int>(wire->last()["error"]["code"].integer()),
+	                 "refusal reported");
+	should::is_equal_true(wire->last()["error"]["message"].text().find("outside") != std::string_view::npos,
+	                      "says why");
+
+	// An unknown request still gets an answer
+	host->on_agent_line(R"({"jsonrpc":"2.0","id":10,"method":"terminal/create","params":{}})");
+	should::is_equal(acp::error_code::method_not_found, static_cast<int>(wire->last()["error"]["code"].integer()),
+	                 "unsupported method refused");
+}
+
+// The agent must not be able to reach outside the folder that is open
+static void should_refuse_agent_paths_outside_the_root()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+
+	const auto root_item = std::make_shared<index_item>(root, root.name(), true);
+	state->set_root(root_item);
+
+	std::string error;
+	should::is_equal_true(state->agent_path_allowed(root.combine("inside.txt"), error), "inside is allowed");
+	should::is_equal_true(state->agent_path_allowed(root.combine("sub").combine("deep.txt"), error),
+	                      "nested is allowed");
+
+	should::is_equal(false, state->agent_path_allowed(pf::file_path{"C:\\Windows\\system.ini"}, error),
+	                 "elsewhere is refused");
+	should::is_equal_true(!error.empty(), "refusal explains itself");
+
+	// Traversal is resolved before the check, so it cannot escape
+	should::is_equal(false, state->agent_path_allowed(root.combine("..").combine("escaped.txt"), error),
+	                 "parent traversal refused");
+	should::is_equal(false, state->agent_path_allowed(pf::file_path{}, error), "empty path refused");
+
+	pf::platform_recycle_file(root);
+}
+
+// An agent edit to an open file goes through undo, and its reads see unsaved work
+static void should_route_agent_edits_through_the_document()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	const auto path = root.combine("code.txt");
+	write_test_text_file(path, "original");
+
+	const auto root_item = std::make_shared<index_item>(root, root.name(), true);
+	const auto item = std::make_shared<index_item>(path, path.name(), false,
+	                                               std::make_shared<document>(null_ev, "unsaved edit"));
+	root_item->children.push_back(item);
+	state->set_root(root_item);
+
+	std::string content;
+	std::string error;
+
+	should::is_equal_true(state->agent_read_file(path, content, error), "read allowed");
+	should::is_equal("unsaved edit", content, "serves the open document, not the disk");
+
+	should::is_equal_true(state->agent_write_file(path, "agent wrote this", error), "write allowed");
+	should::is_equal("agent wrote this", item->doc->str(), "document updated");
+	should::is_equal_true(item->doc->is_modified(), "shows as modified");
+
+	item->doc->undo();
+	should::is_equal("unsaved edit", item->doc->str(), "the edit can be undone");
+
+	// A read-only document refuses the write outright
+	item->doc->read_only(true);
+	should::is_equal(false, state->agent_write_file(path, "nope", error), "read only refused");
+	should::is_equal_true(error.find("read only") != std::string::npos, "says why");
+
+	pf::platform_recycle_file(root);
+}
+
 tests::run_result run_all_tests_result(){
 	tests tests;
 
@@ -3546,6 +3698,11 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
 	tests.register_test("should stop a running turn", should_stop_a_running_turn);
 	tests.register_test("should report a lost agent", should_report_a_lost_agent);
+	tests.register_test("should serve agent file requests", should_serve_agent_file_requests);
+	tests.register_test("should refuse agent paths outside the root",
+	                    should_refuse_agent_paths_outside_the_root);
+	tests.register_test("should route agent edits through the document",
+	                    should_route_agent_edits_through_the_document);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);

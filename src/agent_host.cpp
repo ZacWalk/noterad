@@ -87,7 +87,7 @@ void agent_host::connect(std::unique_ptr<acp::transport> wire, const pf::file_pa
 	_client = std::make_unique<acp::client>(*_wire);
 	wire_client();
 	set_status("Starting the agent...");
-	_client->start(working_dir.view());
+	_client->start(working_dir.view(), {.read_text_file = true, .write_text_file = true});
 }
 
 void agent_host::wire_client()
@@ -143,6 +143,59 @@ void agent_host::wire_client()
 	{
 		ask_permission(id, params);
 	};
+
+	_client->on_request = [this](const acp::request_id id, const std::string_view method,
+	                             const json::value& params)
+	{
+		if (method == "fs/read_text_file")
+			handle_read_file(id, params);
+		else if (method == "fs/write_text_file")
+			handle_write_file(id, params);
+		else
+			_client->respond_error(id, acp::error_code::method_not_found,
+			                       std::format("unsupported method '{}'", method));
+	};
+}
+
+void agent_host::handle_read_file(const acp::request_id id, const json::value& params)
+{
+	const pf::file_path path{params["path"].text()};
+	std::string content;
+	std::string error;
+
+	if (!_events.read_file(path, content, error))
+	{
+		_client->respond_error(id, acp::error_code::invalid_request, error);
+		return;
+	}
+
+	// A window into the file, counted in 1-based lines
+	if (params.contains("line") || params.contains("limit"))
+	{
+		const auto all = agent_session::to_lines(content);
+		const auto first = std::max<int64_t>(1, params["line"].integer(1)) - 1;
+		const auto limit = params["limit"].integer(static_cast<int64_t>(all.size()));
+		const auto start = std::min<size_t>(static_cast<size_t>(first), all.size());
+		const auto count = limit <= 0 ? size_t{0} : std::min<size_t>(static_cast<size_t>(limit), all.size() - start);
+
+		content = agent_session::to_text(std::span(all).subspan(start, count));
+	}
+
+	_client->respond(id, json::object().set("content", std::move(content)));
+}
+
+void agent_host::handle_write_file(const acp::request_id id, const json::value& params)
+{
+	const pf::file_path path{params["path"].text()};
+	std::string error;
+
+	if (!_events.write_file(path, params["content"].text(), error))
+	{
+		_client->respond_error(id, acp::error_code::invalid_request, error);
+		return;
+	}
+
+	_client->respond(id, json::object());
 }
 
 void agent_host::ensure_started()

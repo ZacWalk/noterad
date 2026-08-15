@@ -15,6 +15,11 @@ public:
 		// Replaces transcript lines from 'first' onwards with 'replacement'
 		virtual void transcript_changed(int first, std::span<const std::string> replacement) = 0;
 		virtual void agent_status_changed(std::string_view status) = 0;
+
+		// The agent's file access, so its reads see unsaved work and its writes are undoable.
+		// Both refuse a path outside the root folder.
+		virtual bool read_file(const pf::file_path& path, std::string& content, std::string& error) = 0;
+		virtual bool write_file(const pf::file_path& path, std::string_view content, std::string& error) = 0;
 	};
 
 	explicit agent_host(events& sink) : _events(sink)
@@ -91,5 +96,7 @@ private:
 	void answer_question(size_t index);
 	[[nodiscard]] bool try_answer(std::string_view text);
 
+	void handle_read_file(acp::request_id id, const json::value& params);
+	void handle_write_file(acp::request_id id, const json::value& params);
 	void handle_command(const agent_command_parse& parsed, std::string_view raw);
 };
