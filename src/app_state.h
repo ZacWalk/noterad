@@ -104,6 +104,17 @@ public:
 	bool agent_read_file(const pf::file_path& path, std::string& content, std::string& error);
 	bool agent_write_file(const pf::file_path& path, std::string_view content, std::string& error);
 
+	// Older history is moved aside before the transcript can reach the document size cap
+	static constexpr size_t max_session_bytes = 1024 * 1024;
+
+	uint64_t _session_saved_time = 0;
+	bool _session_listed = false;
+
+	[[nodiscard]] std::string load_session_text(const pf::file_path& path);
+	void reload_session_if_changed();
+	void save_session();
+	void roll_over_long_session();
+
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);
 

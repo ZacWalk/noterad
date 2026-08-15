@@ -490,6 +490,33 @@ namespace
 		const auto result = std::from_chars(text.data(), end, out);
 		return result.ec == std::errc{} && result.ptr == end;
 	}
+
+	// Reads a whole text file, dropping a UTF-8 BOM. Refuses anything larger than 'max_bytes'.
+	bool read_file_text(const pf::file_path& path, std::string& out, const uint32_t max_bytes)
+	{
+		const auto file = pf::open_for_read(path);
+
+		if (!file)
+			return false;
+
+		const auto size = file->size();
+
+		if (size > max_bytes)
+			return false;
+
+		out.resize(size);
+		uint32_t read = 0;
+
+		if (size > 0 && !file->read(reinterpret_cast<uint8_t*>(out.data()), size, &read))
+			return false;
+
+		out.resize(read);
+
+		if (out.starts_with("\xEF\xBB\xBF"))
+			out.erase(0, 3);
+
+		return true;
+	}
 }
 
 // agent_doc_events — Routes the session document's events to the agent pane.
@@ -1655,7 +1682,7 @@ void app_state::show_agent_panel(const bool visible)
 	if (_agent_window)
 		_agent_window->show(visible);
 
-	if (visible && _agent_view && !_session_item)
+	if (visible && _agent_view)
 	{
 		_agent_view->set_document(session_item()->doc);
 		_agent_view->layout();
@@ -1685,25 +1712,136 @@ void app_state::focus_agent_input()
 
 index_item_ptr app_state::session_item()
 {
-	if (_session_item)
-		return _session_item;
-
 	if (!_agent_doc_events)
 		_agent_doc_events = std::make_shared<agent_doc_events>(*this);
 
-	const auto folder = _root_folder && !_root_folder->path.empty()
-		                    ? _root_folder->path
-		                    : pf::current_directory();
+	// One transcript per root folder, so switching folders switches conversation
+	const auto folder = _root_folder ? _root_folder->path : pf::file_path{};
+	const auto path = folder.empty() ? pf::file_path{} : folder.combine(agent_session::file_name);
+
+	if (_session_item && _session_item->path == path)
+		return _session_item;
+
+	_session_item = std::make_shared<index_item>(path, std::string(agent_session::file_name), false);
+	_session_item->doc = std::make_shared<document>(*_agent_doc_events, load_session_text(path));
+	_session_item->doc->path(path);
+	_session_saved_time = pf::file_modified_time(path);
+	_session_listed = false;
+
+	if (_agent_view)
+	{
+		_agent_view->set_document(_session_item->doc);
+		_agent_view->layout();
+	}
+
+	return _session_item;
+}
+
+// Reads the transcript from disk, falling back to a fresh one. Auto-approval is never
+// resumed from a file, so a session that had it on comes back with it off.
+std::string app_state::load_session_text(const pf::file_path& path)
+{
+	std::string text;
+
+	if (read_file_text(path, text, max_agent_file_size) && !text.empty())
+	{
+		auto lines = agent_session::to_lines(text);
+
+		if (agent_session::read_options(lines, agent_session::parse(lines)).yolo)
+		{
+			agent_session::set_option(lines, "yolo", "off");
+			agent_session::append_entry(lines, agent_entry_kind::note, {},
+			                            "This session had YOLO on. It has been turned off — "
+			                            "use /yolo to turn it back on.");
+			text = agent_session::to_text(lines);
+		}
+
+		return text;
+	}
 
 	std::vector<std::string> lines;
 	agent_session::ensure_header(lines);
+	return agent_session::to_text(lines);
+}
 
-	_session_item = std::make_shared<index_item>(folder.combine(agent_session::file_name),
-	                                             std::string(agent_session::file_name), false);
-	_session_item->doc = std::make_shared<document>(*_agent_doc_events, agent_session::to_text(lines));
-	_session_item->doc->path(_session_item->path);
+// The transcript is a file the user may edit, so a newer copy on disk wins
+void app_state::reload_session_if_changed()
+{
+	if (!_session_item)
+		return;
 
-	return _session_item;
+	const auto modified = pf::file_modified_time(_session_item->path);
+
+	if (modified == 0 || modified == _session_saved_time)
+		return;
+
+	std::string text;
+
+	if (!read_file_text(_session_item->path, text, max_agent_file_size))
+		return;
+
+	const auto& doc = _session_item->doc;
+	{
+		undo_group ug(doc);
+		doc->replace_text(ug, doc->all(), text);
+	}
+
+	_session_saved_time = modified;
+	invalidate(invalid::agent_layout);
+}
+
+void app_state::save_session()
+{
+	// Without an open folder there is nowhere to put it, so the transcript stays in memory
+	if (!_session_item || !_session_item->doc || _session_item->path.empty())
+		return;
+
+	roll_over_long_session();
+
+	if (_session_item->doc->save_to_file(_session_item->path))
+	{
+		_session_saved_time = pf::file_modified_time(_session_item->path);
+
+		// The file may be new, so the folder browser needs to learn about it
+		if (!_session_listed)
+		{
+			_session_listed = true;
+			invalidate(invalid::index);
+		}
+	}
+}
+
+// A long conversation would eventually hit the document size cap, so the old part is
+// moved aside rather than silently lost
+void app_state::roll_over_long_session()
+{
+	const auto& doc = _session_item->doc;
+	auto text = doc->str();
+
+	if (text.size() <= max_session_bytes)
+		return;
+
+	const auto stamp = pf::file_modified_time(_session_item->path);
+	const auto archive = _session_item->path.folder().combine(
+		std::format("session-{}", stamp == 0 ? 1 : stamp), "md");
+
+	if (const auto file = pf::open_file_for_write(archive))
+	{
+		file->write(reinterpret_cast<const uint8_t*>(text.data()), static_cast<uint32_t>(text.size()));
+
+		std::vector<std::string> lines;
+		agent_session::ensure_header(lines);
+		agent_session::append_entry(lines, agent_entry_kind::note, {},
+		                            std::format("Earlier history moved to {}.", archive.name()));
+
+		undo_group ug(doc);
+		doc->replace_text(ug, doc->all(), agent_session::to_text(lines));
+
+		if (_agent_host)
+			_agent_host->adopt(agent_session::to_lines(doc->str()));
+
+		invalidate(invalid::index | invalid::agent_layout);
+	}
 }
 
 void app_state::append_agent_lines(const std::vector<std::string>& lines)
@@ -1787,6 +1925,8 @@ public:
 	{
 		return _app.agent_write_file(path, content, error);
 	}
+
+	void transcript_settled() override { _app.save_session(); }
 };
 
 // The agent may only touch the folder that is open, checked after canonicalisation
@@ -1835,24 +1975,12 @@ bool app_state::agent_read_file(const pf::file_path& path, std::string& content,
 		return false;
 	}
 
-	const auto size = file->size();
-
-	if (size > max_agent_file_size)
-	{
-		error = std::format("'{}' is too large to read", path.view());
-		return false;
-	}
-
-	content.resize(size);
-	uint32_t read = 0;
-
-	if (size > 0 && !file->read(reinterpret_cast<uint8_t*>(content.data()), size, &read))
+	if (!read_file_text(path, content, max_agent_file_size))
 	{
 		error = std::format("could not read '{}'", path.view());
 		return false;
 	}
 
-	content.resize(read);
 	return true;
 }
 
@@ -1909,6 +2037,7 @@ void app_state::ensure_agent_host()
 void app_state::on_agent_input(std::string text)
 {
 	ensure_agent_host();
+	reload_session_if_changed();
 
 	// The file is the transcript, so whatever it holds now is what the agent continues from
 	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
@@ -1917,17 +2046,21 @@ void app_state::on_agent_input(std::string text)
 
 void app_state::clear_agent_session()
 {
-	_session_item.reset();
+	const auto item = session_item();
 
-	if (_agent_host)
-		_agent_host->adopt({});
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
 
-	if (_agent_view)
+	// Cleared in place rather than replaced, so Ctrl+Z brings the conversation back
 	{
-		_agent_view->set_document(session_item()->doc);
-		_agent_view->layout();
+		undo_group ug(item->doc);
+		item->doc->replace_text(ug, item->doc->all(), agent_session::to_text(lines));
 	}
 
+	if (_agent_host)
+		_agent_host->adopt(lines);
+
+	save_session();
 	invalidate(invalid::agent_layout);
 }
 

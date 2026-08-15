@@ -78,6 +78,8 @@ void agent_host::note(const agent_entry_kind kind, const std::string_view title,
 		agent_session::append_entry(_lines, kind, title, body);
 		_stream.entry_open = false;
 	});
+
+	_events.transcript_settled();
 }
 
 void agent_host::connect(std::unique_ptr<acp::transport> wire, const pf::file_path& working_dir)
@@ -132,6 +134,7 @@ void agent_host::wire_client()
 			note(agent_entry_kind::note, {}, std::format("Turn ended: {}", acp::to_string(reason)));
 
 		set_status("Ready");
+		_events.transcript_settled();
 	};
 
 	_client->on_permission_request = [this](const acp::request_id id, const json::value& params)

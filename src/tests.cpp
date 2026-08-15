@@ -3192,6 +3192,11 @@ static void should_grow_agent_input_to_six_rows()
 static void should_keep_the_session_document_separate_from_the_editor()
 {
 	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
+	state->ensure_agent_host();
+	state->_agent_host->locate = [] { return pf::file_path{}; };
+
 	const auto editor_doc = state->doc();
 
 	const auto session = state->session_item();
@@ -3205,11 +3210,15 @@ static void should_keep_the_session_document_separate_from_the_editor()
 	should::is_equal(editor_lines, static_cast<int>(editor_doc->size()), "editor untouched");
 	should::is_equal_true(static_cast<int>(session->doc->size()) > editor_lines, "transcript grew");
 	should::is_equal_true(state->doc() == editor_doc, "active document unchanged");
+
+	pf::platform_recycle_file(root);
 }
 
 static void should_handle_agent_slash_commands_in_the_panel()
 {
 	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
 	state->ensure_agent_host();
 
 	// Tests must never launch the real agent
@@ -3229,18 +3238,48 @@ static void should_handle_agent_slash_commands_in_the_panel()
 	should::is_equal_true(text.find("do the thing") != std::string::npos, "user turn recorded");
 	should::is_equal_true(text.find("Could not find") != std::string::npos, "missing agent reported");
 
-	const auto entries = agent_session::parse(agent_session::to_lines(text));
-	const auto user_entries = std::ranges::count_if(entries, [](const agent_entry& e)
-	{
-		return e.kind == agent_entry_kind::user;
-	});
-	should::is_equal_true(user_entries >= 1, "user entry present");
+	// The transcript is a real file, written where the folder is open
+	const auto path = root.combine(agent_session::file_name);
+	should::is_equal_true(path.exists(), "written to disk");
 
-	// Clearing starts a fresh transcript
+	// Clearing empties it, on disk as well as on screen
 	state->on_agent_input("/clear");
 	text = state->session_item()->doc->str();
 	should::is_equal_true(text.find("do the thing") == std::string::npos, "history cleared");
 	should::is_equal_true(text.starts_with(agent_session::file_header), "header restored");
+
+	// Undo brings the conversation back, because clearing is an ordinary edit
+	state->session_item()->doc->undo();
+	should::is_equal_true(state->session_item()->doc->str().find("do the thing") != std::string::npos,
+	                      "clear can be undone");
+
+	pf::platform_recycle_file(root);
+}
+
+// A conversation survives closing the folder, but auto-approval is never resumed silently
+static void should_reload_the_transcript_and_reset_yolo()
+{
+	const auto root = create_temp_test_root();
+	const auto path = root.combine(agent_session::file_name);
+
+	write_test_text_file(path,
+	                     "<!-- rethinkify agent session v1 -->\n\n"
+	                     "## Session\n- model: gpt-5\n- yolo: on\n\n"
+	                     "## You\n\nearlier question\n");
+
+	const auto state = create_test_app();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
+
+	const auto text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("earlier question") != std::string::npos, "history restored");
+
+	const auto lines = agent_session::to_lines(text);
+	const auto options = agent_session::read_options(lines, agent_session::parse(lines));
+	should::is_equal("gpt-5", options.model, "model restored");
+	should::is_equal(false, options.yolo, "auto approval not resumed");
+	should::is_equal_true(text.find("YOLO") != std::string::npos, "and says so");
+
+	pf::platform_recycle_file(root);
 }
 
 // collecting_sink — Records what the host writes, standing in for the pane
@@ -3292,6 +3331,10 @@ struct collecting_sink final : agent_host::events
 		files[std::string(path.view())] = content;
 		return true;
 	}
+
+	void transcript_settled() override { ++settled_count; }
+
+	int settled_count = 0;
 
 	[[nodiscard]] std::string text() const { return agent_session::to_text(lines); }
 };
@@ -3376,6 +3419,8 @@ static void should_patch_only_the_tail_while_streaming()
 		{
 			return inner.write_file(path, content, error);
 		}
+
+		void transcript_settled() override { inner.transcript_settled(); }
 	};
 
 	watching_sink watcher(sink, smallest_first);
@@ -3691,6 +3736,8 @@ tests::run_result run_all_tests_result(){
 	                    should_keep_the_session_document_separate_from_the_editor);
 	tests.register_test("should handle agent slash commands in the panel",
 	                    should_handle_agent_slash_commands_in_the_panel);
+	tests.register_test("should reload the transcript and reset yolo",
+	                    should_reload_the_transcript_and_reset_yolo);
 	tests.register_test("should run an agent turn", should_run_an_agent_turn);
 	tests.register_test("should patch only the tail while streaming",
 	                    should_patch_only_the_tail_while_streaming);

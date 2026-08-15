@@ -20,6 +20,9 @@ public:
 		// Both refuse a path outside the root folder.
 		virtual bool read_file(const pf::file_path& path, std::string& content, std::string& error) = 0;
 		virtual bool write_file(const pf::file_path& path, std::string_view content, std::string& error) = 0;
+
+		// The transcript has reached a resting point and is worth writing to disk
+		virtual void transcript_settled() = 0;
 	};
 
 	explicit agent_host(events& sink) : _events(sink)

@@ -105,6 +105,13 @@ public:
 		const auto shift = window->is_key_down(pk::Shift);
 		const auto control = window->is_key_down(pk::Control);
 
+		// Escape only moves focus, so it is safe to press while the agent is working
+		if (vk == pk::Escape)
+		{
+			_events.set_focus(view_focus::text);
+			return true;
+		}
+
 		if (vk == pk::Return)
 		{
 			if (shift)
