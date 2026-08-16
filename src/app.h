@@ -55,6 +55,9 @@ struct index_item
 	// Bumped by each async load so a stale read can be discarded when it completes
 	uint32_t load_generation = 0;
 
+	// Ordering for document eviction; higher is more recently opened
+	uint64_t last_used = 0;
+
 	index_item() = default;
 
 	index_item(pf::file_path p, std::string n, const bool folder,
@@ -180,6 +183,9 @@ public:
 	virtual void invalidate_lines(int start, int end) = 0;
 	// The text of these lines changed, so layout and highlighting must be redone
 	virtual void lines_changed(int start, int end) = 0;
+	// Lines were inserted after 'at' (delta > 0) or erased from 'at' + 1 (delta < 0).
+	// The text of line 'at' changed too.
+	virtual void line_count_changed(int at, int delta) = 0;
 	virtual void ensure_visible(const text_location& pt) = 0;
 };
 

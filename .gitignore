@@ -20,10 +20,10 @@
 *.pdb
 *.sdf
 /.vs
+/build/
 /intermediate/
 /exe/*.ilk
 exe/*.log
-src/app.vcxproj.filters
 exe/*.ini
 /tmp/
 /exe/.env

@@ -116,5 +116,6 @@ protected:
 		}
 
 		_vscroll.draw(draw, scrollbar_rect());
+		draw_message_bar(draw);
 	}
 };

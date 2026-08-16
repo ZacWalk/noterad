@@ -202,24 +202,6 @@ struct edit_box
 		return false;
 	}
 
-	pf::ipoint caret_position(const pf::irect& box_rect, const int inner_pad,
-	                          const pf::isize& char_sz, const pf::font& font,
-	                          const pf::window_frame_ptr& w) const
-	{
-		const auto text_y = box_rect.top + (box_rect.height() - char_sz.cy) / 2;
-
-		if (text.empty() || cursor_pos == 0)
-		{
-			return {box_rect.left + inner_pad, text_y};
-		}
-		const auto mc = w->create_measure_context();
-		if (!mc)
-			return {box_rect.left + inner_pad, text_y};
-		const auto before = text.substr(0, cursor_pos);
-		const auto sz = mc->measure_text(before, font);
-		return {box_rect.left + inner_pad + sz.cx, text_y};
-	}
-
 	// --- Common drawing helpers for edit-box-based views ---
 
 	static void draw_border(pf::draw_context& dc, const pf::irect& box, const bool focused,
@@ -237,8 +219,9 @@ struct edit_box
 	                    const int char_cy, const pf::font& font) const
 	{
 		if (!has_selection()) return;
-		const auto before_sz = dc.measure_text(text.substr(0, sel_start()), font);
-		const auto sel_sz = dc.measure_text(text.substr(sel_start(), sel_end() - sel_start()), font);
+		const std::string_view view = text;
+		const auto before_sz = dc.measure_text(view.substr(0, sel_start()), font);
+		const auto sel_sz = dc.measure_text(view.substr(sel_start(), sel_end() - sel_start()), font);
 		dc.fill_solid_rect(pf::irect(text_x + before_sz.cx, text_y,
 		                             text_x + before_sz.cx + sel_sz.cx, text_y + char_cy),
 		                   pf::color_t(88, 88, 88));
@@ -249,7 +232,7 @@ struct edit_box
 	{
 		int caret_x = text_x;
 		if (!text.empty() && cursor_pos > 0)
-			caret_x += dc.measure_text(text.substr(0, cursor_pos), font).cx;
+			caret_x += dc.measure_text(std::string_view(text).substr(0, cursor_pos), font).cx;
 		const int caret_w = std::max(1, static_cast<int>(2 * dpi_scale));
 		dc.fill_solid_rect(caret_x, text_y, caret_w, char_cy, ui::text_color);
 	}
@@ -638,8 +621,7 @@ struct custom_scrollbar
 };
 
 
-// edit_box_widget — Composite of edit_box + caret_blinker for views with text input fields.
-// Encapsulates the common focus/timer/key/char wiring shared by search_list_view and console_view.
+// edit_box_widget — Composite of edit_box + caret_blinker for views with an inline text field.
 struct edit_box_widget
 {
 	edit_box edit;
@@ -705,9 +687,10 @@ namespace table_layout
 		return s.substr(start, end - start + 1);
 	}
 
-	inline std::vector<std::string_view> split_pipe_cells(const std::string_view line)
+	inline std::vector<std::string_view>& split_pipe_cells(std::vector<std::string_view>& cells,
+	                                                       const std::string_view line)
 	{
-		std::vector<std::string_view> cells;
+		cells.clear();
 		const auto len = static_cast<int>(line.size());
 		int pos = 0;
 
@@ -731,9 +714,10 @@ namespace table_layout
 		return cells;
 	}
 
-	inline std::vector<std::string_view> split_csv_cells(const std::string_view line)
+	inline std::vector<std::string_view>& split_csv_cells(std::vector<std::string_view>& cells,
+	                                                      const std::string_view line)
 	{
-		std::vector<std::string_view> cells;
+		cells.clear();
 		const auto len = static_cast<int>(line.size());
 		int pos = 0;
 
@@ -843,14 +827,16 @@ namespace table_layout
 		}
 	}
 
-	// Compute how many visual rows a cell needs when word-wrapped to col_w columns
+	// Compute how many visual rows a cell needs when word-wrapped to col_w columns.
+	// break_fn fills the caller's buffer so no allocation happens per cell.
 	template <typename BreakFn>
-	int cell_visual_rows(const std::string_view text, const int col_w, BreakFn&& break_fn)
+	int cell_visual_rows(const std::string_view text, const int col_w,
+	                     std::vector<int>& breaks, BreakFn&& break_fn)
 	{
+		breaks.clear();
 		if (text.empty() || col_w <= 0) return 1;
-		const auto cps = pf::utf8_codepoint_count(text);
-		if (cps <= col_w) return 1;
-		const auto breaks = break_fn(text, col_w);
+		if (pf::utf8_codepoint_count(text) <= col_w) return 1;
+		break_fn(breaks, text, col_w);
 		return static_cast<int>(breaks.size()) + 1;
 	}
 
@@ -861,14 +847,14 @@ namespace table_layout
 	                   const std::vector<std::string_view>& cells, const table_block& table,
 	                   const pf::font& font, const int font_cx, const int font_cy,
 	                   const bool is_header, const pf::color_t bg, const pf::color_t pipe_color,
-	                   const pf::color_t text_color, BreakFn&& break_fn)
+	                   const pf::color_t text_color, std::vector<int>& breaks, BreakFn&& break_fn)
 	{
 		// first pass: compute max visual rows across all cells
 		int max_rows = 1;
 		for (size_t col = 0; col < table.col_widths.size(); col++)
 		{
 			const auto cell_raw = col < cells.size() ? trim_cell(cells[col]) : std::string_view{};
-			const auto vr = cell_visual_rows(cell_raw, table.col_widths[col], break_fn);
+			const auto vr = cell_visual_rows(cell_raw, table.col_widths[col], breaks, break_fn);
 			if (vr > max_rows) max_rows = vr;
 		}
 
@@ -890,7 +876,7 @@ namespace table_layout
 			draw.fill_solid_rect(x, y, cell_px, row_height, bg);
 
 			// word-wrap the cell text
-			const auto breaks = break_fn(cell_raw, col_w);
+			break_fn(breaks, cell_raw, col_w);
 			const auto num_sub = static_cast<int>(breaks.size()) + 1;
 			const auto cell_len = static_cast<int>(cell_raw.size());
 
@@ -939,10 +925,12 @@ namespace table_layout
 		draw_pipe(draw, x, y, 1, font, font_cx, font_cy, pipe_color, bg);
 		x += font_cx;
 
+		std::string dashes;
+
 		for (const auto col_w : table.col_widths)
 		{
 			const auto dash_count = col_w + 2;
-			const std::string dashes(dash_count, u8'-');
+			dashes.assign(dash_count, u8'-');
 			const pf::irect dc{x, y, x + dash_count * font_cx, y + font_cy};
 			draw.draw_text(x, y, dc, dashes, font, pipe_color, bg);
 			x += dash_count * font_cx;

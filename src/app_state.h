@@ -5,6 +5,7 @@
 #include "app.h"
 #include "document.h"
 #include "commands.h"
+#include "gitignore.h"
 #include "ui.h"
 
 
@@ -32,6 +33,9 @@ public:
 	static constexpr size_t max_recent_root_folders = 8;
 	static constexpr uint32_t search_debounce_timer_id = 2001;
 	static constexpr uint32_t search_debounce_ms = 150;
+
+	// Unmodified documents past this count are dropped and reloaded on demand
+	static constexpr size_t max_resident_documents = 24;
 
 	pf::window_frame_ptr _app_window;
 	pf::window_frame_ptr _doc_window;
@@ -76,6 +80,7 @@ public:
 
 	void invalidate_lines(int start, int end) override;
 	void lines_changed(int start, int end) override;
+	void line_count_changed(int at, int delta) override;
 
 	void path_selected(const index_item_ptr& item) override
 	{
@@ -106,24 +111,19 @@ public:
 	void set_message(std::string text);
 
 	uint32_t handle_message(pf::window_frame_ptr window, pf::message_type msg,
-	                        uintptr_t wParam, intptr_t lParam) override;
+	                        const pf::message_params& params) override;
 
 	uint32_t handle_mouse(pf::window_frame_ptr window, pf::mouse_message_type msg,
 	                      const pf::mouse_params& params) override;
 
 	uint32_t on_create(const pf::window_frame_ptr& window);
 
-	uint32_t on_window_dpi_changed(const uintptr_t wParam, const intptr_t lParam)
+	uint32_t on_window_dpi_changed(const pf::message_params& params)
 	{
-		const auto scale_factor = (wParam & 0xFFFF) / static_cast<double>(96);
-		on_scale(scale_factor);
+		on_scale(params.dpi_scale);
 
-		const auto new_bounds = reinterpret_cast<pf::irect*>(lParam);
-
-		if (new_bounds)
-		{
-			_app_window->move_window(*new_bounds);
-		}
+		if (params.suggested_bounds.width() > 0)
+			_app_window->move_window(params.suggested_bounds);
 
 		_doc_window->notify_size();
 		_list_window->notify_size();
@@ -536,36 +536,90 @@ public:
 		return item;
 	}
 
+	// Reads a whole small file; used for .gitignore on the indexing thread
+	static std::string read_text_file(const pf::file_path& path)
+	{
+		const auto handle = pf::open_for_read(path);
+		if (!handle)
+			return {};
+
+		const auto size = handle->size();
+		if (size == 0 || size > 1024 * 1024)
+			return {};
+
+		std::string text(size, '\0');
+		uint32_t total = 0;
+
+		while (total < size)
+		{
+			uint32_t read = 0;
+			if (!handle->read(reinterpret_cast<uint8_t*>(text.data()) + total, size - total, &read) || read == 0)
+				break;
+			total += read;
+		}
+
+		text.resize(total);
+		return text;
+	}
+
 	static index_item_ptr load_index(const pf::file_path& root_path,
 	                                 const index_snapshot_map& existing)
 	{
 		index_item_ptr root = make_item(existing, root_path, true);
-		std::vector<index_item_ptr> folders_to_load{root};
+
+		struct pending_folder
+		{
+			index_item_ptr item;
+			std::string relative; // '/' separated, relative to the root, empty at the root
+		};
+
+		gitignore_rules ignores;
+		std::vector<pending_folder> folders_to_load{{root, {}}};
+
+		const auto join_relative = [](const std::string_view base, const std::string_view name)
+		{
+			return base.empty() ? std::string(name) : std::format("{}/{}", base, name);
+		};
 
 		while (!folders_to_load.empty())
 		{
 			const auto current = folders_to_load.back();
 			folders_to_load.pop_back();
 
-			const auto contents = pf::iterate_file_items(current->path, false);
-			current->children.clear();
+			// A folder's own .gitignore applies to everything below it
+			if (const auto text = read_text_file(current.item->path.combine(".gitignore")); !text.empty())
+				ignores.add_file(text, current.relative);
+
+			const auto contents = pf::iterate_file_items(current.item->path, false);
+			current.item->children.clear();
 
 			for (const auto& f : contents.folders)
 			{
+				const auto name = f.path.name();
+				if (pf::icmp(name, ".git") == 0)
+					continue;
+
+				const auto relative = join_relative(current.relative, name);
+				if (ignores.is_ignored(relative, true))
+					continue;
+
 				auto item = make_item(existing, f.path, true);
 				item->is_folder = true;
-				current->children.push_back(item);
-				folders_to_load.push_back(item);
+				current.item->children.push_back(item);
+				folders_to_load.push_back({item, relative});
 			}
 
 			for (const auto& f : contents.files)
 			{
+				if (ignores.is_ignored(join_relative(current.relative, f.path.name()), false))
+					continue;
+
 				auto item = make_item(existing, f.path, false);
 				item->is_folder = false;
-				current->children.push_back(item);
+				current.item->children.push_back(item);
 			}
 
-			std::ranges::sort(current->children, [](const index_item_ptr& l, const index_item_ptr& r)
+			std::ranges::sort(current.item->children, [](const index_item_ptr& l, const index_item_ptr& r)
 			{
 				if (l->is_folder != r->is_folder) return l->is_folder > r->is_folder;
 				return pf::icmp(l->name, r->name) < 0;
@@ -594,6 +648,7 @@ public:
 	};
 
 	using search_results_map = std::unordered_map<pf::file_path, std::vector<search_result>, pf::ihash>;
+	using path_set = std::unordered_set<pf::file_path, pf::ihash, pf::ieq>;
 
 	void execute_search(const std::string& text, std::function<void()> on_complete = {});
 	static search_results_map perform_search(const std::vector<search_input>& inputs, const std::string& text,
@@ -603,6 +658,21 @@ private:
 	bool _word_wrap = true;
 	std::string _pending_search_text;
 	std::atomic<uint32_t> _search_generation = 0;
+
+	// Bumped by any edit or reindex; a search may only be narrowed while it is unchanged
+	uint32_t _content_generation = 0;
+	uint32_t _searched_generation = 0;
+	std::string _searched_text;
+	std::vector<pf::file_path> _searched_matches;
+
+	uint64_t _use_counter = 0;
+
+public:
+	void note_content_changed() { ++_content_generation; }
+	void evict_unused_documents();
+	[[nodiscard]] size_t resident_document_count() const;
+
+private:
 
 	[[nodiscard]] std::string relative_name(const pf::file_path& path) const
 	{
@@ -654,19 +724,6 @@ private:
 		}
 	}
 
-	static index_item_ptr find_first_saved_file(const index_item_ptr& node)
-	{
-		if (!node) return nullptr;
-		if (!node->is_folder && node->path.is_save_path())
-			return node;
-		for (const auto& child : node->children)
-		{
-			if (auto found = find_first_saved_file(child))
-				return found;
-		}
-		return nullptr;
-	}
-
 	static std::vector<std::string> snapshot_document_lines(const document& d)
 	{
 		std::vector<std::string> lines;
@@ -684,15 +741,19 @@ private:
 
 	// Snapshots unsaved edits so the search worker never reads a live document.
 	// Unmodified documents match the file on disk, so the worker reads those instead.
-	static void collect_search_inputs(const std::vector<index_item_ptr>& items, std::vector<search_input>& inputs)
+	static void collect_search_inputs(const std::vector<index_item_ptr>& items, std::vector<search_input>& inputs,
+	                                  const path_set* only = nullptr)
 	{
 		for (const auto& item : items)
 		{
 			if (item->is_folder)
 			{
-				collect_search_inputs(item->children, inputs);
+				collect_search_inputs(item->children, inputs, only);
 				continue;
 			}
+
+			if (only && !only->contains(item->path))
+				continue;
 
 			search_input input;
 			input.path = item->path;
@@ -705,6 +766,18 @@ private:
 
 			inputs.push_back(std::move(input));
 		}
+	}
+
+	void collect_evictable_documents(const index_item_ptr& item, std::vector<index_item_ptr>& out) const
+	{
+		// Modified work is unsaved, and a generated document has a path but no matching file,
+		// so neither can be recovered by reloading
+		if (item->doc && item != _active_item && !item->doc->is_modified()
+			&& !item->doc->is_read_only() && item->path.exists())
+			out.push_back(item);
+
+		for (const auto& child : item->children)
+			collect_evictable_documents(child, out);
 	}
 
 	static void apply_search_results(const std::vector<index_item_ptr>& items,

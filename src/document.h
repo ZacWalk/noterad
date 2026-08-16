@@ -210,11 +210,6 @@ public:
 
 		return result;
 	}
-
-	[[nodiscard]] int line_count() const
-	{
-		return 1 + _end.y - _start.y;
-	}
 };
 
 class document_line
@@ -248,7 +243,6 @@ public:
 		return static_cast<size_t>(_byte_length);
 	}
 
-	int icmp(const document_line& other) const;
 	void render(std::string& out) const;
 	void update(std::string_view text);
 
@@ -379,6 +373,13 @@ class document : public std::enable_shared_from_this<document>
 
 	std::vector<document_line> _lines;
 	std::vector<undo_item> _undo;
+
+	// Reused by the measurement helpers below; they run per line on every layout and paint
+	mutable std::string _line_scratch;
+
+	// Reused by the edit paths so a keystroke does not allocate
+	std::string _edit_scratch;
+	std::string _edit_scratch2;
 
 	size_t _undo_pos = 0;
 	mutable size_t _saved_undo_pos = 0;
@@ -723,6 +724,13 @@ public:
 highlight_fn select_highlighter(doc_type type, const pf::file_path& path);
 
 // Spell checking helpers — thin wrappers around the platform spell checker.
+// Non-ASCII bytes count as word bytes, so a scan never stops inside a codepoint.
+inline bool is_spell_word_byte(const char ch)
+{
+	const auto b = static_cast<unsigned char>(ch);
+	return b >= 0x80 || isalnum(b) != 0;
+}
+
 bool spell_check_word(std::string_view word);
 std::vector<std::string> spell_suggest(std::string_view word);
 void spell_add_word(std::string_view word);

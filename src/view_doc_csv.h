@@ -8,6 +8,17 @@ class csv_doc_view final : public read_only_doc_view
 {
 	table_layout::table_block _table; // cached column layout for entire document
 
+	// Paint and layout scratch, reused across every row
+	mutable std::string _line_buf;
+	mutable std::vector<std::string_view> _cells;
+	mutable std::vector<int> _cell_breaks;
+
+	// Fills the caller's buffer, so wrapping a cell costs no allocation
+	static void cell_breaks(std::vector<int>& out, const std::string_view text, const int col_w)
+	{
+		calc_word_breaks_into(out, text, col_w, [](int, int) { return 1; });
+	}
+
 public:
 	csv_doc_view(app_events& events) : read_only_doc_view(events)
 	{
@@ -25,7 +36,8 @@ public:
 
 	void recalc_vert_scrollbar() override
 	{
-		_content_extent.cy = _font_extent.cy + _total_visual_rows * _font_extent.cy;
+		_content_extent.cy = top_content_padding() + _total_visual_rows * _font_extent.cy +
+			bottom_content_padding();
 
 		const int max_y = std::max(0, _content_extent.cy - (_view_extent.cy - text_top()));
 		if (_scroll_offset.y > max_y)
@@ -40,8 +52,6 @@ public:
 
 	void layout() override
 	{
-		reset_parse_cookies();
-
 		rebuild_table();
 
 		if (!_doc || _table.col_widths.empty())
@@ -59,26 +69,20 @@ public:
 		_wrap_line_y.resize(line_count + 1);
 		_wrap_line_y[0] = 0;
 
-		auto break_fn = [](const std::string_view text, const int col_w)
-		{
-			return calc_word_breaks(text, col_w, [](int, int) { return 1; });
-		};
-
 		int cumulative = 0;
-		std::string line_text;
 
 		for (int i = 0; i < line_count; i++)
 		{
 			_wrap_line_y[i] = cumulative;
 
-			(*_doc)[i].render(line_text);
-			const auto cells = table_layout::split_csv_cells(line_text);
+			(*_doc)[i].render(_line_buf);
+			table_layout::split_csv_cells(_cells, _line_buf);
 
 			int max_rows = 1;
-			for (size_t c = 0; c < _table.col_widths.size() && c < cells.size(); c++)
+			for (size_t c = 0; c < _table.col_widths.size() && c < _cells.size(); c++)
 			{
 				const auto vr = table_layout::cell_visual_rows(
-					table_layout::trim_cell(cells[c]), _table.col_widths[c], break_fn);
+					table_layout::trim_cell(_cells[c]), _table.col_widths[c], _cell_breaks, cell_breaks);
 				if (vr > max_rows) max_rows = vr;
 			}
 			cumulative += max_rows;
@@ -112,22 +116,17 @@ protected:
 
 		if (_table.col_widths.empty())
 		{
-			_vscroll.draw(draw, rcClient);
+			_vscroll.draw(draw, scrollbar_rect());
 			draw_message_bar(draw);
 			return;
 		}
-
-		auto break_fn = [](const std::string_view text, const int col_w)
-		{
-			return calc_word_breaks(text, col_w, [](int, int) { return 1; });
-		};
 
 		// Find first visible line
 		int nCurrentLine;
 		if (!_wrap_line_y.empty())
 		{
 			const int first_vrow = font_cy > 0
-				                       ? std::max(0, (_scroll_offset.y - font_cy) / font_cy)
+				                       ? std::max(0, (_scroll_offset.y - top_content_padding()) / font_cy)
 				                       : 0;
 			nCurrentLine = visual_row_to_line_index(first_vrow);
 		}
@@ -137,19 +136,18 @@ protected:
 		}
 
 		auto y = line_offset(nCurrentLine) - _scroll_offset.y + pad_top;
-		std::string line_text;
 
 		while (y < rcClient.bottom && nCurrentLine < line_count)
 		{
-			(*_doc)[nCurrentLine].render(line_text);
+			(*_doc)[nCurrentLine].render(_line_buf);
+			table_layout::split_csv_cells(_cells, _line_buf);
 
-			const auto cells = table_layout::split_csv_cells(line_text);
 			const bool is_header = (nCurrentLine == 0);
 			const auto tx = is_header ? header_clr : text_clr;
 
 			const auto vis_rows = table_layout::draw_table_row(
-				draw, y, left_pad, rcClient.right, cells, _table,
-				font, font_cx, font_cy, is_header, bg, pipe_clr, tx, break_fn);
+				draw, y, left_pad, rcClient.right, _cells, _table,
+				font, font_cx, font_cy, is_header, bg, pipe_clr, tx, _cell_breaks, cell_breaks);
 
 			y += vis_rows * font_cy;
 
@@ -185,18 +183,17 @@ private:
 		_table.separator_line = -1; // separator is drawn visually, not from a document line
 
 		// Compute natural column widths from all rows
-		std::string tmp;
 		for (int i = 0; i < line_count; i++)
 		{
-			(*_doc)[i].render(tmp);
-			const auto cells = table_layout::split_csv_cells(tmp);
+			(*_doc)[i].render(_line_buf);
+			table_layout::split_csv_cells(_cells, _line_buf);
 
-			while (_table.col_widths.size() < cells.size())
+			while (_table.col_widths.size() < _cells.size())
 				_table.col_widths.push_back(0);
 
-			for (size_t c = 0; c < cells.size(); c++)
+			for (size_t c = 0; c < _cells.size(); c++)
 			{
-				const auto w = pf::utf8_codepoint_count(table_layout::trim_cell(cells[c]));
+				const auto w = pf::utf8_codepoint_count(table_layout::trim_cell(_cells[c]));
 				if (w > _table.col_widths[c]) _table.col_widths[c] = w;
 			}
 		}
