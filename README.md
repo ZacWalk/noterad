@@ -1,6 +1,6 @@
 # Noterad
 
-[![Build](https://github.com/ZacWalk/noterad/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/noterad/actions/workflows/build.yml)
+[![Build](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml)
 
 A lightweight Windows text editor for working across a folder full of notes, logs and data files. Point it at a folder, search everything in it, and read or edit whatever comes back.
 
