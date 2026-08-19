@@ -193,19 +193,19 @@ public:
 	}
 
 	uint32_t handle_message(pf::window_frame_ptr window, const pf::message_type msg,
-	                        const uintptr_t wParam, const intptr_t lParam) override
+	                        const pf::message_params& params) override
 	{
 		if (msg == pf::message_type::drop_files)
 		{
-			const auto paths = pf::dropped_file_paths(wParam);
-			if (!paths.empty())
+			if (!params.dropped_paths.empty())
 			{
 				const auto dest = get_save_folder(_selected_item);
-				_events.copy_files_to_folder(paths, dest);
+				_events.copy_files_to_folder(
+					{params.dropped_paths.begin(), params.dropped_paths.end()}, dest);
 			}
 			return 0;
 		}
-		return list_view::handle_message(std::move(window), msg, wParam, lParam);
+		return list_view::handle_message(std::move(window), msg, params);
 	}
 
 	uint32_t handle_mouse(pf::window_frame_ptr window, const pf::mouse_message_type msg,
@@ -348,19 +348,19 @@ public:
 	void update_selected(const pf::window_frame_ptr& window)
 	{
 		const auto active = _events.active_item();
-		list_view_item_ptr select_this;
+		_selected_index = -1;
+		_selected_item = nullptr;
 
-		for (const auto& i : _items)
+		for (int i = 0; i < static_cast<int>(_items.size()); i++)
 		{
-			if (i->source == active)
+			if (_items[i]->source == active)
 			{
-				select_this = i;
+				set_selected(i);
 				break;
 			}
 		}
 
-		_selected_item = select_this;
-		ensure_visible(window, select_this);
+		ensure_visible(window, _selected_item);
 	}
 
 	void populate(const pf::window_frame_ptr& window)
@@ -406,16 +406,16 @@ public:
 
 	void select_index_item(const pf::window_frame_ptr& window, const index_item_ptr& item)
 	{
-		for (const auto& i : _items)
+		for (int i = 0; i < static_cast<int>(_items.size()); i++)
 		{
-			if (i->source == item)
+			if (_items[i]->source == item)
 			{
-				if (_selected_item != i)
+				if (_selected_item != _items[i])
 				{
-					_selected_item = i;
-					ensure_visible(window, i);
+					set_selected(i);
+					ensure_visible(window, _selected_item);
 					window->invalidate();
-					on_item_selected(window, i, false);
+					on_item_selected(window, _selected_item, false);
 				}
 				return;
 			}
@@ -427,14 +427,14 @@ public:
 		{
 			populate(window);
 
-			for (const auto& i : _items)
+			for (int i = 0; i < static_cast<int>(_items.size()); i++)
 			{
-				if (i->source == item)
+				if (_items[i]->source == item)
 				{
-					_selected_item = i;
-					ensure_visible(window, i);
+					set_selected(i);
+					ensure_visible(window, _selected_item);
 					window->invalidate();
-					on_item_selected(window, i, false);
+					on_item_selected(window, _selected_item, false);
 					return;
 				}
 			}

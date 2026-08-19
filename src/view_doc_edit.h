@@ -13,6 +13,8 @@ public:
 
 	~edit_doc_view() override = default;
 
+	[[nodiscard]] bool allows_text_drag() const override { return _doc && !_doc->is_read_only(); }
+
 	std::vector<pf::menu_command> on_popup_menu(const pf::ipoint& client_pt) override
 	{
 		std::vector<pf::menu_command> items;
@@ -144,7 +146,7 @@ private:
 		const bool shift = window->is_key_down(pk::Shift);
 		const bool alt = window->is_key_down(pk::Alt);
 
-		// Editing keys
+		// Only keys the command table does not claim reach here
 		if (vk == pk::Back && !ctrl && !alt)
 		{
 			_doc->edit_delete_back();
@@ -157,11 +159,6 @@ private:
 				_doc->edit_delete();
 			return true;
 		}
-		if (vk == pk::Delete && !shift)
-		{
-			_doc->edit_delete();
-			return true;
-		}
 		if (vk == pk::Tab && !shift)
 		{
 			_doc->edit_tab();
@@ -171,48 +168,6 @@ private:
 		{
 			_doc->edit_untab();
 			return true;
-		}
-
-		// Clipboard editing (secondary bindings)
-		if (vk == pk::Insert && shift)
-		{
-			_doc->edit_paste(clipboard_text());
-			return true;
-		}
-		if (vk == pk::Delete && shift)
-		{
-			set_clipboard(_doc->edit_cut());
-			return true;
-		}
-		if (vk == pk::Back && alt)
-		{
-			_doc->edit_undo();
-			return true;
-		}
-
-		// Clipboard + edit (primary bindings)
-		if (ctrl && !shift && !alt)
-		{
-			if (vk == 'X')
-			{
-				set_clipboard(_doc->edit_cut());
-				return true;
-			}
-			if (vk == 'V')
-			{
-				_doc->edit_paste(clipboard_text());
-				return true;
-			}
-			if (vk == 'Z')
-			{
-				_doc->edit_undo();
-				return true;
-			}
-			if (vk == 'Y')
-			{
-				_doc->edit_redo();
-				return true;
-			}
 		}
 
 		return doc_view::on_key_down(window, vk);

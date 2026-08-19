@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build Noterad",
+            "label": "Build Rethinkify",
             "type": "shell",
             "command": "pwsh",
             "args": [
@@ -21,7 +21,7 @@
             "detail": "CMake + Ninja via dd.ps1"
         },
         {
-            "label": "Build Noterad (Release)",
+            "label": "Build Rethinkify (Release)",
             "type": "shell",
             "command": "pwsh",
             "args": [
@@ -35,7 +35,7 @@
             "detail": "CMake + Ninja via dd.ps1"
         },
         {
-            "label": "Test Noterad",
+            "label": "Test Rethinkify",
             "type": "shell",
             "command": "pwsh",
             "args": [

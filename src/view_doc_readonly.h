@@ -15,6 +15,8 @@ public:
 
 	[[nodiscard]] bool has_caret() const override { return false; }
 
+	[[nodiscard]] bool allows_drag_selection() const override { return false; }
+
 	void set_word_wrap(bool enabled) override
 	{
 	}
@@ -71,7 +73,7 @@ public:
 			return true;
 		}
 
-		// Skip doc_view's caret navigation; the base still handles escape, copy and zoom
+		// Skip doc_view's caret navigation; the base still handles escape and zoom
 		return text_view::on_key_down(window, vk);
 	}
 

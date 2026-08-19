@@ -17,6 +17,12 @@ protected:
 	bool _sel_margin = true;
 	uint32_t _drag_sel_timer = 0;
 
+	// Dragging the selection itself: pending until the mouse actually moves
+	bool _drag_text_pending = false;
+	bool _drag_text = false;
+	pf::ipoint _drag_text_origin{};
+	text_location _drop_location{};
+
 	document_ptr _doc;
 
 	int _screen_chars = 0;
@@ -59,6 +65,25 @@ public:
 
 	[[nodiscard]] virtual bool has_caret() const { return true; }
 
+	// Views that lay text out non-uniformly cannot hit-test a click, so they do not drag-select
+	[[nodiscard]] virtual bool allows_drag_selection() const { return true; }
+
+	// Only a writable view can move text by dragging it
+	[[nodiscard]] virtual bool allows_text_drag() const { return false; }
+
+	// Where target ends up once the selection above it has been removed
+	[[nodiscard]] static text_location adjust_for_removal(const text_selection& sel, const text_location& target)
+	{
+		if (!(sel._end < target))
+			return target;
+
+		auto result = target;
+		if (target.y == sel._end.y)
+			result.x = sel._start.x + (target.x - sel._end.x);
+		result.y = target.y - (sel._end.y - sel._start.y);
+		return result;
+	}
+
 	void start_caret_blink(const pf::window_frame_ptr& window)
 	{
 		if (window && has_caret() && !_caret.active)
@@ -90,7 +115,8 @@ public:
 	{
 		_scroll_offset = {};
 		_doc = d;
-		_highlight = select_highlighter(d->get_doc_type(), d->path());
+		_highlight = select_highlighter(d ? d->get_doc_type() : doc_type::text,
+		                                d ? d->path() : pf::file_path{});
 		reset_parse_cookies();
 
 		// Clear stale word-wrap state so visual_row_to_line_index
@@ -121,14 +147,6 @@ public:
 
 	void set_selection(const text_selection& sel) override { if (_doc) _doc->select(sel); }
 	[[nodiscard]] bool has_current_selection() const override { return _doc && _doc->has_selection(); }
-
-	// --- Line text access ---
-
-	void render_line(const int line_num, std::string& out) const override
-	{
-		if (_doc) (*_doc)[line_num].render(out);
-		else out.clear();
-	}
 
 	// --- Syntax highlighting (view-owned) ---
 
@@ -203,24 +221,16 @@ public:
 		return _parse_cookies[lineIndex];
 	}
 
-	uint32_t highlight_line(const uint32_t cookie, const document_line& line,
+	// line_text must already hold the rendered text of the line being drawn
+	uint32_t highlight_line(const uint32_t cookie, const std::string_view line_text,
 	                        text_block* pBuf, int& nBlocks) const
 	{
-		auto& line_view = _highlight_buf;
-		line.render(line_view);
-		const auto result = _highlight(cookie, line_view, pBuf, nBlocks);
+		const auto result = _highlight(cookie, line_text, pBuf, nBlocks);
 
 		if (_doc->spell_check() && pBuf)
 		{
-			const auto len = static_cast<int>(line_view.size());
-			const std::string_view line_text(line_view);
+			const auto len = static_cast<int>(line_text.size());
 
-			// Non-ASCII bytes count as word characters so a codepoint is never split
-			auto is_word_char = [](const char ch)
-			{
-				const auto b = static_cast<unsigned char>(ch);
-				return b >= 0x80 || isalnum(b) != 0;
-			};
 			auto can_spell_check_style = [](const style color)
 			{
 				switch (color)
@@ -274,9 +284,9 @@ public:
 					int next = pos + 1;
 					auto color = base_color;
 
-					if (is_word_char(line_text[pos]))
+					if (is_spell_word_byte(line_text[pos]))
 					{
-						while (next < end && is_word_char(line_text[next]))
+						while (next < end && is_spell_word_byte(line_text[next]))
 							next++;
 
 						if (!spell_check_word(line_text.substr(pos, next - pos)))
@@ -284,7 +294,7 @@ public:
 					}
 					else
 					{
-						while (next < end && !is_word_char(line_text[next]))
+						while (next < end && !is_spell_word_byte(line_text[next]))
 							next++;
 					}
 
@@ -319,13 +329,13 @@ public:
 	// --- frame_reactor overrides ---
 
 	uint32_t handle_message(const pf::window_frame_ptr window, const pf::message_type msg,
-	                        const uintptr_t wParam, const intptr_t lParam) override
+	                        const pf::message_params& params) override
 	{
 		using mt = pf::message_type;
 
 		if (msg == mt::timer)
 		{
-			on_timer(window, static_cast<uint32_t>(wParam));
+			on_timer(window, params.timer_id);
 			return 0;
 		}
 		if (msg == mt::sys_color_change)
@@ -334,7 +344,7 @@ public:
 			return 0;
 		}
 
-		return text_view::handle_message(window, msg, wParam, lParam);
+		return text_view::handle_message(window, msg, params);
 	}
 
 	uint32_t handle_mouse(pf::window_frame_ptr window, const pf::mouse_message_type msg,
@@ -481,7 +491,8 @@ public:
 	int visual_row_to_line_index(const int visual_row) const
 	{
 		if (!_word_wrap || _wrap_line_y.empty()) return visual_row;
-		const int line_count = static_cast<int>(_doc->size());
+		// The array lags the document between an edit and the next layout
+		const int line_count = std::min(static_cast<int>(_doc->size()), static_cast<int>(_wrap_line_y.size()));
 		int lo = 0, hi = line_count - 1;
 		while (lo < hi)
 		{
@@ -504,7 +515,7 @@ public:
 
 	void ensure_visible(pf::window_frame_ptr& window, const text_location& pt) override
 	{
-		if (_word_wrap && !_wrap_line_y.empty() && !_wrap_offsets.empty())
+		if (_word_wrap && !_wrap_offsets.empty() && pt.y >= 0 && pt.y < std::ssize(_wrap_line_y))
 		{
 			const int sub_row = char_to_sub_row(pt.y, pt.x);
 			const int cursor_vrow = _wrap_line_y[pt.y] + sub_row;
@@ -572,6 +583,9 @@ public:
 
 			invalidate_selection(window);
 			update_caret(window);
+
+			if (!_focused)
+				cancel_text_drag(window);
 
 			if (!_focused && _drag_selection)
 			{
@@ -685,13 +699,23 @@ protected:
 			return;
 		}
 
+		// Pressing inside an existing selection may start a drag instead of a new selection
+		if (allows_text_drag() && !bShift && !bControl && point.x >= margin_width()
+			&& _doc->has_selection() && _doc->is_inside_selection(client_to_text(point)))
+		{
+			_drag_text_pending = true;
+			_drag_text_origin = point;
+			window->set_capture();
+			return;
+		}
+
 		if (point.x < margin_width())
 		{
 			if (bControl)
 			{
 				_doc->select(_doc->all());
 			}
-			else
+			else if (allows_drag_selection())
 			{
 				const auto sel = _doc->line_selection(client_to_text(point), bShift);
 				_doc->select(sel);
@@ -704,7 +728,7 @@ protected:
 				_drag_selection = true;
 			}
 		}
-		else
+		else if (allows_drag_selection())
 		{
 			const auto pos = client_to_text(point);
 			const auto sel = bControl ? _doc->word_selection(pos, bShift) : _doc->pos_selection(pos, bShift);
@@ -770,6 +794,25 @@ protected:
 			return;
 		}
 
+		if (_drag_text_pending)
+		{
+			const auto slop = std::max(4, _font_extent.cx / 2);
+			if (std::abs(point.x - _drag_text_origin.x) > slop ||
+				std::abs(point.y - _drag_text_origin.y) > slop)
+			{
+				_drag_text_pending = false;
+				_drag_text = true;
+			}
+		}
+
+		if (_drag_text)
+		{
+			_drop_location = client_to_text(point);
+			window->set_cursor_shape(pf::cursor_shape::arrow);
+			_events.invalidate(invalid::windows);
+			return;
+		}
+
 		if (_drag_selection)
 		{
 			const auto bOnMargin = point.x < margin_width();
@@ -818,6 +861,25 @@ protected:
 			return;
 		}
 
+		// A press inside the selection that never moved just places the caret
+		if (_drag_text_pending)
+		{
+			_drag_text_pending = false;
+			window->release_capture();
+			const auto pos = client_to_text(point);
+			_doc->select(text_selection(pos, pos));
+			_events.invalidate(invalid::doc);
+			return;
+		}
+
+		if (_drag_text)
+		{
+			_drag_text = false;
+			window->release_capture();
+			drop_selected_text(client_to_text(point), window->is_key_down(pf::platform_key::Control));
+			return;
+		}
+
 		if (_drag_selection)
 		{
 			const auto pos = client_to_text(point);
@@ -841,7 +903,7 @@ protected:
 
 	void on_left_button_dbl_clk(const pf::window_frame_ptr& window, const pf::ipoint& point)
 	{
-		if (!_drag_selection)
+		if (!_drag_selection && allows_drag_selection())
 		{
 			const bool bShift = window->is_key_down(pf::platform_key::Shift);
 			_doc->select(_doc->word_selection(client_to_text(point), bShift));
@@ -857,6 +919,9 @@ protected:
 
 	uint32_t on_right_button_down(pf::window_frame_ptr& window, const pf::ipoint& point)
 	{
+		if (!allows_drag_selection())
+			return 0;
+
 		const auto pt = client_to_text(point);
 
 		if (!_doc->is_inside_selection(pt))
@@ -876,11 +941,59 @@ protected:
 			invalidate_lines(window, sel._start.y, sel._end.y);
 	}
 
+	// Moves the selection to target, or copies it when copy is set
+	void drop_selected_text(const text_location& target, const bool copy)
+	{
+		const auto sel = _doc->selection();
+
+		if (sel.empty() || !_doc->query_editable())
+			return;
+
+		// Dropping anywhere on the selection, including either edge, moves nothing
+		if (!(target < sel._start) && !(sel._end < target))
+			return;
+
+		const auto text = _doc->copy();
+		if (text.empty())
+			return;
+
+		undo_group ug(_doc);
+
+		auto insert_at = target;
+
+		if (!copy)
+		{
+			insert_at = adjust_for_removal(sel, target);
+			_doc->delete_text(ug, sel);
+		}
+
+		const auto end = _doc->insert_text(ug, insert_at, text);
+		_doc->select(text_selection(insert_at, end));
+		_events.invalidate(invalid::doc);
+	}
+
+	void cancel_text_drag(const pf::window_frame_ptr& window)
+	{
+		if (!_drag_text && !_drag_text_pending)
+			return;
+
+		_drag_text = false;
+		_drag_text_pending = false;
+		window->release_capture();
+		_events.invalidate(invalid::windows);
+	}
+
 	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
 	{
 		namespace pk = pf::platform_key;
 		const bool ctrl = window->is_key_down(pk::Control);
 		const bool shift = window->is_key_down(pk::Shift);
+
+		if (vk == pk::Escape && (_drag_text || _drag_text_pending))
+		{
+			cancel_text_drag(window);
+			return true;
+		}
 
 		// Document cursor navigation — these replace the base class scroll behavior
 		if (vk == pk::Left && !ctrl && !shift)
@@ -1118,6 +1231,10 @@ public:
 			window->set_cursor_shape(pf::cursor_shape::arrow);
 		}
 		else if (_doc->is_inside_selection(client_to_text(pt)))
+		{
+			window->set_cursor_shape(pf::cursor_shape::arrow);
+		}
+		else if (!allows_drag_selection() || _drag_text)
 		{
 			window->set_cursor_shape(pf::cursor_shape::arrow);
 		}
@@ -1388,6 +1505,21 @@ public:
 		}
 	}
 
+	// Splice the per-line arrays rather than rebuilding them, so inserting or
+	// removing a few lines stays proportional to the edit, not to the document.
+	void line_count_changed(pf::window_frame_ptr& window, const int at, const int delta) override
+	{
+		// A dirty range recorded before this edit is in the old line numbering, and only one
+		// entirely below 'at' still means what it said. A multi-step undo gets here.
+		if (_wrap_dirty_last > at)
+			mark_wrap_dirty_all();
+
+		splice_parse_cookies(at, delta);
+		splice_wrap(at, delta);
+		mark_wrap_dirty(at, at + std::max(0, delta));
+		invalidate_lines(window, at, -1);
+	}
+
 	void layout() override
 	{
 		if (!_doc || !_word_wrap)
@@ -1402,7 +1534,7 @@ public:
 
 		const auto line_count = static_cast<int>(_doc->size());
 
-		// A changed line count means every offset after it has moved
+		// The arrays no longer describe the document, so a splice cannot patch them
 		if (_wrap_dirty_all || static_cast<int>(_wrap_offsets.size()) != line_count + 1)
 		{
 			full_layout(line_count);
@@ -1423,6 +1555,77 @@ private:
 		_wrap_dirty_all = false;
 		_wrap_dirty_first = -1;
 		_wrap_dirty_last = -1;
+	}
+
+	// Cookies below 'at' stay valid; the rest is rebuilt lazily by highlight_cookie.
+	void splice_parse_cookies(const int at, const int delta) const
+	{
+		const auto count = static_cast<int>(_parse_cookies.size());
+		const auto before_edit = static_cast<int>(_doc ? _doc->size() : 0) - delta;
+
+		if (count != before_edit || at < 0 || at >= count)
+		{
+			reset_parse_cookies();
+			return;
+		}
+
+		if (delta > 0)
+			_parse_cookies.insert(_parse_cookies.begin() + at + 1, delta, invalid_cookie);
+		else if (delta < 0)
+			_parse_cookies.erase(_parse_cookies.begin() + at + 1, _parse_cookies.begin() + at + 1 - delta);
+
+		_cookies_valid_to = std::min(_cookies_valid_to, at);
+	}
+
+	// Inserted lines start with no break points; layout() re-wraps them because
+	// line_count_changed marks them dirty.
+	void splice_wrap(const int at, const int delta)
+	{
+		const auto line_count = static_cast<int>(_wrap_offsets.size()) - 1;
+		const auto before_edit = static_cast<int>(_doc ? _doc->size() : 0) - delta;
+
+		if (!_word_wrap || line_count <= 0 || line_count != before_edit
+			|| at < 0 || at >= line_count
+			|| static_cast<int>(_wrap_line_y.size()) != line_count + 1
+			|| (delta < 0 && at + 1 - delta > line_count))
+		{
+			mark_wrap_dirty_all();
+			return;
+		}
+
+		if (delta > 0)
+		{
+			const auto first_row = _wrap_line_y[at + 1];
+
+			for (size_t i = at + 1; i < _wrap_line_y.size(); i++)
+				_wrap_line_y[i] += delta;
+
+			_wrap_line_y.insert(_wrap_line_y.begin() + at + 1, delta, 0);
+			for (int k = 0; k < delta; k++)
+				_wrap_line_y[at + 1 + k] = first_row + k;
+
+			const auto first_break = _wrap_offsets[at + 1];
+			_wrap_offsets.insert(_wrap_offsets.begin() + at + 1, delta, first_break);
+		}
+		else if (delta < 0)
+		{
+			const auto removed = -delta;
+			const auto first_break = _wrap_offsets[at + 1];
+			const auto last_break = _wrap_offsets[at + 1 + removed];
+			const auto rows = _wrap_line_y[at + 1 + removed] - _wrap_line_y[at + 1];
+
+			_wrap_breaks.erase(_wrap_breaks.begin() + first_break, _wrap_breaks.begin() + last_break);
+
+			_wrap_offsets.erase(_wrap_offsets.begin() + at + 1, _wrap_offsets.begin() + at + 1 + removed);
+			for (size_t i = at + 1; i < _wrap_offsets.size(); i++)
+				_wrap_offsets[i] -= last_break - first_break;
+
+			_wrap_line_y.erase(_wrap_line_y.begin() + at + 1, _wrap_line_y.begin() + at + 1 + removed);
+			for (size_t i = at + 1; i < _wrap_line_y.size(); i++)
+				_wrap_line_y[i] -= rows;
+		}
+
+		_total_visual_rows = _wrap_line_y.back();
 	}
 
 	void full_layout(const int line_count)
@@ -1489,7 +1692,7 @@ protected:
 	{
 		if (_word_wrap && !_wrap_line_y.empty())
 		{
-			const auto idx = std::clamp(lineIndex, 0, static_cast<int>(_doc->size()));
+			const auto idx = std::clamp(lineIndex, 0, static_cast<int>(_wrap_line_y.size()) - 1);
 			return top_content_padding() + _wrap_line_y[idx] * _font_extent.cy;
 		}
 		return top_content_padding() + lineIndex * _font_extent.cy;
@@ -1546,11 +1749,11 @@ protected:
 		{
 			_doc->expanded_chars(pszChars, nOffset, nCount, _expand_buf);
 			const auto nWidth = rcClip.right - ptOrigin.x;
+			const auto nCodepoints = pf::utf8_codepoint_count(_expand_buf);
 
 			if (nWidth > 0)
 			{
 				const auto nCharWidth = _font_extent.cx;
-				const auto nCodepoints = pf::utf8_codepoint_count(_expand_buf);
 				const auto nCountFit = nWidth / nCharWidth + 1;
 
 				auto nDrawBytes = static_cast<int>(_expand_buf.size());
@@ -1572,7 +1775,7 @@ protected:
 				               f, text_color, bg_color);
 			}
 
-			ptOrigin.x += _font_extent.cx * pf::utf8_codepoint_count(_expand_buf);
+			ptOrigin.x += _font_extent.cx * nCodepoints;
 		}
 	}
 
@@ -1632,6 +1835,10 @@ protected:
 		const auto bg_color = line_bg_color(lineIndex);
 		const auto& line = (*_doc)[lineIndex];
 		const auto breaks = line_breaks(lineIndex);
+
+		// Resolve the inherited cookie first: it scans backwards using _highlight_buf
+		const auto cookie = highlight_cookie(lineIndex - 1);
+
 		auto& line_view = _render_buf;
 		line.render(line_view);
 		const auto nLength = static_cast<int>(line_view.size());
@@ -1642,8 +1849,7 @@ protected:
 			_block_buf.resize(needed);
 		auto* pBuf = _block_buf.data();
 		auto nBlocks = 0;
-		const auto cookie = highlight_cookie(lineIndex - 1);
-		set_parse_cookie(lineIndex, highlight_line(cookie, line, pBuf, nBlocks));
+		set_parse_cookie(lineIndex, highlight_line(cookie, line_view, pBuf, nBlocks));
 
 		const int num_rows = static_cast<int>(breaks.size()) + 1;
 
@@ -1724,13 +1930,15 @@ protected:
 			_block_buf.resize(needed);
 		auto* pBuf = _block_buf.data();
 		auto nBlocks = 0;
+
+		// Resolve the inherited cookie first: it scans backwards using _highlight_buf
 		const auto cookie = highlight_cookie(lineIndex - 1);
 
-		set_parse_cookie(lineIndex, highlight_line(cookie, line, pBuf, nBlocks));
-
-		pf::ipoint origin(rc.left - scroll_char() * _font_extent.cx, rc.top);
 		auto& line_view = _render_buf;
 		line.render(line_view);
+		set_parse_cookie(lineIndex, highlight_line(cookie, line_view, pBuf, nBlocks));
+
+		pf::ipoint origin(rc.left - scroll_char() * _font_extent.cx, rc.top);
 
 		if (nBlocks > 0)
 		{
@@ -1799,13 +2007,14 @@ protected:
 		const auto rcClient = client_rect();
 		const auto clip = draw.clip_rect();
 		const auto line_count = static_cast<int>(_doc->size());
-		const auto pad_left = text_left();
+		const auto margin_w = margin_width();
+		const auto pad_left = margin_w + _font_extent.cx;
 
 		// Erase entire viewport
 		draw.fill_solid_rect(rcClient, style_to_color(style::normal_bkgnd));
 
 		// Paint margin background
-		const pf::irect rcMargin(0, 0, margin_width(), rcClient.bottom);
+		const pf::irect rcMargin(0, 0, margin_w, rcClient.bottom);
 		draw.fill_solid_rect(rcMargin, style_to_color(_sel_margin ? style::sel_margin : style::normal_bkgnd));
 
 		if (_focused && _doc)
@@ -1843,7 +2052,7 @@ protected:
 
 			if (y + nLineHeight > clip.top && y < clip.bottom)
 			{
-				draw_margin(draw, pf::irect(0, y, margin_width(), y + nLineHeight), nCurrentLine, styles.text_font);
+				draw_margin(draw, pf::irect(0, y, margin_w, y + nLineHeight), nCurrentLine, styles.text_font);
 				draw_line(draw, pf::irect(pad_left, y, rcClient.right, y + nLineHeight), nCurrentLine,
 				          styles.text_font);
 			}
@@ -1856,7 +2065,21 @@ protected:
 		_vscroll.draw(draw, sb_rc);
 		_hscroll.draw(draw, sb_rc);
 		draw_caret(draw);
+		draw_drop_marker(draw);
 		draw_message_bar(draw);
+	}
+
+	// Shows where a dragged selection will land
+	void draw_drop_marker(pf::draw_context& draw) const
+	{
+		if (!_drag_text)
+			return;
+
+		const auto pt = text_to_client(_drop_location);
+		const auto rc = client_rect();
+
+		if (pt.y + _font_extent.cy > rc.top && pt.y < rc.bottom)
+			draw.fill_solid_rect(pt.x, pt.y, 2, _font_extent.cy, style_to_color(style::md_bullet));
 	}
 
 	virtual void draw_caret(pf::draw_context& draw) const

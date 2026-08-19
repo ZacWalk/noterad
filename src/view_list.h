@@ -34,6 +34,9 @@ protected:
 	list_view_item_ptr _hover_item;
 	bool _focused = false;
 
+	// Position of _selected_item; a hint, revalidated by selected_index()
+	mutable int _selected_index = -1;
+
 	pf::isize _font_extent = {10, 10};
 	int _header_height = 0;
 
@@ -102,93 +105,97 @@ protected:
 			context_rect.left += line_sz.cx;
 
 			const auto avail_width = context_rect.width();
-			const auto& name = item->name;
+			const std::string_view name = item->name;
 			const auto name_len = static_cast<int>(name.size());
 			const auto full_width = dc.measure_text(name, font_spec).cx;
 
-			std::string display_text;
+			std::string_view display_text = name;
 			int display_match_start = item->text_match_start;
+			bool ellipsis_prefix = false;
+			bool ellipsis_suffix = false;
 
-			if (full_width <= avail_width || item->text_match_length <= 0)
+			if (full_width > avail_width && item->text_match_length > 0)
 			{
-				display_text = name;
-			}
-			else
-			{
+				// Widen a window around the match until it fills the available width.
+				// Width grows monotonically with the radius, so binary search it rather
+				// than stepping a character at a time — this runs on every paint.
 				const auto ellipsis_width = dc.measure_text("...", font_spec).cx;
-				const int match_start = item->text_match_start;
-				const int match_end = match_start + item->text_match_length;
-				int vis_start = match_start;
-				int vis_end = std::min(match_end, name_len);
+				const int match_start = std::clamp(item->text_match_start, 0, name_len);
+				const int match_end = std::clamp(match_start + item->text_match_length, match_start, name_len);
 
-				auto calc_width = [&]()
+				int vis_start = match_start;
+				int vis_end = match_end;
+
+				const auto width_of_radius = [&](const int radius)
 				{
+					vis_start = std::max(0, match_start - radius);
+					while (vis_start > 0 && pf::is_utf8_continuation(name[vis_start])) vis_start--;
+
+					vis_end = std::min(name_len, match_end + radius);
+					while (vis_end < name_len && pf::is_utf8_continuation(name[vis_end])) vis_end++;
+
 					auto w = dc.measure_text(name.substr(vis_start, vis_end - vis_start), font_spec).cx;
 					if (vis_start > 0) w += ellipsis_width;
 					if (vis_end < name_len) w += ellipsis_width;
 					return w;
 				};
 
-				bool expanded = true;
-				while (expanded)
+				int lo = 0;
+				int hi = name_len;
+
+				while (lo < hi)
 				{
-					expanded = false;
-					if (vis_start > 0)
-					{
-						--vis_start;
-						if (calc_width() > avail_width) ++vis_start;
-						else expanded = true;
-					}
-					if (vis_end < name_len)
-					{
-						++vis_end;
-						if (calc_width() > avail_width) --vis_end;
-						else expanded = true;
-					}
+					const auto mid = lo + (hi - lo + 1) / 2;
+					if (width_of_radius(mid) <= avail_width)
+						lo = mid;
+					else
+						hi = mid - 1;
 				}
 
-				const bool prefix = vis_start > 0;
-				const bool suffix = vis_end < name_len;
+				width_of_radius(lo);
 
-				display_text.clear();
-				if (prefix) display_text += "...";
-				display_match_start = static_cast<int>(display_text.size()) + (match_start - vis_start);
-				display_text += name.substr(vis_start, vis_end - vis_start);
-				if (suffix) display_text += "...";
+				ellipsis_prefix = vis_start > 0;
+				ellipsis_suffix = vis_end < name_len;
+				display_text = name.substr(vis_start, vis_end - vis_start);
+				display_match_start = match_start - vis_start;
 			}
+
+			const auto draw_segment = [&](pf::irect& seg, const std::string_view text, const pf::color_t seg_bg)
+			{
+				if (text.empty()) return;
+				seg.right = std::min(seg.left + dc.measure_text(text, font_spec).cx, context_rect.right);
+				dc.draw_text(seg.left, seg.top, seg, text, font_spec, ui::text_color, seg_bg);
+				seg.left = seg.right;
+			};
+
+			auto seg_rect = context_rect;
+
+			if (ellipsis_prefix)
+				draw_segment(seg_rect, "...", bg);
 
 			if (item->line_match_pos >= 0 && item->text_match_length > 0 &&
 				display_match_start >= 0 && display_match_start < static_cast<int>(display_text.size()))
 			{
+				constexpr auto highlight_color = pf::color_t(220, 140, 0);
 				const auto match_end = std::min(display_match_start + item->text_match_length,
 				                                static_cast<int>(display_text.size()));
-				const auto before_text = display_text.substr(0, display_match_start);
-				const auto match_text = display_text.substr(display_match_start, match_end - display_match_start);
-				const auto after_text = display_text.substr(match_end);
 
-				const auto before_sz = dc.measure_text(before_text, font_spec);
-				const auto match_sz = dc.measure_text(match_text, font_spec);
-
-				constexpr auto highlight_color = pf::color_t(220, 140, 0);
-
-				auto seg_rect = context_rect;
-				seg_rect.right = seg_rect.left + before_sz.cx;
-				dc.draw_text(seg_rect.left, seg_rect.top, seg_rect, before_text, font_spec, ui::text_color, bg);
-
-				seg_rect.left = seg_rect.right;
-				seg_rect.right = seg_rect.left + match_sz.cx;
-				dc.draw_text(seg_rect.left, seg_rect.top, seg_rect, match_text, font_spec, ui::text_color,
+				draw_segment(seg_rect, display_text.substr(0, display_match_start), bg);
+				draw_segment(seg_rect, display_text.substr(display_match_start, match_end - display_match_start),
 				             highlight_color);
-
-				seg_rect.left = seg_rect.right;
-				seg_rect.right = context_rect.right;
-				dc.draw_text(seg_rect.left, seg_rect.top, seg_rect, after_text, font_spec, ui::text_color, bg);
+				draw_segment(seg_rect, display_text.substr(match_end), bg);
 			}
 			else
 			{
-				dc.draw_text(context_rect.left, context_rect.top, context_rect, display_text, font_spec,
-				             ui::text_color, bg);
+				draw_segment(seg_rect, display_text, bg);
 			}
+
+			if (ellipsis_suffix)
+				draw_segment(seg_rect, "...", bg);
+
+			if (seg_rect.left < context_rect.right)
+				dc.fill_solid_rect(seg_rect.left, context_rect.top,
+				                   context_rect.right - seg_rect.left, context_rect.height(), bg);
 		}
 		else
 		{
@@ -343,49 +350,55 @@ public:
 		return _selected_item;
 	}
 
+	// O(1) while the hint holds, falling back to a scan after the list is rebuilt
+	[[nodiscard]] int selected_index() const
+	{
+		if (!_selected_item)
+			return -1;
+
+		if (_selected_index >= 0 && _selected_index < static_cast<int>(_items.size())
+			&& _items[_selected_index] == _selected_item)
+			return _selected_index;
+
+		for (int i = 0; i < static_cast<int>(_items.size()); i++)
+		{
+			if (_items[i] == _selected_item)
+			{
+				_selected_index = i;
+				return i;
+			}
+		}
+
+		_selected_index = -1;
+		return -1;
+	}
+
+	void set_selected(const int index)
+	{
+		_selected_index = index;
+		_selected_item = index >= 0 && index < static_cast<int>(_items.size()) ? _items[index] : nullptr;
+	}
+
 	void navigate_next(const pf::window_frame_ptr& window, const bool forward, const bool skip_groups = false)
 	{
 		if (_items.empty()) return;
 
-		if (!_selected_item)
-		{
-			auto pick = forward ? _items.front() : _items.back();
-			if (skip_groups && pick->is_group)
-				pick = nullptr;
-			if (!skip_groups || pick)
-			{
-				_selected_item = pick;
-				ensure_visible(window, _selected_item);
-				window->invalidate();
-				on_item_selected(window, _selected_item, false);
-			}
+		const auto count = static_cast<int>(_items.size());
+		const auto current = selected_index();
+		const auto step = forward ? 1 : -1;
+
+		auto next = current < 0 ? (forward ? 0 : count - 1) : current + step;
+
+		while (next >= 0 && next < count && skip_groups && _items[next]->is_group)
+			next += step;
+
+		if (next < 0 || next >= count)
 			return;
-		}
 
-		auto find_next = [&](auto&& range) -> list_view_item_ptr
-		{
-			bool found = false;
-			for (const auto& i : range)
-			{
-				if (found && (!skip_groups || !i->is_group))
-					return i;
-				if (i == _selected_item)
-					found = true;
-			}
-			return nullptr;
-		};
-
-		const auto next = forward
-			                  ? find_next(_items)
-			                  : find_next(_items | std::views::reverse);
-
-		if (next)
-		{
-			_selected_item = next;
-			ensure_visible(window, _selected_item);
-			window->invalidate();
-			on_item_selected(window, next, false);
-		}
+		set_selected(next);
+		ensure_visible(window, _selected_item);
+		window->invalidate();
+		on_item_selected(window, _selected_item, false);
 	}
 
 	[[nodiscard]] int scroll_y() const { return _scroll_offset.y; }
@@ -393,13 +406,13 @@ public:
 	~list_view() override = default;
 
 	uint32_t handle_message(pf::window_frame_ptr window, const pf::message_type msg,
-	                        const uintptr_t wParam, const intptr_t lParam) override
+	                        const pf::message_params& params) override
 	{
 		using mt = pf::message_type;
 
 		if (msg == mt::create) return 0;
 		if (msg == mt::erase_background) return 1;
-		if (msg == mt::timer) return on_timer(window, static_cast<uint32_t>(wParam));
+		if (msg == mt::timer) return on_timer(window, params.timer_id);
 		if (msg == mt::set_focus || msg == mt::kill_focus)
 		{
 			update_focus(window);
@@ -594,14 +607,14 @@ public:
 	void select_list_item(const pf::window_frame_ptr& window, const list_view_item_ptr& item,
 	                      const bool activated = true)
 	{
-		for (const auto& i : _items)
+		for (int i = 0; i < static_cast<int>(_items.size()); i++)
 		{
-			if (i == item)
+			if (_items[i] == item)
 			{
-				_selected_item = i;
-				ensure_visible(window, i);
+				set_selected(i);
+				ensure_visible(window, item);
 				window->invalidate();
-				on_item_selected(window, i, activated);
+				on_item_selected(window, item, activated);
 				return;
 			}
 		}

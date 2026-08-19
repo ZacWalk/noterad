@@ -24,7 +24,6 @@
 /intermediate/
 /exe/*.ilk
 exe/*.log
-src/app.vcxproj.filters
 exe/*.ini
 /tmp/
 /exe/.env

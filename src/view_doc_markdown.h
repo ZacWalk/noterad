@@ -19,6 +19,14 @@ public:
 
 	~markdown_doc_view() override = default;
 
+	// Cached tables describe the previous document until the next layout
+	void set_document(const document_ptr& d) override
+	{
+		_tables.clear();
+		_line_pixel_y.clear();
+		read_only_doc_view::set_document(d);
+	}
+
 	void handle_size(pf::window_frame_ptr& window, const pf::isize extent,
 	                 pf::measure_context& measure) override
 	{
@@ -46,8 +54,6 @@ public:
 
 	void layout() override
 	{
-		reset_parse_cookies();
-
 		if (!_doc)
 		{
 			_wrap_breaks.clear();
@@ -62,6 +68,7 @@ public:
 		const auto line_count = static_cast<int>(_doc->size());
 		_wrap_breaks.clear();
 		_wrap_offsets.clear();
+		_tables.clear();
 		_wrap_line_y.resize(line_count + 1);
 		_line_pixel_y.resize(line_count + 1);
 		_wrap_line_y[0] = 0;
@@ -76,18 +83,19 @@ public:
 		int cumulative = 0;
 		int cumulative_px = 0;
 		int i = 0;
-		std::string line_text;
 
 		while (i < line_count)
 		{
-			(*_doc)[i].render(line_text);
+			(*_doc)[i].render(_line_buf);
 
 			// Table block handling
-			if (is_table_row(line_text))
+			if (is_table_row(_line_buf))
 			{
 				const auto table = find_table(i, table_cols);
 				if (table.start_line >= 0 && table.start_line <= i)
 				{
+					_tables.push_back(table);
+
 					for (int tl = i; tl < table.end_line; tl++)
 					{
 						_wrap_line_y[tl] = cumulative;
@@ -100,13 +108,13 @@ public:
 						}
 						else
 						{
-							(*_doc)[tl].render(line_text);
-							const auto cells = split_cells(line_text);
+							(*_doc)[tl].render(_line_buf);
+							split_cells(_cells, _line_buf);
 							int max_rows = 1;
-							for (size_t c = 0; c < table.col_widths.size() && c < cells.size(); c++)
+							for (size_t c = 0; c < table.col_widths.size() && c < _cells.size(); c++)
 							{
-								const auto vr = cell_visual_rows(trim_cell(cells[c]),
-								                                 table.col_widths[c]);
+								const auto vr = table_layout::cell_visual_rows(
+									trim_cell(_cells[c]), table.col_widths[c], _cell_breaks, cell_breaks_fn);
 								if (vr > max_rows) max_rows = vr;
 							}
 							cumulative += max_rows;
@@ -122,7 +130,8 @@ public:
 			_wrap_line_y[i] = cumulative;
 			_line_pixel_y[i] = cumulative_px;
 
-			const auto info = parse_line(line_text);
+			parse_line(_line_buf, _line_info);
+			const auto& info = _line_info;
 			auto font_cx = _font_extent.cx > 0 ? _font_extent.cx : 1;
 			auto font_cy = base_cy;
 
@@ -143,9 +152,8 @@ public:
 			const auto chars_per_row = safe_cols(avail_width, font_cx);
 			const auto indent_cols = info.is_list ? info.content_start : 0;
 			const auto wrap_cols = std::max(1, chars_per_row - indent_cols);
-			const auto breaks = calc_word_breaks(line_text, wrap_cols,
-			                                     [](int, int) { return 1; });
-			const auto num_rows = static_cast<int>(breaks.size()) + 1;
+			wrap_line_into(_line_buf, wrap_cols);
+			const auto num_rows = static_cast<int>(_breaks.size()) + 1;
 			pixel_height += num_rows * font_cy;
 
 			// Extra space below
@@ -198,24 +206,21 @@ protected:
 
 		while (y < rcClient.bottom && nCurrentLine < line_count)
 		{
-			const auto& line = (*_doc)[nCurrentLine];
-			std::string line_text;
-			line.render(line_text);
+			(*_doc)[nCurrentLine].render(_line_buf);
 
 			// ── Table block rendering ───────────────────────────────
-			if (is_table_row(line_text))
+			if (is_table_row(_line_buf))
 			{
-				const auto table_cols = safe_cols(avail_width, _font_extent.cx);
-				const auto table = find_table(nCurrentLine, table_cols);
-				if (table.start_line >= 0)
+				const auto* const table = table_at(nCurrentLine);
+				if (table)
 				{
-					for (int tl = nCurrentLine; tl < table.end_line && y < rcClient.bottom; tl++)
+					for (int tl = nCurrentLine; tl < table->end_line && y < rcClient.bottom; tl++)
 					{
-						(*_doc)[tl].render(line_text);
+						(*_doc)[tl].render(_line_buf);
 
-						if (tl == table.separator_line)
+						if (tl == table->separator_line)
 						{
-							draw_table_separator_row(draw, y, left_pad, rcClient.right, table,
+							draw_table_separator_row(draw, y, left_pad, rcClient.right, *table,
 							                         _events.styles().text_font,
 							                         _font_extent.cx, _font_extent.cy);
 							y += _font_extent.cy;
@@ -223,20 +228,21 @@ protected:
 						else
 						{
 							const auto vis_rows = draw_table_row(draw, y, left_pad, rcClient.right,
-							                                     line_text, table,
+							                                     _line_buf, *table,
 							                                     _events.styles().text_font,
 							                                     _font_extent.cx, _font_extent.cy,
-							                                     tl == table.start_line);
+							                                     tl == table->start_line);
 							y += vis_rows * _font_extent.cy;
 						}
 					}
-					nCurrentLine = table.end_line;
+					nCurrentLine = table->end_line;
 					continue;
 				}
 			}
 
 			// ── Normal markdown line ────────────────────────────────
-			const auto info = parse_line(line_text);
+			parse_line(_line_buf, _line_info);
+			const auto& info = _line_info;
 			const auto font = font_for_heading(info.heading_level);
 			auto font_cx = _font_extent.cx;
 			auto font_cy = _font_extent.cy;
@@ -256,24 +262,22 @@ protected:
 			const auto chars_per_row = safe_cols(avail_width, font_cx);
 			const auto indent_cols = info.is_list ? info.content_start : 0;
 			const auto wrap_cols = std::max(1, chars_per_row - indent_cols);
-			const auto line_len = static_cast<int>(line_text.size());
+			const auto line_len = static_cast<int>(_line_buf.size());
 
-			const auto breaks = calc_word_breaks(line_text, wrap_cols,
-			                                     [](int, int) { return 1; });
-
-			const auto num_rows = static_cast<int>(breaks.size()) + 1;
+			wrap_line_into(_line_buf, wrap_cols);
+			const auto num_rows = static_cast<int>(_breaks.size()) + 1;
 
 			for (int row = 0; row < num_rows && y < rcClient.bottom; row++)
 			{
-				const auto row_start = row == 0 ? 0 : breaks[row - 1];
-				const auto row_end = row < static_cast<int>(breaks.size()) ? breaks[row] : line_len;
+				const auto row_start = row == 0 ? 0 : _breaks[row - 1];
+				const auto row_end = row < static_cast<int>(_breaks.size()) ? _breaks[row] : line_len;
 
 				const auto row_left = (row > 0 && indent_cols > 0)
 					                      ? left_pad + indent_cols * font_cx
 					                      : left_pad;
 
 				draw_md_line(draw, pf::irect(row_left, y, rcClient.right, y + font_cy),
-				             line_text, info, font, font_cx, nCurrentLine, row_start, row_end);
+				             _line_buf, info, font, font_cx, nCurrentLine, row_start, row_end);
 				y += font_cy;
 			}
 
@@ -303,6 +307,17 @@ private:
 
 	using table_block = table_layout::table_block;
 
+	// Tables found by the last layout, in document order
+	std::vector<table_block> _tables;
+
+	[[nodiscard]] const table_block* table_at(const int line) const
+	{
+		for (const auto& t : _tables)
+			if (line >= t.start_line && line < t.end_line)
+				return &t;
+		return nullptr;
+	}
+
 	static bool is_table_row(const std::string_view line)
 	{
 		if (line.empty()) return false;
@@ -324,9 +339,10 @@ private:
 
 	static std::string_view trim_cell(const std::string_view s) { return table_layout::trim_cell(s); }
 
-	static std::vector<std::string_view> split_cells(const std::string_view line)
+	static std::vector<std::string_view>& split_cells(std::vector<std::string_view>& cells,
+	                                                 const std::string_view line)
 	{
-		return table_layout::split_pipe_cells(line);
+		return table_layout::split_pipe_cells(cells, line);
 	}
 
 	static bool is_right_align_cell(const std::string_view text) { return table_layout::is_right_align_cell(text); }
@@ -337,7 +353,7 @@ private:
 		const auto line_count = static_cast<int>(_doc->size());
 		if (line_hint < 0 || line_hint >= line_count) return result;
 
-		std::string tmp;
+		auto& tmp = _table_buf;
 		(*_doc)[line_hint].render(tmp);
 		if (!is_table_row(tmp)) return result;
 
@@ -375,12 +391,12 @@ private:
 		{
 			if (i == result.separator_line) continue;
 			(*_doc)[i].render(tmp);
-			const auto cells = split_cells(tmp);
-			while (result.col_widths.size() < cells.size())
+			split_cells(_cells, tmp);
+			while (result.col_widths.size() < _cells.size())
 				result.col_widths.push_back(0);
-			for (size_t c = 0; c < cells.size(); c++)
+			for (size_t c = 0; c < _cells.size(); c++)
 			{
-				const auto w = pf::utf8_codepoint_count(trim_cell(cells[c]));
+				const auto w = pf::utf8_codepoint_count(trim_cell(_cells[c]));
 				if (w > result.col_widths[c]) result.col_widths[c] = w;
 			}
 		}
@@ -389,15 +405,6 @@ private:
 		table_layout::cap_col_widths(result.col_widths, avail_cols);
 
 		return result;
-	}
-
-	// Compute how many visual rows a cell needs when word-wrapped to col_w columns
-	static int cell_visual_rows(const std::string_view text, const int col_w)
-	{
-		return table_layout::cell_visual_rows(text, col_w, [](const std::string_view t, const int cw)
-		{
-			return calc_word_breaks(t, cw, [](int, int) { return 1; });
-		});
 	}
 
 	// Returns the total height in visual rows consumed by this table row
@@ -410,15 +417,11 @@ private:
 		const auto mk = style_to_color(style::md_marker);
 		const auto tx = is_header ? style_to_color(style::md_bold) : style_to_color(style::normal_text);
 
-		const auto cells = split_cells(line_text);
+		split_cells(_cells, line_text);
 
-		auto break_fn = [](const std::string_view t, const int cw)
-		{
-			return calc_word_breaks(t, cw, [](int, int) { return 1; });
-		};
-
-		return table_layout::draw_table_row(draw, y, left_pad, right, cells, table,
-		                                    font, font_cx, font_cy, is_header, bg, mk, tx, break_fn);
+		return table_layout::draw_table_row(draw, y, left_pad, right, _cells, table,
+		                                    font, font_cx, font_cy, is_header, bg, mk, tx,
+		                                    _cell_breaks, cell_breaks_fn);
 	}
 
 	void draw_table_separator_row(pf::draw_context& draw, const int y, const int left_pad,
@@ -508,10 +511,7 @@ private:
 
 	static bool is_spell_word(const std::string_view text)
 	{
-		return !text.empty() && std::ranges::all_of(text, [](const char ch)
-		{
-			return isalnum(static_cast<unsigned char>(ch)) != 0;
-		});
+		return !text.empty() && std::ranges::all_of(text, is_spell_word_byte);
 	}
 
 	struct text_run
@@ -521,16 +521,12 @@ private:
 		pf::color_t color;
 	};
 
-	std::vector<text_run> build_text_runs(const std::string_view text, const span_type type,
-	                                      const pf::color_t base_color) const
+	void build_text_runs(const std::string_view text, const span_type type,
+	                     const pf::color_t base_color, std::vector<text_run>& runs) const
 	{
-		std::vector<text_run> runs;
+		runs.clear();
 		const auto spell_enabled = _doc && _doc->spell_check() && spell_check_span(type);
 		const auto error_color = style_to_color(style::error_text);
-		auto is_word_char = [](const char ch)
-		{
-			return isalnum(static_cast<unsigned char>(ch)) != 0;
-		};
 
 		const auto push_run = [&](const int start, const int length, const pf::color_t color)
 		{
@@ -549,9 +545,9 @@ private:
 		{
 			int next = pos + 1;
 			auto color = base_color;
-			if (is_word_char(text[pos]))
+			if (is_spell_word_byte(text[pos]))
 			{
-				while (next < len && is_word_char(text[next]))
+				while (next < len && is_spell_word_byte(text[next]))
 					next++;
 				const auto word = text.substr(pos, next - pos);
 				if (spell_enabled && is_spell_word(word) && !spell_check_word(word))
@@ -559,14 +555,12 @@ private:
 			}
 			else
 			{
-				while (next < len && !is_word_char(text[next]))
+				while (next < len && !is_spell_word_byte(text[next]))
 					next++;
 			}
 			push_run(pos, next - pos, color);
 			pos = next;
 		}
-
-		return runs;
 	}
 
 	void draw_run(pf::draw_context& draw, const pf::irect& rc, pf::ipoint& origin,
@@ -613,11 +607,15 @@ private:
 		}
 	}
 
-	static line_info parse_line(const std::string_view text)
+	static void parse_line(const std::string_view text, line_info& info)
 	{
-		line_info info;
+		info.heading_level = 0;
+		info.is_list = false;
+		info.content_start = 0;
+		info.spans.clear();
+
 		if (text.empty())
-			return info;
+			return;
 
 		int pos = 0;
 		const auto len = static_cast<int>(text.size());
@@ -637,7 +635,7 @@ private:
 				info.spans.push_back({0, pos + 1, span_type::marker});
 				info.content_start = pos + 1;
 				parse_inline(text, pos + 1, info);
-				return info;
+				return;
 			}
 			pos = 0; // not a valid heading
 		}
@@ -650,7 +648,7 @@ private:
 			info.spans.push_back({1, 1, span_type::plain});
 			info.content_start = 2;
 			parse_inline(text, 2, info);
-			return info;
+			return;
 		}
 
 		// Check for ordered list (digit(s) followed by ". ")
@@ -665,13 +663,12 @@ private:
 				info.spans.push_back({p + 1, 1, span_type::plain});
 				info.content_start = p + 2;
 				parse_inline(text, p + 2, info);
-				return info;
+				return;
 			}
 		}
 
 		// Plain line with inline formatting
 		parse_inline(text, 0, info);
-		return info;
 	}
 
 	static void parse_inline(const std::string_view text, const int start, line_info& info)
@@ -855,8 +852,8 @@ private:
 			const auto color = color_for_span(span.type, info.heading_level);
 			const auto text = line_text.substr(vis_start, vis_len);
 
-			const auto runs = build_text_runs(text, span.type, color);
-			for (const auto& run : runs)
+			build_text_runs(text, span.type, color, _runs);
+			for (const auto& run : _runs)
 			{
 				draw_run(draw, rc, origin,
 				         text.substr(run.start, run.length),
@@ -865,5 +862,25 @@ private:
 				         sel_begin, sel_end, sel_text_color, sel_bg_color);
 			}
 		}
+	}
+
+	// Layout and paint scratch, reused for every line so drawing allocates nothing
+	mutable std::string _line_buf;
+	mutable std::string _table_buf;
+	mutable line_info _line_info;
+	mutable std::vector<int> _breaks;
+	mutable std::vector<int> _cell_breaks;
+	mutable std::vector<text_run> _runs;
+	mutable std::vector<std::string_view> _cells;
+
+	// Fills the caller's buffer, so wrapping a cell costs no allocation
+	static void cell_breaks_fn(std::vector<int>& out, const std::string_view text, const int col_w)
+	{
+		calc_word_breaks_into(out, text, col_w, [](int, int) { return 1; });
+	}
+
+	void wrap_line_into(const std::string_view text, const int cols) const
+	{
+		calc_word_breaks_into(_breaks, text, cols, [](int, int) { return 1; });
 	}
 };

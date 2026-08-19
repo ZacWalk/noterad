@@ -47,9 +47,6 @@ public:
 
 	~text_view() override = default;
 
-	// --- Line text access (implemented by derived views) ---
-	virtual void render_line(int line_num, std::string& out) const = 0;
-
 	// --- Text selection interface ---
 	// Virtual methods for text selection, coordinating with document selection logic.
 	[[nodiscard]] virtual text_selection current_selection() const = 0;
@@ -112,7 +109,7 @@ public:
 	// --- frame_reactor interface ---
 
 	uint32_t handle_message(pf::window_frame_ptr window, const pf::message_type msg,
-	                        const uintptr_t wParam, const intptr_t lParam) override
+	                        const pf::message_params& params) override
 	{
 		using mt = pf::message_type;
 
@@ -201,12 +198,6 @@ public:
 		_events.invalidate(invalid::windows);
 	}
 
-	void scroll_to_end()
-	{
-		_scroll_offset.y = max_scroll_y();
-		_events.invalidate(invalid::windows);
-	}
-
 	// --- Clipboard ---
 
 	std::string clipboard_text() const
@@ -239,6 +230,11 @@ public:
 	virtual void lines_changed(pf::window_frame_ptr& window, const int start, const int end)
 	{
 		invalidate_lines(window, start, end);
+	}
+
+	virtual void line_count_changed(pf::window_frame_ptr& window, const int at, const int delta)
+	{
+		invalidate(window);
 	}
 
 protected:
@@ -309,16 +305,7 @@ protected:
 		}
 	}
 
-	template <typename AdvanceFn>
-	static std::vector<int> calc_word_breaks(const std::string_view text, const int max_cols,
-	                                         AdvanceFn&& char_advance)
-	{
-		std::vector<int> breaks;
-		calc_word_breaks_into(breaks, text, max_cols, std::forward<AdvanceFn>(char_advance));
-		return breaks;
-	}
-
-	virtual void draw_view(pf::window_frame_ptr& window,
+virtual void draw_view(pf::window_frame_ptr& window,
 	                       pf::draw_context& draw) const = 0;
 
 	virtual void on_char(pf::window_frame_ptr& window, const char32_t c)
@@ -340,29 +327,8 @@ protected:
 			_events.on_escape();
 			return true;
 		}
-
 		if (ctrl && !shift)
 		{
-			if (vk == 'C' || vk == pk::Insert)
-			{
-				set_clipboard(select_text());
-				return true;
-			}
-			if (vk == 'A')
-			{
-				select_all();
-				return true;
-			}
-			if (vk == pk::Home)
-			{
-				scroll_to_top();
-				return true;
-			}
-			if (vk == pk::End)
-			{
-				scroll_to_end();
-				return true;
-			}
 			if (vk == 0xBB /*VK_OEM_PLUS*/ || vk == 0x6B /*VK_ADD*/)
 			{
 				zoom(window, 2);

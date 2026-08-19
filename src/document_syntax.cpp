@@ -225,50 +225,99 @@ static void add_block(text_block* pBuf, int& nActualItems, const int pos, const 
 	}
 }
 
-uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
-                       int& nActualItems)
+// Everything that distinguishes one C-like language from another in the scanner below
+struct syntax_rules
+{
+	syntax_lang lang;
+	std::string_view line_comment;
+	std::string_view block_open; // empty when the language has no block comment
+	std::string_view block_close;
+	char escape;
+	bool hash_preprocessor; // '#' at the first non-space starts a directive
+	bool dash_in_identifiers;
+	bool line_continuation; // a trailing backslash carries the state to the next line
+};
+
+static constexpr syntax_rules cpp_rules{syntax_lang::cpp, "//", "/*", "*/", '\\', true, false, true};
+static constexpr syntax_rules rust_rules{syntax_lang::rust, "//", "/*", "*/", '\\', false, false, false};
+static constexpr syntax_rules python_rules{syntax_lang::python, "#", {}, {}, '\\', false, false, false};
+static constexpr syntax_rules ps1_rules{syntax_lang::ps1, "#", "<#", "#>", '`', false, true, false};
+
+// A two-character token is matched on its second character, so the block starts one back
+static bool token_at(const std::string_view line, const int i, const std::string_view token, int& start)
+{
+	if (token.empty())
+		return false;
+
+	if (token.size() == 1)
+	{
+		if (line[i] != token[0]) return false;
+		start = i;
+		return true;
+	}
+
+	if (i == 0 || line[i] != token[1] || line[i - 1] != token[0]) return false;
+	start = i - 1;
+	return true;
+}
+
+static uint32_t highlight_code(const syntax_rules& rules, uint32_t dwCookie,
+                               const std::string_view line_view, text_block* pBuf, int& nActualItems)
 {
 	nActualItems = 0;
 
 	if (line_view.empty())
-	{
 		return dwCookie & COOKIE_EXT_COMMENT;
-	}
 
 	const auto len = static_cast<int>(line_view.size());
-	auto bFirstChar = (dwCookie & ~COOKIE_EXT_COMMENT) == 0;
-	auto bRedefineBlock = true;
-	auto bDecIndex = false;
+
+	// Only a carried block comment can precede the '#' of a directive
+	auto first_char = (dwCookie & ~COOKIE_EXT_COMMENT) == 0;
+	auto redefine_block = true;
+	auto dec_index = false;
 	auto block_start = -1;
 	auto i = 0;
 
+	const auto is_identifier_char = [&rules](const char c)
+	{
+		return is_alnum32(c) || c == '_' || c == '.' || (rules.dash_in_identifiers && c == '-');
+	};
+
+	const auto flush_identifier = [&](const int end)
+	{
+		const auto word = line_view.substr(block_start, end - block_start);
+
+		if (is_keyword(rules.lang, word))
+			add_block(pBuf, nActualItems, block_start, style::code_keyword);
+		else if (is_number(word))
+			add_block(pBuf, nActualItems, block_start, style::code_number);
+	};
+
+	// An odd run of escape characters before a quote means the quote is escaped
+	const auto quote_is_escaped = [&](const int pos)
+	{
+		auto count = 0;
+		for (auto j = pos - 1; j >= 0 && line_view[j] == rules.escape; j--) count++;
+		return count % 2 != 0;
+	};
+
 	for (i = 0;; i++)
 	{
-		if (bRedefineBlock)
+		if (redefine_block)
 		{
-			auto nPos = i;
-			if (bDecIndex)
-				nPos--;
+			const auto pos = dec_index ? i - 1 : i;
 
 			if (dwCookie & (COOKIE_COMMENT | COOKIE_EXT_COMMENT))
-			{
-				add_block(pBuf, nActualItems, nPos, style::code_comment);
-			}
+				add_block(pBuf, nActualItems, pos, style::code_comment);
 			else if (dwCookie & (COOKIE_CHAR | COOKIE_STRING))
-			{
-				add_block(pBuf, nActualItems, nPos, style::code_string);
-			}
+				add_block(pBuf, nActualItems, pos, style::code_string);
 			else if (dwCookie & COOKIE_PREPROCESSOR)
-			{
-				add_block(pBuf, nActualItems, nPos, style::code_preprocessor);
-			}
+				add_block(pBuf, nActualItems, pos, style::code_preprocessor);
 			else
-			{
-				add_block(pBuf, nActualItems, nPos, style::normal_text);
-			}
+				add_block(pBuf, nActualItems, pos, style::normal_text);
 
-			bRedefineBlock = false;
-			bDecIndex = false;
+			redefine_block = false;
+			dec_index = false;
 		}
 
 		if (i == len)
@@ -277,74 +326,62 @@ uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text
 		if (dwCookie & COOKIE_COMMENT)
 		{
 			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
 			break;
 		}
 
 		const auto c = line_view[i];
 
-		//	String constant "...."
 		if (dwCookie & COOKIE_STRING)
 		{
-			if (c == '"')
+			if (c == '"' && !quote_is_escaped(i))
 			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_STRING;
-					bRedefineBlock = true;
-				}
+				dwCookie &= ~COOKIE_STRING;
+				redefine_block = true;
 			}
 			continue;
 		}
 
-		//	Char constant '..'
 		if (dwCookie & COOKIE_CHAR)
 		{
-			if (c == '\'')
+			if (c == '\'' && !quote_is_escaped(i))
 			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_CHAR;
-					bRedefineBlock = true;
-				}
+				dwCookie &= ~COOKIE_CHAR;
+				redefine_block = true;
 			}
 			continue;
 		}
 
-		//	Extended comment /*....*/
+		auto token_start = 0;
+
 		if (dwCookie & COOKIE_EXT_COMMENT)
 		{
-			if (i > 0 && c == '/' && line_view[i - 1] == '*')
+			if (token_at(line_view, i, rules.block_close, token_start))
 			{
 				dwCookie &= ~COOKIE_EXT_COMMENT;
-				bRedefineBlock = true;
+				redefine_block = true;
 			}
 			continue;
 		}
 
-		if (i > 0 && c == '/' && line_view[i - 1] == '/')
+		// Block comment before line comment, or PowerShell's '<#' reads as a '#' comment
+		if (token_at(line_view, i, rules.block_open, token_start))
 		{
-			add_block(pBuf, nActualItems, i - 1, style::code_comment);
+			add_block(pBuf, nActualItems, token_start, style::code_comment);
+			dwCookie |= COOKIE_EXT_COMMENT;
+			continue;
+		}
+
+		if (token_at(line_view, i, rules.line_comment, token_start))
+		{
+			add_block(pBuf, nActualItems, token_start, style::code_comment);
 			dwCookie |= COOKIE_COMMENT;
 			break;
 		}
 
-		//	Preprocessor directive #....
+		// The remainder of a directive keeps the directive colour
 		if (dwCookie & COOKIE_PREPROCESSOR)
-		{
-			if (i > 0 && c == '*' && line_view[i - 1] == '/')
-			{
-				add_block(pBuf, nActualItems, i - 1, style::code_comment);
-				dwCookie |= COOKIE_EXT_COMMENT;
-			}
 			continue;
-		}
 
-		//	Normal text
 		if (c == '"')
 		{
 			add_block(pBuf, nActualItems, i, style::code_string);
@@ -359,14 +396,7 @@ uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text
 			continue;
 		}
 
-		if (i > 0 && c == '*' && line_view[i - 1] == '/')
-		{
-			add_block(pBuf, nActualItems, i - 1, style::code_comment);
-			dwCookie |= COOKIE_EXT_COMMENT;
-			continue;
-		}
-
-		if (bFirstChar)
+		if (rules.hash_preprocessor && first_char)
 		{
 			if (c == '#')
 			{
@@ -375,56 +405,33 @@ uint32_t highlight_cpp(uint32_t dwCookie, const std::string_view line_view, text
 				continue;
 			}
 			if (!is_space32(c))
-				bFirstChar = false;
+				first_char = false;
 		}
 
+		// Keywords and numbers only matter when blocks are being collected
 		if (pBuf == nullptr)
-			continue; //	We don't need to extract keywords,
-		//	for faster parsing skip the rest of loop
+			continue;
 
-		if (is_alnum32(c) || c == '_' || c == '.')
+		if (is_identifier_char(c))
 		{
 			if (block_start == -1)
 				block_start = i;
 		}
-		else
+		else if (block_start >= 0)
 		{
-			if (block_start >= 0)
-			{
-				const auto block_len = i - block_start;
-
-				if (is_keyword(syntax_lang::cpp, line_view.substr(block_start, block_len)))
-				{
-					add_block(pBuf, nActualItems, block_start, style::code_keyword);
-				}
-				else if (is_number(line_view.substr(block_start, block_len)))
-				{
-					add_block(pBuf, nActualItems, block_start, style::code_number);
-				}
-
-				bRedefineBlock = true;
-				bDecIndex = true;
-				block_start = -1;
-			}
+			flush_identifier(i);
+			redefine_block = true;
+			dec_index = true;
+			block_start = -1;
 		}
 	}
 
 	if (block_start >= 0)
-	{
-		const auto block_len = i - block_start;
+		flush_identifier(i);
 
-		if (is_keyword(syntax_lang::cpp, line_view.substr(block_start, block_len)))
-		{
-			add_block(pBuf, nActualItems, block_start, style::code_keyword);
-		}
-		else if (is_number(line_view.substr(block_start, block_len)))
-		{
-			add_block(pBuf, nActualItems, block_start, style::code_number);
-		}
-	}
-
-	if (line_view[len - 1] != '\\')
+	if (!rules.line_continuation || line_view[len - 1] != '\\')
 		dwCookie &= COOKIE_EXT_COMMENT;
+
 	return dwCookie;
 }
 
@@ -464,32 +471,6 @@ uint32_t highlight_text(uint32_t dwCookie, const std::string_view line_view, tex
 				block_start = -1;
 			}
 		}
-	}
-
-	return 0;
-}
-
-uint32_t highlight_hex(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
-                       int& nActualItems)
-{
-	nActualItems = 0;
-	if (line_view.empty()) return 0;
-
-	const auto len = static_cast<int>(line_view.size());
-
-	// Offset address (first 8 hex chars + 2 spaces) -> number color
-	add_block(pBuf, nActualItems, 0, style::code_number);
-
-	// Hex bytes section -> keyword color
-	if (len > 10)
-		add_block(pBuf, nActualItems, 10, style::code_keyword);
-
-	// Find the ASCII separator "|"
-	const auto bar_pos = line_view.find(u8'|', 10);
-	if (bar_pos != std::string_view::npos)
-	{
-		// ASCII section -> string color
-		add_block(pBuf, nActualItems, static_cast<int>(bar_pos), style::code_string);
 	}
 
 	return 0;
@@ -650,379 +631,6 @@ uint32_t highlight_markdown(uint32_t dwCookie, const std::string_view line_view,
 	return 0;
 }
 
-uint32_t highlight_rust(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
-                        int& nActualItems)
-{
-	nActualItems = 0;
-	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
-	const auto len = static_cast<int>(line_view.size());
-	auto bRedefineBlock = true;
-	auto bDecIndex = false;
-	auto block_start = -1;
-	auto i = 0;
-	for (i = 0;; i++)
-	{
-		if (bRedefineBlock)
-		{
-			auto nPos = i;
-			if (bDecIndex) nPos--;
-			if (dwCookie & (COOKIE_COMMENT | COOKIE_EXT_COMMENT))
-				add_block(
-					pBuf, nActualItems, nPos, style::code_comment);
-			else if (dwCookie & (COOKIE_CHAR | COOKIE_STRING)) add_block(pBuf, nActualItems, nPos, style::code_string);
-			else if (dwCookie & COOKIE_PREPROCESSOR) add_block(pBuf, nActualItems, nPos, style::code_preprocessor);
-			else add_block(pBuf, nActualItems, nPos, style::normal_text);
-			bRedefineBlock = false;
-			bDecIndex = false;
-		}
-		if (i == len) break;
-		if (dwCookie & COOKIE_COMMENT)
-		{
-			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		const auto c = line_view[i];
-		if (dwCookie & COOKIE_STRING)
-		{
-			if (c == '"')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_STRING;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (dwCookie & COOKIE_CHAR)
-		{
-			if (c == '\'')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_CHAR;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (dwCookie & COOKIE_EXT_COMMENT)
-		{
-			if (i > 0 && c == '/' && line_view[i - 1] == '*')
-			{
-				dwCookie &= ~COOKIE_EXT_COMMENT;
-				bRedefineBlock = true;
-			}
-			continue;
-		}
-		if (i > 0 && c == '/' && line_view[i - 1] == '/')
-		{
-			add_block(pBuf, nActualItems, i - 1, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		if (dwCookie & COOKIE_PREPROCESSOR)
-		{
-			if (i > 0 && c == '*' && line_view[i - 1] == '/')
-			{
-				add_block(pBuf, nActualItems, i - 1, style::code_comment);
-				dwCookie |= COOKIE_EXT_COMMENT;
-			}
-			continue;
-		}
-		if (c == '"')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_STRING;
-			continue;
-		}
-		if (c == '\'')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_CHAR;
-			continue;
-		}
-		if (i > 0 && c == '*' && line_view[i - 1] == '/')
-		{
-			add_block(pBuf, nActualItems, i - 1, style::code_comment);
-			dwCookie |= COOKIE_EXT_COMMENT;
-			continue;
-		}
-		// Rust uses # for attributes, not preprocessor
-		if (pBuf == nullptr) continue;
-		if (is_alnum32(c) || c == '_' || c == '.') { if (block_start == -1) block_start = i; }
-		else
-		{
-			if (block_start >= 0)
-			{
-				const auto block_len = i - block_start;
-				if (is_keyword(syntax_lang::rust, line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_keyword);
-				else if (is_number(line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_number);
-				bRedefineBlock = true;
-				bDecIndex = true;
-				block_start = -1;
-			}
-		}
-	}
-	if (block_start >= 0)
-	{
-		const auto block_len = i - block_start;
-		if (is_keyword(syntax_lang::rust, line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_keyword);
-		else if (is_number(line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_number);
-	}
-	dwCookie &= COOKIE_EXT_COMMENT;
-	return dwCookie;
-}
-
-uint32_t highlight_python(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
-                          int& nActualItems)
-{
-	nActualItems = 0;
-	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
-	const auto len = static_cast<int>(line_view.size());
-	auto bRedefineBlock = true;
-	auto bDecIndex = false;
-	auto block_start = -1;
-	auto i = 0;
-	for (i = 0;; i++)
-	{
-		if (bRedefineBlock)
-		{
-			auto nPos = i;
-			if (bDecIndex) nPos--;
-			if (dwCookie & (COOKIE_COMMENT | COOKIE_EXT_COMMENT))
-				add_block(
-					pBuf, nActualItems, nPos, style::code_comment);
-			else if (dwCookie & (COOKIE_CHAR | COOKIE_STRING)) add_block(pBuf, nActualItems, nPos, style::code_string);
-			else add_block(pBuf, nActualItems, nPos, style::normal_text);
-			bRedefineBlock = false;
-			bDecIndex = false;
-		}
-		if (i == len) break;
-		if (dwCookie & COOKIE_COMMENT)
-		{
-			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		const auto c = line_view[i];
-		// Simplified quote escaping for Python
-		if (dwCookie & COOKIE_STRING)
-		{
-			if (c == '"')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_STRING;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (dwCookie & COOKIE_CHAR)
-		{
-			if (c == '\'')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '\\'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_CHAR;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (c == '#')
-		{
-			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		if (c == '"')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_STRING;
-			continue;
-		}
-		if (c == '\'')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_CHAR;
-			continue;
-		}
-		if (pBuf == nullptr) continue;
-		if (is_alnum32(c) || c == '_' || c == '.') { if (block_start == -1) block_start = i; }
-		else
-		{
-			if (block_start >= 0)
-			{
-				const auto block_len = i - block_start;
-				if (is_keyword(syntax_lang::python, line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_keyword);
-				else if (is_number(line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_number);
-				bRedefineBlock = true;
-				bDecIndex = true;
-				block_start = -1;
-			}
-		}
-	}
-	if (block_start >= 0)
-	{
-		const auto block_len = i - block_start;
-		if (is_keyword(syntax_lang::python, line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_keyword);
-		else if (is_number(line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_number);
-	}
-	return dwCookie & COOKIE_EXT_COMMENT;
-}
-
-uint32_t highlight_ps1(uint32_t dwCookie, const std::string_view line_view, text_block* pBuf,
-                       int& nActualItems)
-{
-	nActualItems = 0;
-	if (line_view.empty()) return dwCookie & COOKIE_EXT_COMMENT;
-	const auto len = static_cast<int>(line_view.size());
-	auto bRedefineBlock = true;
-	auto bDecIndex = false;
-	auto block_start = -1;
-	auto i = 0;
-	for (i = 0;; i++)
-	{
-		if (bRedefineBlock)
-		{
-			auto nPos = i;
-			if (bDecIndex) nPos--;
-			if (dwCookie & (COOKIE_COMMENT | COOKIE_EXT_COMMENT))
-				add_block(
-					pBuf, nActualItems, nPos, style::code_comment);
-			else if (dwCookie & (COOKIE_CHAR | COOKIE_STRING)) add_block(pBuf, nActualItems, nPos, style::code_string);
-			else add_block(pBuf, nActualItems, nPos, style::normal_text);
-			bRedefineBlock = false;
-			bDecIndex = false;
-		}
-		if (i == len) break;
-		if (dwCookie & COOKIE_COMMENT)
-		{
-			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		const auto c = line_view[i];
-		// PS uses backtick  to escape but let's keep it simple here or standard slash
-		if (dwCookie & COOKIE_STRING)
-		{
-			if (c == '"')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '`'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_STRING;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (dwCookie & COOKIE_CHAR)
-		{
-			if (c == '\'')
-			{
-				int bs = 0;
-				for (int j = i - 1; j >= 0 && line_view[j] == '`'; j--) bs++;
-				if (bs % 2 == 0)
-				{
-					dwCookie &= ~COOKIE_CHAR;
-					bRedefineBlock = true;
-				}
-			}
-			continue;
-		}
-		if (dwCookie & COOKIE_EXT_COMMENT)
-		{
-			if (i > 0 && c == '>' && line_view[i - 1] == '#')
-			{
-				dwCookie &= ~COOKIE_EXT_COMMENT;
-				bRedefineBlock = true;
-			}
-			continue;
-		}
-		if (i > 0 && c == '#' && line_view[i - 1] == '<')
-		{
-			add_block(pBuf, nActualItems, i - 1, style::code_comment);
-			dwCookie |= COOKIE_EXT_COMMENT;
-			continue;
-		}
-		if (c == '#' && (i == 0 || line_view[i - 1] != '<'))
-		{
-			add_block(pBuf, nActualItems, i, style::code_comment);
-			dwCookie |= COOKIE_COMMENT;
-			break;
-		}
-		if (c == '"')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_STRING;
-			continue;
-		}
-		if (c == '\'')
-		{
-			add_block(pBuf, nActualItems, i, style::code_string);
-			dwCookie |= COOKIE_CHAR;
-			continue;
-		}
-		if (pBuf == nullptr) continue;
-		if (is_alnum32(c) || c == '_' || c == '.' || c == '-') { if (block_start == -1) block_start = i; }
-		else
-		{
-			if (block_start >= 0)
-			{
-				const auto block_len = i - block_start;
-				if (is_keyword(syntax_lang::ps1, line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_keyword);
-				else if (is_number(line_view.substr(block_start, block_len)))
-					add_block(
-						pBuf, nActualItems, block_start, style::code_number);
-				bRedefineBlock = true;
-				bDecIndex = true;
-				block_start = -1;
-			}
-		}
-	}
-	if (block_start >= 0)
-	{
-		const auto block_len = i - block_start;
-		if (is_keyword(syntax_lang::ps1, line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_keyword);
-		else if (is_number(line_view.substr(block_start, block_len)))
-			add_block(
-				pBuf, nActualItems, block_start, style::code_number);
-	}
-	return dwCookie & COOKIE_EXT_COMMENT;
-}
 
 static bool is_ps1_extension(const std::string_view ext)
 {
@@ -1062,11 +670,11 @@ highlight_fn select_highlighter(const doc_type type, const pf::file_path& path)
 	switch (type)
 	{
 	case doc_type::hex:
-		return highlight_hex;
+	case doc_type::csv:
+		// Both render their own text and never consult the highlighter
+		return highlight_text;
 	case doc_type::markdown:
 		return highlight_markdown;
-	case doc_type::csv:
-		return highlight_text;
 	default:
 		break;
 	}
@@ -1074,13 +682,21 @@ highlight_fn select_highlighter(const doc_type type, const pf::file_path& path)
 	auto ext = path.extension();
 	if (!ext.empty() && ext.starts_with('.')) ext = ext.substr(1);
 
+	const auto code_highlighter = [](const syntax_rules& rules)
+	{
+		return [&rules](const uint32_t cookie, const std::string_view line, text_block* buf, int& count)
+		{
+			return highlight_code(rules, cookie, line, buf, count);
+		};
+	};
+
 	if (is_cpp_extension(ext))
-		return highlight_cpp;
+		return code_highlighter(cpp_rules);
 	if (is_rust_extension(ext))
-		return highlight_rust;
+		return code_highlighter(rust_rules);
 	if (is_python_extension(ext))
-		return highlight_python;
+		return code_highlighter(python_rules);
 	if (is_ps1_extension(ext))
-		return highlight_ps1;
+		return code_highlighter(ps1_rules);
 	return highlight_text;
 }

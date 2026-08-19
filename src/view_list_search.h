@@ -224,6 +224,9 @@ public:
 	{
 	}
 
+	// Total matches found, independent of which groups are expanded
+	[[nodiscard]] int result_count() const { return _result_count; }
+
 	uint32_t handle_mouse(pf::window_frame_ptr window, const pf::mouse_message_type msg,
 	                      const pf::mouse_params& params) override
 	{
@@ -413,15 +416,22 @@ public:
 			build_folder_items(items, root->children);
 		_items = std::move(items);
 
-		_result_count = 0;
-		for (const auto& i : _items)
-			if (!i->is_group) _result_count++;
+		// Counted from the matches themselves, so collapsing a group does not change the total
+		_result_count = root ? count_results(root) : 0;
 
 		_events.invalidate(invalid::search_layout);
 		layout_list();
 	}
 
 private:
+	static int count_results(const index_item_ptr& item)
+	{
+		auto total = static_cast<int>(item->search_results.size());
+		for (const auto& child : item->children)
+			total += count_results(child);
+		return total;
+	}
+
 	void on_context_menu(const pf::window_frame_ptr& window, const pf::ipoint& screen_pt)
 	{
 		window->set_focus();

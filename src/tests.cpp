@@ -5,6 +5,7 @@
 #include "document.h"
 #include "app_state.h"
 #include "view_doc.h"
+#include "view_list_search.h"
 #include "calc.h"
 #include "test.h"
 
@@ -21,6 +22,10 @@ public:
 	}
 
 	void lines_changed(int, int) override
+	{
+	}
+
+	void line_count_changed(int, int) override
 	{
 	}
 
@@ -140,6 +145,17 @@ struct stub_window_frame final : pf::window_frame
 	void accept_drop_files(bool) override
 	{
 	}
+};
+
+// stub_measure_context — fixed monospace metrics so layout is deterministic in tests
+struct stub_measure_context final : pf::measure_context
+{
+	pf::isize measure_text(const std::string_view text, const pf::font&) const override
+	{
+		return {static_cast<int>(pf::utf8_codepoint_count(text)) * 8, 16};
+	}
+
+	pf::isize measure_char(const pf::font&) const override { return {8, 16}; }
 };
 
 static void insert_chars(const document_ptr& doc, const std::string_view chars,
@@ -754,6 +770,234 @@ static void should_md_highlight_list()
 	should::is_equal(0, blocks[0]._char_pos, "md list bullet pos");
 }
 
+// ── Code highlighting ──────────────────────────────────────────────────────────────────
+
+struct highlight_result
+{
+	text_block blocks[256];
+	int count = 0;
+	uint32_t cookie = 0;
+
+	[[nodiscard]] style style_at(const int char_pos) const
+	{
+		auto result = style::normal_text;
+		for (int i = 0; i < count && blocks[i]._char_pos <= char_pos; i++)
+			result = blocks[i]._color;
+		return result;
+	}
+};
+
+static highlight_result run_highlighter(const pf::file_path& path, const std::string_view text,
+                                        const uint32_t cookie_in = 0)
+{
+	highlight_result result;
+	const auto highlighter = select_highlighter(doc_type::text, path);
+	result.cookie = highlighter(cookie_in, text, result.blocks, result.count);
+	return result;
+}
+
+static void should_highlight_cpp()
+{
+	const pf::file_path path{"a.cpp"};
+
+	const auto keyword = run_highlighter(path, "int x = 42;");
+	should::is_equal(static_cast<int>(style::code_keyword), static_cast<int>(keyword.style_at(0)),
+	                 "cpp keyword");
+	should::is_equal(static_cast<int>(style::code_number), static_cast<int>(keyword.style_at(8)),
+	                 "cpp number");
+
+	const auto comment = run_highlighter(path, "x = 1; // trailing");
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(comment.style_at(8)),
+	                 "cpp line comment");
+
+	const auto str = run_highlighter(path, "auto s = \"text\";");
+	should::is_equal(static_cast<int>(style::code_string), static_cast<int>(str.style_at(10)),
+	                 "cpp string");
+
+	const auto prep = run_highlighter(path, "#include <vector>");
+	should::is_equal(static_cast<int>(style::code_preprocessor), static_cast<int>(prep.style_at(1)),
+	                 "cpp preprocessor");
+
+	// A block comment carries into the next line through the cookie
+	const auto opened = run_highlighter(path, "/* start");
+	should::is_equal_true(opened.cookie != 0, "cpp block comment opens");
+	const auto carried = run_highlighter(path, "still comment", opened.cookie);
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(carried.style_at(0)),
+	                 "cpp block comment carries");
+	const auto closed = run_highlighter(path, "end */", opened.cookie);
+	should::is_equal(0, static_cast<int>(closed.cookie), "cpp block comment closes");
+
+	// An escaped quote does not end the string
+	const auto escaped = run_highlighter(path, "\"a\\\"b\" + c");
+	should::is_equal(static_cast<int>(style::code_string), static_cast<int>(escaped.style_at(4)),
+	                 "cpp escaped quote stays in string");
+}
+
+static void should_highlight_rust()
+{
+	const pf::file_path path{"a.rs"};
+
+	const auto keyword = run_highlighter(path, "fn main() {}");
+	should::is_equal(static_cast<int>(style::code_keyword), static_cast<int>(keyword.style_at(0)),
+	                 "rust keyword");
+
+	const auto comment = run_highlighter(path, "let x = 1; // note");
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(comment.style_at(12)),
+	                 "rust line comment");
+
+	// Rust has no preprocessor: an attribute is not a directive
+	const auto attribute = run_highlighter(path, "#[derive(Debug)]");
+	should::is_equal(0, static_cast<int>(attribute.cookie), "rust attribute is not preprocessor");
+	should::is_equal(false, attribute.style_at(1) == style::code_preprocessor,
+	                 "rust attribute not coloured as preprocessor");
+
+	const auto opened = run_highlighter(path, "/* start");
+	should::is_equal_true(opened.cookie != 0, "rust block comment opens");
+}
+
+static void should_highlight_python()
+{
+	const pf::file_path path{"a.py"};
+
+	const auto keyword = run_highlighter(path, "def main():");
+	should::is_equal(static_cast<int>(style::code_keyword), static_cast<int>(keyword.style_at(0)),
+	                 "python keyword");
+
+	const auto comment = run_highlighter(path, "x = 1  # note");
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(comment.style_at(7)),
+	                 "python comment");
+
+	// '#' is a comment, not a C-style preprocessor directive
+	const auto hash_first = run_highlighter(path, "# whole line");
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(hash_first.style_at(0)),
+	                 "python leading hash is a comment");
+
+	// A slash pair is division, not a comment
+	const auto div = run_highlighter(path, "y = a // b");
+	should::is_equal(false, div.style_at(7) == style::code_comment,
+	                 "python floor division is not a comment");
+
+	const auto str = run_highlighter(path, "s = 'text'");
+	should::is_equal(static_cast<int>(style::code_string), static_cast<int>(str.style_at(5)),
+	                 "python string");
+}
+
+static void should_highlight_powershell()
+{
+	const pf::file_path path{"a.ps1"};
+
+	const auto keyword = run_highlighter(path, "function Get-Thing {}");
+	should::is_equal(static_cast<int>(style::code_keyword), static_cast<int>(keyword.style_at(0)),
+	                 "ps1 keyword");
+
+	// PowerShell keywords are case-insensitive
+	const auto upper = run_highlighter(path, "FOREACH ($x in $y) {}");
+	should::is_equal(static_cast<int>(style::code_keyword), static_cast<int>(upper.style_at(0)),
+	                 "ps1 keyword is case insensitive");
+
+	const auto comment = run_highlighter(path, "$x = 1 # note");
+	should::is_equal(static_cast<int>(style::code_comment), static_cast<int>(comment.style_at(7)),
+	                 "ps1 comment");
+
+	// Backtick is the escape character, so a backslash does not escape a quote
+	const auto backslash = run_highlighter(path, "\"a\\\" + $b");
+	should::is_equal(false, backslash.style_at(8) == style::code_string,
+	                 "ps1 backslash does not escape a quote");
+
+	const auto opened = run_highlighter(path, "<# start");
+	should::is_equal_true(opened.cookie != 0, "ps1 block comment opens");
+	const auto closed = run_highlighter(path, "end #>", opened.cookie);
+	should::is_equal(0, static_cast<int>(closed.cookie), "ps1 block comment closes");
+}
+
+static void should_highlight_plain_text()
+{
+	const auto result = run_highlighter(pf::file_path{"a.txt"}, "value 42 here");
+	should::is_equal(static_cast<int>(style::code_number), static_cast<int>(result.style_at(6)),
+	                 "plain text number");
+	should::is_equal(0, static_cast<int>(result.cookie), "plain text has no cookie");
+}
+
+// A word scan must never stop between the bytes of one codepoint, or the spell
+// checker sees fragments and flags correctly spelled words
+static void should_treat_utf8_bytes_as_word_bytes()
+{
+	constexpr std::string_view cafe = "caf\xC3\xA9 au lait";
+
+	int end = 0;
+	while (end < static_cast<int>(cafe.size()) && is_spell_word_byte(cafe[end]))
+		end++;
+
+	should::is_equal(5, end, "accented word scanned whole");
+	should::is_equal(false, is_spell_word_byte(' '), "space is not a word byte");
+	should::is_equal_true(is_spell_word_byte('a'), "letter is a word byte");
+}
+
+static void should_find_text_ignoring_case_for_non_ascii()
+{
+	// A hex escape swallows following hex digits, so the literals are split at each boundary
+	constexpr std::string_view ecole_upper = "\xC3\x89" "COLE";
+	constexpr std::string_view ecole_lower = "\xC3\xA9" "cole";
+
+	should::is_equal(static_cast<size_t>(0), find_in_text(ecole_upper, ecole_lower),
+	                 "accented match folds case");
+	should::is_equal(static_cast<size_t>(4), find_in_text("the caf\xC3\x89 here", "caf\xC3\xA9"),
+	                 "accented match at offset");
+	should::is_equal(std::string_view::npos, find_in_text("caf\xC3\xA9", "caf\xC3\xA8"),
+	                 "different accent does not match");
+	should::is_equal(std::string_view::npos, find_in_text(ecole_upper, ecole_lower, true),
+	                 "case sensitive rejects the fold");
+
+	// A multi-byte character must not be matched from inside its own bytes
+	should::is_equal(static_cast<size_t>(0), find_in_text("\xC3\xA9\xC3\xA9", "\xC3\xA9"),
+	                 "match starts on a codepoint boundary");
+
+	should::is_equal(static_cast<size_t>(6), find_in_text("plain ASCII text", "ascii"),
+	                 "ascii path still folds case");
+}
+
+static void should_apply_gitignore_rules()
+{
+	gitignore_rules rules;
+	rules.add_file("# comment\n\nbin/\n*.obj\n/root-only.txt\ndocs/*.tmp\n!keep.obj\n", {});
+
+	should::is_equal_true(rules.is_ignored("bin", true), "directory rule ignores the folder");
+	should::is_equal(false, rules.is_ignored("bin", false), "directory rule spares a file");
+	should::is_equal_true(rules.is_ignored("src/deep/bin", true), "directory rule applies at any depth");
+
+	should::is_equal_true(rules.is_ignored("a.obj", false), "extension rule");
+	should::is_equal_true(rules.is_ignored("src/a.obj", false), "extension rule at depth");
+	should::is_equal(false, rules.is_ignored("keep.obj", false), "negation re-includes");
+
+	should::is_equal_true(rules.is_ignored("root-only.txt", false), "anchored rule at the root");
+	should::is_equal(false, rules.is_ignored("src/root-only.txt", false), "anchored rule not at depth");
+
+	should::is_equal_true(rules.is_ignored("docs/notes.tmp", false), "path rule matches");
+	should::is_equal(false, rules.is_ignored("docs/sub/notes.tmp", false), "'*' does not cross a slash");
+
+	should::is_equal(false, rules.is_ignored("src/main.cpp", false), "unmatched file is kept");
+}
+
+static void should_apply_nested_gitignore_relative_to_its_folder()
+{
+	gitignore_rules rules;
+	rules.add_file("/local.txt\n", "src");
+
+	should::is_equal_true(rules.is_ignored("src/local.txt", false), "anchored to its own folder");
+	should::is_equal(false, rules.is_ignored("local.txt", false), "does not apply above its folder");
+	should::is_equal(false, rules.is_ignored("other/local.txt", false), "does not apply to a sibling");
+}
+
+static void should_match_gitignore_double_star()
+{
+	gitignore_rules rules;
+	rules.add_file("**/build\nlogs/**\n", {});
+
+	should::is_equal_true(rules.is_ignored("build", true), "'**/' matches at the root");
+	should::is_equal_true(rules.is_ignored("a/b/build", true), "'**/' matches at depth");
+	should::is_equal_true(rules.is_ignored("logs/a/b.txt", false), "trailing '**' matches everything below");
+}
+
 // ── app_state tests ────────────────────────────────────────────────────────────────────
 
 // sync_scheduler — Test stub that executes tasks immediately on the calling thread.
@@ -888,6 +1132,143 @@ static void should_cap_search_results()
 		total += static_cast<int>(entry.second.size());
 
 	should::is_equal(max_search_results, total, "search results capped");
+}
+
+// The header shows the number of matches, which must not change when a group is collapsed
+static void should_count_search_results_when_group_collapsed()
+{
+	const auto state = create_test_app();
+	const auto root = std::make_shared<index_item>(pf::file_path{"c:\\folder"}, "folder", true);
+	const auto file = std::make_shared<index_item>(pf::file_path{"c:\\folder\\a.txt"}, "a.txt", false);
+	file->search_results = {
+		{"one", 0, 0, 0, 3},
+		{"two", 1, 0, 0, 3},
+		{"three", 2, 0, 0, 3},
+	};
+	root->children.push_back(file);
+	state->set_root(root);
+
+	auto& view = *state->_search_view;
+	view.populate();
+	should::is_equal(3, view.result_count(), "matches counted while expanded");
+
+	view._key_to_item[view.make_key(file)]->expanded = false;
+	view.populate();
+	should::is_equal(3, view.result_count(), "matches still counted while collapsed");
+}
+
+// A longer query is answered from the previous hits, so files that already failed are not reread
+static void should_narrow_search_to_previous_matches()
+{
+	const auto state = create_test_app();
+	const auto root = std::make_shared<index_item>(pf::file_path{"c:\\folder"}, "folder", true);
+
+	const auto hit = std::make_shared<index_item>(pf::file_path{"c:\\folder\\hit.txt"}, "hit.txt", false,
+	                                              std::make_shared<document>(null_ev, "alpha beta", true));
+	const auto miss = std::make_shared<index_item>(pf::file_path{"c:\\folder\\miss.txt"}, "miss.txt", false,
+	                                               std::make_shared<document>(null_ev, "nothing here", true));
+	root->children.push_back(hit);
+	root->children.push_back(miss);
+	state->set_root(root);
+
+	state->execute_search("alp");
+	should::is_equal(1, static_cast<int>(hit->search_results.size()), "prefix matched the one file");
+	should::is_equal(0, static_cast<int>(miss->search_results.size()), "prefix missed the other");
+
+	state->execute_search("alpha");
+	should::is_equal(1, static_cast<int>(hit->search_results.size()), "narrowed search still matches");
+	should::is_equal(0, static_cast<int>(miss->search_results.size()), "narrowed search clears the rest");
+
+	// Backspacing widens the query again, so the full folder must be rescanned
+	state->execute_search("nothing");
+	should::is_equal(0, static_cast<int>(hit->search_results.size()), "widened search rescans");
+	should::is_equal(1, static_cast<int>(miss->search_results.size()), "widened search finds the other file");
+}
+
+// Writing a truncated document back would replace the file with only the part that was read
+static void should_refuse_to_save_truncated_document()
+{
+	const auto root = create_temp_test_root();
+	const auto path = root.combine("big.txt");
+	write_test_text_file(path, "original contents");
+
+	const auto d = std::make_shared<document>(null_ev, "partial");
+	loaded_file_data data;
+	data.lines.emplace_back(std::string_view{"partial"});
+	data.truncated = true;
+	data.disk_modified_time = 1; // apply_loaded_data ignores data that never came from disk
+	d->apply_loaded_data(path, std::move(data));
+
+	should::is_equal_true(d->is_truncated(), "document reports truncation");
+	should::is_equal(false, d->save_to_file(path), "save refused");
+	should::is_equal("original contents", read_test_text_file(path), "file left untouched");
+}
+
+static void should_evict_unused_documents()
+{
+	const auto state = create_test_app();
+	const auto disk_root = create_temp_test_root();
+	const auto root = std::make_shared<index_item>(disk_root, disk_root.name(), true);
+	state->set_root(root);
+
+	constexpr int file_count = 30;
+
+	for (int i = 0; i < file_count; i++)
+	{
+		const auto path = disk_root.combine(std::format("f{}.txt", i));
+		write_test_text_file(path, "contents");
+
+		auto item = std::make_shared<index_item>(path, std::string(path.name()), false,
+		                                         std::make_shared<document>(null_ev, "contents"));
+		root->children.push_back(item);
+		state->set_active_item(item);
+	}
+
+	// The active document is kept on top of the budget
+	should::is_equal(static_cast<int>(app_state::max_resident_documents) + 1,
+	                 static_cast<int>(state->resident_document_count()),
+	                 "resident documents capped");
+
+	should::is_equal_true(root->children.back()->doc != nullptr, "active document kept");
+	should::is_equal_true(root->children.front()->doc == nullptr, "least recently used dropped");
+
+	// Unsaved work is never dropped, however old it is
+	const auto modified = std::make_shared<index_item>(disk_root.combine("dirty.txt"), "dirty.txt", false,
+	                                                   std::make_shared<document>(null_ev, "edited", true));
+	write_test_text_file(modified->path, "contents");
+	root->children.push_back(modified);
+
+	for (int i = 0; i < file_count; i++)
+		state->set_active_item(root->children[i]);
+
+	should::is_equal_true(modified->doc != nullptr, "modified document pinned");
+}
+
+// Dragging text deletes the selection before reinserting it, which shifts any target below
+static void should_adjust_drop_target_for_removed_selection()
+{
+	const text_selection same_line(5, 0, 10, 0);
+
+	should::is_equal(2, doc_view::adjust_for_removal(same_line, text_location(2, 0)).x,
+	                 "target before the selection is unchanged");
+	should::is_equal(6, doc_view::adjust_for_removal(same_line, text_location(11, 0)).x,
+	                 "target after the selection shifts back by its width");
+	should::is_equal(0, doc_view::adjust_for_removal(same_line, text_location(11, 0)).y,
+	                 "same line stays on the same line");
+
+	const text_selection multi_line(2, 1, 4, 3);
+
+	const auto later_line = doc_view::adjust_for_removal(multi_line, text_location(7, 5));
+	should::is_equal(7, later_line.x, "a target on a later line keeps its column");
+	should::is_equal(3, later_line.y, "a target on a later line moves up by the line count");
+
+	const auto last_line = doc_view::adjust_for_removal(multi_line, text_location(9, 3));
+	should::is_equal(7, last_line.x, "a target on the final selected line is rebased");
+	should::is_equal(1, last_line.y, "a target on the final selected line joins the first");
+
+	const auto earlier = doc_view::adjust_for_removal(multi_line, text_location(1, 0));
+	should::is_equal(1, earlier.x, "a target above the selection is unchanged");
+	should::is_equal(0, earlier.y, "a target above the selection keeps its line");
 }
 
 static void should_create_new_file_with_content()
@@ -1316,6 +1697,29 @@ static void should_save_preserves_bom_presence()
 	pf::platform_recycle_file(root);
 }
 
+// A UTF-16 file used to come back as UTF-8, silently changing the encoding
+static void should_save_preserves_utf16_encoding()
+{
+	const auto root = create_temp_test_root();
+	const auto path = root.combine("utf16.txt");
+
+	// FF FE BOM followed by "hi" in UTF-16 LE
+	write_test_text_file(path, std::string_view("\xFF\xFE\x68\x00\x69\x00", 6));
+
+	const auto d = std::make_shared<document>(null_ev);
+	d->apply_loaded_data(path, load_lines(path));
+
+	should::is_equal(static_cast<int>(file_encoding::utf16), static_cast<int>(d->encoding()),
+	                 "loaded as UTF-16");
+	should::is_equal("hi", d->str(), "decoded to UTF-8 in memory");
+
+	should::is_equal_true(d->save_to_file(path), "saved UTF-16 file");
+	should::is_equal(std::string("\xFF\xFE\x68\x00\x69\x00", 6), read_test_text_file(path),
+	                 "written back as UTF-16 with its BOM");
+
+	pf::platform_recycle_file(root);
+}
+
 static void should_doc_reformat_json()
 {
 	const auto d = std::make_shared<document>(null_ev, "{\"a\":\"b\"}");
@@ -1445,6 +1849,202 @@ static void should_search_doc_match_positions()
 	should::is_equal(8, item->search_results[1].text_match_start, "second trimmed pos");
 }
 
+static void should_clip_context_of_a_very_long_result_line()
+{
+	const auto state = create_test_app();
+
+	auto line = std::string(4000, 'a');
+	line.replace(3000, 6, "needle");
+
+	const auto item = std::make_shared<index_item>(pf::file_path{"long.txt"}, "long.txt", false,
+	                                               std::make_shared<document>(null_ev, line));
+
+	const auto root = std::make_shared<index_item>(pf::file_path{"root"}, "root", true);
+	root->children.push_back(item);
+	state->set_root(root);
+
+	state->execute_search("needle");
+
+	should::is_equal(1, static_cast<int>(item->search_results.size()), "match count");
+
+	const auto& result = item->search_results.front();
+	should::is_equal_true(result.line_text.size() <= 400, "context clipped to a bounded window");
+	should::is_equal(3000, result.line_match_pos, "match position within the whole line is kept");
+	should::is_equal("needle", result.line_text.substr(result.text_match_start, 6),
+	                 "match offset still points at the match");
+}
+
+// ── Word wrap tests ────────────────────────────────────────────────────────────
+//
+// Structural edits splice the per-line wrap arrays instead of rebuilding them, so
+// every case here checks the spliced result against a forced full rebuild.
+
+static std::shared_ptr<app_state> create_wrapped_test_app()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	state->set_word_wrap(true);
+	state->_doc_view->handle_size(window, pf::isize{400, 320}, measure);
+
+	const auto doc = state->doc();
+	undo_group ug(doc);
+	doc->insert_text(ug, text_location(0, 0),
+	                 "the quick brown fox jumps over the lazy dog and keeps on running for a while\n"
+	                 "short\n"
+	                 "another long line that will certainly need to wrap more than once inside this view\n"
+	                 "\n"
+	                 "a final line that is also long enough to wrap onto more than a single visual row");
+	return state;
+}
+
+static std::string wrap_shape(const std::shared_ptr<app_state>& state)
+{
+	std::string shape;
+	for (int i = 0; i < static_cast<int>(state->doc()->size()); i++)
+		shape += std::format("{},", state->_doc_view->line_visual_rows(i));
+	return shape;
+}
+
+static void should_match_a_full_rebuild(const std::shared_ptr<app_state>& state, const std::string_view message)
+{
+	state->_doc_view->layout();
+	const auto spliced = wrap_shape(state);
+
+	state->_doc_view->mark_wrap_dirty_all();
+	state->_doc_view->layout();
+
+	should::is_equal(wrap_shape(state), spliced, message);
+}
+
+static void should_wrap_long_lines_onto_several_rows()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	should::is_equal_true(state->_doc_view->line_visual_rows(0) > 1, "a long line occupies several rows");
+	should::is_equal(1, state->_doc_view->line_visual_rows(1), "a short line occupies one row");
+	should::is_equal(1, state->_doc_view->line_visual_rows(3), "an empty line occupies one row");
+}
+
+static void should_splice_wrap_when_a_line_is_split()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+	const auto long_line_rows = state->_doc_view->line_visual_rows(2);
+	should::is_equal_true(long_line_rows > 1, "the line below the edit wraps");
+
+	undo_group ug(doc);
+	doc->insert_text(ug, text_location(20, 0), u8'\n');
+
+	should::is_equal(6, static_cast<int>(doc->size()), "a line was added");
+
+	// Before any re-layout the tail has already moved down a row, which it could only
+	// do if the arrays were spliced rather than thrown away and rebuilt
+	should::is_equal(long_line_rows, state->_doc_view->line_visual_rows(3),
+	                 "the untouched line kept its rows at its new index");
+
+	should_match_a_full_rebuild(state, "wrap after splitting a line");
+}
+
+static void should_splice_wrap_when_lines_are_joined()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+	const auto last_line_rows = state->_doc_view->line_visual_rows(4);
+	should::is_equal_true(last_line_rows > 1, "the last line wraps");
+
+	undo_group ug(doc);
+	doc->delete_text(ug, text_location(0, 2));
+
+	should::is_equal(4, static_cast<int>(doc->size()), "a line was removed");
+	should::is_equal(last_line_rows, state->_doc_view->line_visual_rows(3),
+	                 "the untouched last line kept its rows at its new index");
+
+	should_match_a_full_rebuild(state, "wrap after joining two lines");
+}
+
+static void should_splice_wrap_when_a_block_is_deleted()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+	const auto last_line_rows = state->_doc_view->line_visual_rows(4);
+
+	undo_group ug(doc);
+	doc->delete_text(ug, text_selection(text_location(10, 0), text_location(4, 3)));
+
+	should::is_equal(2, static_cast<int>(doc->size()), "three lines were removed");
+	should::is_equal(last_line_rows, state->_doc_view->line_visual_rows(1),
+	                 "the untouched last line kept its rows at its new index");
+
+	should_match_a_full_rebuild(state, "wrap after deleting a multi-line selection");
+}
+
+static void should_splice_wrap_when_a_block_is_inserted()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+	const auto last_line_rows = state->_doc_view->line_visual_rows(4);
+
+	{
+		undo_group ug(doc);
+		doc->insert_text(ug, text_location(5, 1),
+		                 "\nan inserted line long enough that it has to wrap across more than one row\nand another\n");
+	}
+
+	should::is_equal(8, static_cast<int>(doc->size()), "three lines were added");
+	should::is_equal(last_line_rows, state->_doc_view->line_visual_rows(7),
+	                 "the untouched last line kept its rows at its new index");
+
+	should_match_a_full_rebuild(state, "wrap after inserting a block");
+}
+
+static void should_splice_wrap_when_an_edit_is_undone()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+	{
+		undo_group ug(doc);
+		doc->insert_text(ug, text_location(20, 0), u8'\n');
+	}
+	state->_doc_view->layout();
+
+	doc->undo();
+
+	should::is_equal(5, static_cast<int>(doc->size()), "the split was undone");
+	should_match_a_full_rebuild(state, "wrap after undo");
+}
+
+static void should_rewrap_a_dirty_line_that_a_later_split_moved()
+{
+	const auto state = create_wrapped_test_app();
+	state->_doc_view->layout();
+
+	const auto doc = state->doc();
+
+	// Two edits reach the view before layout runs, so the dirty line index recorded
+	// by the first is in the old numbering by the time the second has moved that line
+	{
+		undo_group ug(doc);
+		doc->insert_text(ug, text_location(0, 4), "extra words that push this line onto one more visual row ");
+		doc->insert_text(ug, text_location(0, 0), u8'\n');
+	}
+
+	should::is_equal(6, static_cast<int>(doc->size()), "a line was added");
+	should_match_a_full_rebuild(state, "wrap after an edit below a later split");
+}
+
 static void should_search_doc_case_insensitive()
 {
 	const auto state = create_test_app();
@@ -1556,6 +2156,7 @@ tests::run_result run_all_tests_result()
 
 	// Encoding tests
 	tests.register_test("should save preserve BOM presence", should_save_preserves_bom_presence);
+	tests.register_test("should save preserve UTF-16 encoding", should_save_preserves_utf16_encoding);
 
 	// Misc utility tests
 	tests.register_test("should clamp value", should_clamp_value);
@@ -1593,11 +2194,30 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should md highlight italic", should_md_highlight_italic);
 	tests.register_test("should md highlight link", should_md_highlight_link);
 	tests.register_test("should md highlight list", should_md_highlight_list);
+	tests.register_test("should highlight cpp", should_highlight_cpp);
+	tests.register_test("should highlight rust", should_highlight_rust);
+	tests.register_test("should highlight python", should_highlight_python);
+	tests.register_test("should highlight powershell", should_highlight_powershell);
+	tests.register_test("should highlight plain text", should_highlight_plain_text);
+	tests.register_test("should treat utf8 bytes as word bytes", should_treat_utf8_bytes_as_word_bytes);
+	tests.register_test("should find text ignoring case for non ascii",
+	                    should_find_text_ignoring_case_for_non_ascii);
+	tests.register_test("should apply gitignore rules", should_apply_gitignore_rules);
+	tests.register_test("should apply nested gitignore relative to its folder",
+	                    should_apply_nested_gitignore_relative_to_its_folder);
+	tests.register_test("should match gitignore double star", should_match_gitignore_double_star);
+	tests.register_test("should narrow search to previous matches", should_narrow_search_to_previous_matches);
+	tests.register_test("should refuse to save a truncated document", should_refuse_to_save_truncated_document);
+	tests.register_test("should evict unused documents", should_evict_unused_documents);
+	tests.register_test("should adjust drop target for removed selection",
+	                    should_adjust_drop_target_for_removed_selection);
 
 	// App state tests
 	tests.register_test("should app_state new_doc is markdown", should_app_state_new_doc_is_markdown);
 	tests.register_test("should app_state is_markdown_path", should_app_state_is_markdown_path);
 	tests.register_test("should cap search results", should_cap_search_results);
+	tests.register_test("should count search results when group collapsed",
+	                    should_count_search_results_when_group_collapsed);
 	tests.register_test("should create_new_file with content", should_create_new_file_with_content);
 	tests.register_test("should create_new_file added to tree", should_create_new_file_added_to_tree);
 	tests.register_test("should create_new_file with unique name", should_create_new_file_with_unique_name);
@@ -1642,6 +2262,18 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should search doc empty clears", should_search_doc_empty_clears);
 	tests.register_test("should search multiple files", should_search_multiple_files);
 	tests.register_test("should search no match", should_search_no_match);
+	tests.register_test("should clip context of a very long result line",
+	                    should_clip_context_of_a_very_long_result_line);
+
+	// Word wrap tests
+	tests.register_test("should wrap long lines onto several rows", should_wrap_long_lines_onto_several_rows);
+	tests.register_test("should splice wrap when a line is split", should_splice_wrap_when_a_line_is_split);
+	tests.register_test("should splice wrap when lines are joined", should_splice_wrap_when_lines_are_joined);
+	tests.register_test("should splice wrap when a block is deleted", should_splice_wrap_when_a_block_is_deleted);
+	tests.register_test("should splice wrap when a block is inserted", should_splice_wrap_when_a_block_is_inserted);
+	tests.register_test("should splice wrap when an edit is undone", should_splice_wrap_when_an_edit_is_undone);
+	tests.register_test("should rewrap a dirty line that a later split moved",
+	                    should_rewrap_a_dirty_line_that_a_later_split_moved);
 
 	auto result = tests.run_all_result();
 	result.output = "# Test results\n\n" + result.output;

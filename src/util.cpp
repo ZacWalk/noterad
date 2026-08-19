@@ -2,28 +2,67 @@
 
 #include "pch.h"
 #include "util.h"
+#include "platform.h"
 
 
 
 // ── String utilities ────────────────────────────────────────────────────────────
 
+namespace
+{
+	// Folds case per codepoint, so a multi-byte character is never compared byte by byte
+	bool matches_at(const std::string_view text, const size_t pos,
+	                const std::string_view pattern, const bool match_case)
+	{
+		auto t = text.begin() + pos;
+		auto p = pattern.begin();
+
+		while (p != pattern.end())
+		{
+			if (t == text.end())
+				return false;
+
+			const auto pc = pf::pop_utf8_char(p, pattern.end());
+			const auto tc = pf::pop_utf8_char(t, text.end());
+
+			if (pc != tc && (match_case || pf::to_lower(pc) != pf::to_lower(tc)))
+				return false;
+		}
+
+		return true;
+	}
+}
+
 size_t find_in_text(const std::string_view text, const std::string_view pattern, const bool match_case)
 {
 	if (text.empty()) return std::string_view::npos;
 	if (pattern.empty()) return std::string_view::npos;
+	if (pattern.size() > text.size()) return std::string_view::npos;
 
-	const auto text_len = text.size();
-	const auto pat_len = pattern.size();
+	const auto first = static_cast<uint8_t>(pattern[0]);
 
-	if (pat_len > text_len) return std::string_view::npos;
+	// An ASCII lead byte can never appear inside a multi-byte sequence, so memchr can
+	// skip straight to plausible starts. A multi-byte lead has no single byte to scan
+	// for, so every codepoint boundary is tried instead.
+	if (first >= 0x80)
+	{
+		for (size_t pos = 0; pos + pattern.size() <= text.size(); ++pos)
+		{
+			if (pf::is_utf8_continuation(text[pos]))
+				continue;
+			if (matches_at(text, pos, pattern, match_case))
+				return pos;
+		}
 
-	const auto last = text_len - pat_len;
-	const auto first_lower = static_cast<char>(pf::to_lower(static_cast<uint8_t>(pattern[0])));
-	const auto first_upper = static_cast<char>(pf::to_upper(static_cast<uint8_t>(pattern[0])));
+		return std::string_view::npos;
+	}
+
+	const auto last = text.size() - pattern.size();
+	const auto first_lower = static_cast<char>(pf::to_lower(first));
+	const auto first_upper = static_cast<char>(pf::to_upper(first));
 
 	for (size_t pos = 0; pos <= last;)
 	{
-		// Skip ahead on the first byte so the inner loop only runs on plausible starts
 		const auto remaining = last - pos + 1;
 		const auto* const hit = static_cast<const char*>(memchr(text.data() + pos, first_lower, remaining));
 		const auto* const hit_alt = match_case || first_upper == first_lower
@@ -36,20 +75,12 @@ size_t find_in_text(const std::string_view text, const std::string_view pattern,
 
 		pos = static_cast<size_t>(start - text.data());
 
-		bool found = true;
-		for (size_t j = 1; j < pat_len; ++j)
-		{
-			const auto tc = text[pos + j];
-			const auto pc = pattern[j];
-			if (tc != pc && (match_case || pf::to_lower(tc) != pf::to_lower(pc)))
-			{
-				found = false;
-				break;
-			}
-		}
-		if (found) return pos;
+		if (matches_at(text, pos, pattern, match_case))
+			return pos;
+
 		++pos;
 	}
+
 	return std::string_view::npos;
 }
 

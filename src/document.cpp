@@ -116,16 +116,6 @@ void document_line::update(const std::string_view text)
 	_byte_length = static_cast<int>(_text.size());
 }
 
-int document_line::icmp(const document_line& other) const
-{
-	std::string line_text;
-	render(line_text);
-
-	std::string other_line_text;
-	other.render(other_line_text);
-
-	return pf::icmp(line_text, other_line_text);
-}
 static void find_utf8_line_boundaries(const file_buffer_ptr& buffer, const int header_len,
                                       std::vector<document_line>& lines)
 {
@@ -400,7 +390,6 @@ void document::update_max_line_length(const int i) const
 int document::expanded_line_length(const int line_index) const
 {
 	const auto& line = _lines[line_index];
-	std::string line_view;
 
 	if (line.expanded_length_cache() == invalid_length)
 	{
@@ -409,9 +398,9 @@ int document::expanded_line_length(const int line_index) const
 		if (!line.empty())
 		{
 			const auto tab_len = tab_size();
-			line.render(line_view);
+			line.render(_line_scratch);
 
-			for (const auto ch : line_view)
+			for (const auto ch : _line_scratch)
 			{
 				if (ch == u8'\t')
 					expanded_len += tab_len - expanded_len % tab_len;
@@ -484,18 +473,17 @@ int document::calc_offset(const int lineIndex, const int nCharIndex) const
 
 	if (lineIndex >= 0 && lineIndex < std::ssize(_lines))
 	{
-		std::string line_view;
 		const auto& line = _lines[lineIndex];
-		line.render(line_view);
+		line.render(_line_scratch);
 
 		const auto tabSize = tab_size();
-		const auto charLimit = std::min(nCharIndex, static_cast<int>(line_view.size()));
+		const auto charLimit = std::min(nCharIndex, static_cast<int>(_line_scratch.size()));
 
 		for (auto i = 0; i < charLimit; i++)
 		{
-			if (line_view[i] == u8'\t')
+			if (_line_scratch[i] == u8'\t')
 				result += tabSize - result % tabSize;
-			else if (!pf::is_utf8_continuation(line_view[i]))
+			else if (!pf::is_utf8_continuation(_line_scratch[i]))
 				result++;
 		}
 	}
@@ -512,19 +500,17 @@ int document::calc_offset_approx(const int lineIndex, const int nOffset) const
 		return 0;
 
 	const auto& line = _lines[lineIndex];
+	line.render(_line_scratch);
 
-	std::string line_view;
-	line.render(line_view);
-
-	const auto nLength = static_cast<int>(line_view.size());
+	const auto nLength = static_cast<int>(_line_scratch.size());
 	int nCurrentOffset = 0;
 	const int tabSize = tab_size();
 
 	for (int i = 0; i < nLength; i++)
 	{
-		if (line_view[i] == u8'\t')
+		if (_line_scratch[i] == u8'\t')
 			nCurrentOffset += tabSize - nCurrentOffset % tabSize;
-		else if (!pf::is_utf8_continuation(line_view[i]))
+		else if (!pf::is_utf8_continuation(_line_scratch[i]))
 			nCurrentOffset++;
 
 		if (nCurrentOffset >= nOffset)
@@ -1382,7 +1368,7 @@ file_lines_info iterate_file_lines(const pf::file_handle_ptr& handle,
 
 static std::string temp_file_path()
 {
-	return pf::platform_temp_file_path("noterad.");
+	return pf::platform_temp_file_path("rethinkify.");
 }
 
 static std::string last_error_message()
@@ -1394,6 +1380,12 @@ bool document::save_to_file(const pf::file_path& path, const line_endings nCrlfS
                             const bool bClearModifiedFlag /*= true*/) const
 {
 	auto success = false;
+
+	// A truncated document holds only the first part of the file, so writing it back would
+	// destroy the rest
+	if (_read_only || _is_truncated)
+		return false;
+
 	const auto tempPath = temp_file_path();
 	const auto wpath = pf::utf8_to_utf16(tempPath);
 	std::ofstream stream(wpath, std::ios::binary);
@@ -1421,17 +1413,50 @@ bool document::save_to_file(const pf::file_path& path, const line_endings nCrlfS
 
 		std::string line_text;
 
+		// A file that arrived as UTF-16 is written back as UTF-16 rather than silently re-encoded
+		const bool utf16 = _encoding == file_encoding::utf16 || _encoding == file_encoding::utf16be;
+		const bool big_endian = _encoding == file_encoding::utf16be;
+
+		const auto write_text = [&](const std::string_view s)
+		{
+			if (!utf16)
+			{
+				stream.write(s.data(), s.size());
+				return;
+			}
+
+			auto wide = pf::utf8_to_utf16(s);
+			if (big_endian)
+				for (auto& ch : wide)
+					ch = static_cast<wchar_t>(ch >> 8 | ch << 8);
+			stream.write(reinterpret_cast<const char*>(wide.data()),
+			             static_cast<std::streamsize>(wide.size() * sizeof(wchar_t)));
+		};
+
 		if (_buffer && _buffer->bom_length > 0)
 		{
-			static constexpr uint8_t utf8_bom[3] = {0xEF, 0xBB, 0xBF};
-			stream.write(reinterpret_cast<const char*>(utf8_bom), 3);
+			if (_encoding == file_encoding::utf16)
+			{
+				static constexpr uint8_t bom[2] = {0xFF, 0xFE};
+				stream.write(reinterpret_cast<const char*>(bom), 2);
+			}
+			else if (_encoding == file_encoding::utf16be)
+			{
+				static constexpr uint8_t bom[2] = {0xFE, 0xFF};
+				stream.write(reinterpret_cast<const char*>(bom), 2);
+			}
+			else
+			{
+				static constexpr uint8_t utf8_bom[3] = {0xEF, 0xBB, 0xBF};
+				stream.write(reinterpret_cast<const char*>(utf8_bom), 3);
+			}
 		}
 
 		for (const auto& line : _lines)
 		{
-			if (!first) stream << eol;
+			if (!first) write_text(eol);
 			line.render(line_text);
-			stream.write(line_text.data(), line_text.size());
+			write_text(line_text);
 			first = false;
 		}
 
@@ -1617,7 +1642,7 @@ text_location document::insert_text(const text_location& location, const std::st
 	{
 		// Single-line insert: splice into existing line
 		auto& li = _lines[location.y];
-		std::string line_text;
+		auto& line_text = _edit_scratch;
 		li.render(line_text);
 		line_text.insert(location.x, input_lines[0]);
 		result.x = location.x + static_cast<int>(input_lines[0].size());
@@ -1629,7 +1654,7 @@ text_location document::insert_text(const text_location& location, const std::st
 	{
 		// Multi-line insert: split current line, bulk-insert new lines
 		auto& first_line = _lines[location.y];
-		std::string line_text;
+		auto& line_text = _edit_scratch;
 		first_line.render(line_text);
 		const auto tail = line_text.substr(location.x);
 		line_text.erase(location.x);
@@ -1654,7 +1679,8 @@ text_location document::insert_text(const text_location& location, const std::st
 		result.y = location.y + count - 1;
 		result.x = static_cast<int>(input_lines[count - 1].size());
 
-		_events.invalidate(invalid::doc);
+		_max_line_len = -1;
+		_events.line_count_changed(location.y, count - 1);
 	}
 
 	_modified = true;
@@ -1663,6 +1689,9 @@ text_location document::insert_text(const text_location& location, const std::st
 
 text_location document::insert_text(undo_group& ug, const text_location& location, const std::string_view text)
 {
+	if (text.empty())
+		return location;
+
 	const auto result_location = insert_text(location, text);
 	ug.insert(text_selection(location, result_location), text);
 	_modified = true;
@@ -1677,23 +1706,24 @@ text_location document::insert_text(const text_location& location, const char& c
 	if (c == L'\n')
 	{
 		// Split - create new line from the tail of the current line
-		std::string line_text;
+		auto& line_text = _edit_scratch;
 		li.render(line_text);
-		const auto tail = line_text.substr(location.x);
+		_edit_scratch2.assign(line_text, location.x);
 		line_text.erase(location.x);
 		li.update(line_text);
 
 		// Insert after updating li — _lines.insert may invalidate the li reference
-		_lines.insert(_lines.begin() + location.y + 1, document_line(tail));
+		_lines.insert(_lines.begin() + location.y + 1, document_line(_edit_scratch2));
 
 		resultLocation.y = location.y + 1;
 		resultLocation.x = 0;
 
-		_events.invalidate(invalid::doc);
+		_max_line_len = -1;
+		_events.line_count_changed(location.y, 1);
 	}
 	else if (c != '\r')
 	{
-		std::string line_text;
+		auto& line_text = _edit_scratch;
 		li.render(line_text);
 		line_text.insert(line_text.begin() + location.x, c);
 		li.update(line_text);
@@ -1731,7 +1761,7 @@ text_location document::delete_text(undo_group& ug, const text_location& locatio
 	}
 	else
 	{
-		std::string line_text;
+		auto& line_text = _edit_scratch2;
 		_lines[location.y].render(line_text);
 		const auto start_x = pf::utf8_prev(line_text, location.x);
 		ug.erase(text_selection(text_location(start_x, location.y), text_location(location.x, location.y)),
@@ -1749,7 +1779,7 @@ text_location document::delete_text(const text_selection& selection)
 		if (selection._start.y == selection._end.y)
 		{
 			auto& li = _lines[selection._start.y];
-			std::string line_text;
+			auto& line_text = _edit_scratch;
 			li.render(line_text);
 
 			line_text.erase(line_text.begin() + selection._start.x, line_text.begin() + selection._end.x);
@@ -1761,7 +1791,8 @@ text_location document::delete_text(const text_selection& selection)
 		}
 		else
 		{
-			std::string line_text_start, line_text_end;
+			auto& line_text_start = _edit_scratch;
+			auto& line_text_end = _edit_scratch2;
 			_lines[selection._start.y].render(line_text_start);
 			_lines[selection._end.y].render(line_text_end);
 
@@ -1776,7 +1807,8 @@ text_location document::delete_text(const text_selection& selection)
 
 			if (end() < _cursor_loc) _cursor_loc = end();
 
-			_events.invalidate(invalid::doc);
+			_max_line_len = -1;
+			_events.line_count_changed(selection._start.y, selection._start.y - selection._end.y);
 		}
 	}
 
@@ -1786,6 +1818,9 @@ text_location document::delete_text(const text_selection& selection)
 
 text_location document::delete_text(undo_group& ug, const text_selection& selection)
 {
+	if (selection.empty())
+		return selection._start;
+
 	ug.erase(selection, combine(text(selection)));
 	_modified = true;
 	return delete_text(selection);
@@ -1802,7 +1837,8 @@ text_location document::delete_text(const text_location& location)
 		{
 			auto& previous = _lines[location.y - 1];
 
-			std::string line_text, previous_text;
+			auto& line_text = _edit_scratch;
+			auto& previous_text = _edit_scratch2;
 			line.render(line_text);
 			previous.render(previous_text);
 
@@ -1813,13 +1849,14 @@ text_location document::delete_text(const text_location& location)
 			previous.update(previous_text);
 
 			_lines.erase(_lines.begin() + location.y);
-			_events.invalidate(invalid::doc);
+			_max_line_len = -1;
+			_events.line_count_changed(location.y - 1, -1);
 		}
 	}
 	else
 	{
 		auto& li = _lines[location.y];
-		std::string line_text;
+		auto& line_text = _edit_scratch;
 		li.render(line_text);
 
 		// Erase the whole codepoint, not a single byte
@@ -2007,6 +2044,7 @@ void document::apply_loaded_data(const pf::file_path& path, loaded_file_data dat
 		_is_truncated = data.truncated;
 		_read_only = data.encoding == file_encoding::binary || data.truncated;
 		_spell_check = should_spell_check_path(path);
+		_encoding = data.encoding;
 		_line_ending = data.endings;
 		_modified = false;
 		_undo_pos = 0;

@@ -1,5 +1,0 @@
-WinMain: before app_init
-WinMain: before create
-app_state::on_create ENTERED
-on_create: root='C:\code\apps\noterad\src'
-WinMain: after create

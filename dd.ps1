@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Noterad build helper.
+    Rethinkify build helper.
 
 .DESCRIPTION
     dd run   - build Release x64 and start the app
@@ -93,7 +93,7 @@ function Invoke-Build([string]$Configuration) {
     $env:PATH = "$(Split-Path $ninja);$env:PATH"
 
     # The linker fails with LNK1168 if the previous build is still running.
-    Get-Process noterad-64, noterad-64d -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process rethinkify-64, rethinkify-64d -ErrorAction SilentlyContinue | Stop-Process -Force
 
     $preset = $Configuration.ToLowerInvariant()
 
@@ -115,7 +115,7 @@ switch ($Command) {
     'build' { Invoke-Build $Config }
 
     'clean' {
-        Get-Process noterad-64, noterad-64d -ErrorAction SilentlyContinue | Stop-Process -Force
+        Get-Process rethinkify-64, rethinkify-64d -ErrorAction SilentlyContinue | Stop-Process -Force
         foreach ($path in @('build', 'exe')) {
             $full = Join-Path $root $path
             if (Test-Path $full) { Remove-Item -LiteralPath $full -Recurse -Force }
@@ -124,14 +124,14 @@ switch ($Command) {
 
     'run' {
         Invoke-Build $Config
-        $exe = Join-Path $root "exe\noterad-$exeSuffix.exe"
+        $exe = Join-Path $root "exe\rethinkify-$exeSuffix.exe"
         Write-Host "Starting $exe" -ForegroundColor Cyan
         if ($Rest) { Start-Process -FilePath $exe -ArgumentList $Rest } else { Start-Process -FilePath $exe }
     }
 
     'test' {
         Invoke-Build $Config
-        $exe = Join-Path $root "exe\noterad-$exeSuffix.exe"
+        $exe = Join-Path $root "exe\rethinkify-$exeSuffix.exe"
         $tmp = Join-Path $root 'tmp'
         if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp | Out-Null }
         $out = Join-Path $tmp 'test_out.txt'

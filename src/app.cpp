@@ -18,7 +18,7 @@
 #include "app_state.h"
 #include "test.h"
 
-std::string g_app_name = "Noterad";
+std::string g_app_name = "Rethinkify";
 
 extern std::string run_all_tests();
 extern tests::run_result run_all_tests_result();
@@ -82,7 +82,7 @@ pf::color_t style_to_color(const style style_index)
 static std::string make_about_text(const commands& cmds)
 {
 	std::string text =
-		"# Noterad\n"
+		"# Rethinkify\n"
 		"\n"
 		"*A lightweight text editor written in C++ by Zac Walker*\n"
 		"\n"
@@ -323,6 +323,28 @@ namespace
 		return replace(std::string(text), "&", "&&");
 	}
 
+	// A single line can be megabytes (minified JSON, log dumps), so a result keeps only a
+	// window around its match. Bounds both the memory held by 5,000 results and the work
+	// the panel does measuring the text on every paint.
+	constexpr int max_result_context = 400;
+
+	std::string clip_result_context(const std::string_view line, int& match_start)
+	{
+		if (std::ssize(line) <= max_result_context)
+			return std::string(line);
+
+		auto start = static_cast<size_t>(std::max(0, match_start - max_result_context / 4));
+		while (start > 0 && pf::is_utf8_continuation(line[start]))
+			start--;
+
+		auto end = std::min(line.size(), start + max_result_context);
+		while (end < line.size() && pf::is_utf8_continuation(line[end]))
+			end++;
+
+		match_start -= static_cast<int>(start);
+		return std::string(line.substr(start, end - start));
+	}
+
 	void find_matches_in_line(std::vector<search_result>& results, const std::string_view line,
 	                          const int line_number, const std::string_view text)
 	{
@@ -333,15 +355,17 @@ namespace
 		while (trim < line.length() && (line[trim] == u8' ' || line[trim] == u8'\t'))
 			trim++;
 
+		const auto trimmed = line.substr(trim);
+
 		auto pos = find_in_text(line, text);
 		while (pos != std::string_view::npos)
 		{
 			search_result item;
-			item.line_text = line.substr(trim);
 			item.line_number = line_number;
 			item.line_match_pos = static_cast<int>(pos);
 			item.text_match_start = pos >= trim ? static_cast<int>(pos - trim) : 0;
 			item.text_match_length = static_cast<int>(text.length());
+			item.line_text = clip_result_context(trimmed, item.text_match_start);
 			results.push_back(std::move(item));
 
 			const auto next_start = pos + text.length();
@@ -513,7 +537,15 @@ void app_state::invalidate_lines(const int start, const int end)
 
 void app_state::lines_changed(const int start, const int end)
 {
+	note_content_changed();
 	_doc_view->lines_changed(_doc_window, start, end);
+}
+
+void app_state::line_count_changed(const int at, const int delta)
+{
+	note_content_changed();
+	_doc_view->line_count_changed(_doc_window, at, delta);
+	invalidate(invalid::doc);
 }
 
 void app_state::on_navigate_next(const bool forward)
@@ -587,6 +619,7 @@ void app_state::load_doc(const index_item_ptr& item, std::function<void()> on_lo
 					return;
 
 				item->doc->apply_loaded_data(path, std::move(lines));
+				t->note_content_changed(); // a reload can introduce matches a narrowed search would miss
 				t->apply_spell_check_mode(item->doc);
 
 				// Only switch view if this item is still the active one,
@@ -637,6 +670,9 @@ void app_state::load_doc(const pf::file_path& path)
 void app_state::set_active_item(const index_item_ptr& item)
 {
 	_active_item = item;
+	if (item)
+		item->last_used = ++_use_counter;
+	evict_unused_documents();
 	apply_spell_check_mode(item ? item->doc : nullptr);
 	if (item && root_item() && !root_item()->path.empty() && item->path.is_save_path())
 		remember_root_document(root_item()->path, item->path);
@@ -648,6 +684,40 @@ void app_state::set_active_item(const index_item_ptr& item)
 
 	update_info_message();
 	invalidate(invalid::app_title);
+}
+
+size_t app_state::resident_document_count() const
+{
+	std::function<size_t(const index_item_ptr&)> count = [&](const index_item_ptr& item) -> size_t
+	{
+		size_t total = item->doc ? 1 : 0;
+		for (const auto& child : item->children)
+			total += count(child);
+		return total;
+	};
+
+	return _root_folder ? count(_root_folder) : 0;
+}
+
+// Documents are cheap to reload, so only the most recently opened stay resident
+void app_state::evict_unused_documents()
+{
+	if (!_root_folder)
+		return;
+
+	std::vector<index_item_ptr> evictable;
+	collect_evictable_documents(_root_folder, evictable);
+
+	if (evictable.size() <= max_resident_documents)
+		return;
+
+	std::ranges::sort(evictable, [](const index_item_ptr& l, const index_item_ptr& r)
+	{
+		return l->last_used > r->last_used;
+	});
+
+	for (auto i = max_resident_documents; i < evictable.size(); ++i)
+		evictable[i]->doc.reset();
 }
 
 void app_state::update_info_message()
@@ -946,6 +1016,7 @@ void app_state::refresh_index(const pf::file_path& root_path, std::function<void
 				}
 
 				t->set_root(new_root);
+				t->note_content_changed();
 				t->remember_root_folder(t->root_item()->path);
 				t->invalidate(invalid::files_layout | invalid::files_populate);
 
@@ -957,13 +1028,30 @@ void app_state::refresh_index(const pf::file_path& root_path, std::function<void
 
 void app_state::execute_search(const std::string& text, std::function<void()> on_complete)
 {
+	// A longer query can only match where the previous one did, so while the tree is
+	// unchanged each extra keystroke rescans the previous hits instead of the folder
+	const bool narrow = !_searched_text.empty()
+		&& _searched_generation == _content_generation
+		&& text.size() > _searched_text.size()
+		&& text.starts_with(_searched_text);
+
 	std::vector<search_input> inputs;
-	collect_search_inputs(_root_folder->children, inputs);
+
+	if (narrow)
+	{
+		const path_set previous_matches(_searched_matches.begin(), _searched_matches.end());
+		collect_search_inputs(_root_folder->children, inputs, &previous_matches);
+	}
+	else
+	{
+		collect_search_inputs(_root_folder->children, inputs);
+	}
 
 	const auto generation = _search_generation.fetch_add(1) + 1;
+	const auto content_generation = _content_generation;
 
 	_scheduler->run_async(
-		[t = shared_from_this(), inputs = std::move(inputs), text, generation,
+		[t = shared_from_this(), inputs = std::move(inputs), text, generation, content_generation,
 			on_complete = std::move(on_complete)]() mutable
 		{
 			const auto is_cancelled = [t, generation] { return t->_search_generation.load() != generation; };
@@ -974,12 +1062,21 @@ void app_state::execute_search(const std::string& text, std::function<void()> on
 				return;
 
 			t->_scheduler->run_ui(
-				[t, results = std::move(results), generation, on_complete = std::move(on_complete)]()
+				[t, results = std::move(results), generation, content_generation,
+					text, on_complete = std::move(on_complete)]()
 				{
 					if (t->_search_generation.load() != generation)
 						return; // a newer search has superseded this one
 
 					apply_search_results(t->_root_folder->children, results);
+
+					t->_searched_text = text;
+					t->_searched_generation = content_generation;
+					t->_searched_matches.clear();
+					t->_searched_matches.reserve(results.size());
+					for (const auto& entry : results)
+						t->_searched_matches.push_back(entry.first);
+
 					if (on_complete)
 						on_complete();
 				});
@@ -1259,7 +1356,7 @@ create_path_result app_state::create_new_folder(const pf::file_path& folder)
 }
 
 uint32_t app_state::handle_message(const pf::window_frame_ptr window,
-                                   const pf::message_type msg, const uintptr_t wParam, const intptr_t lParam)
+                                   const pf::message_type msg, const pf::message_params& params)
 {
 	_app_window = window;
 	using mt = pf::message_type;
@@ -1279,7 +1376,7 @@ uint32_t app_state::handle_message(const pf::window_frame_ptr window,
 		return 0;
 	if (msg == mt::timer)
 	{
-		if (static_cast<uint32_t>(wParam) == search_debounce_timer_id)
+		if (params.timer_id == search_debounce_timer_id)
 		{
 			_app_window->kill_timer(search_debounce_timer_id);
 			run_pending_search();
@@ -1287,12 +1384,11 @@ uint32_t app_state::handle_message(const pf::window_frame_ptr window,
 		return 0;
 	}
 	if (msg == mt::dpi_changed)
-		return on_window_dpi_changed(wParam, lParam);
+		return on_window_dpi_changed(params);
 	if (msg == mt::drop_files)
 	{
-		const auto paths = pf::dropped_file_paths(wParam);
-		if (!paths.empty())
-			load_doc(paths.front());
+		if (!params.dropped_paths.empty())
+			load_doc(params.dropped_paths.front());
 		return 0;
 	}
 
@@ -1339,8 +1435,6 @@ uint32_t app_state::handle_mouse(const pf::window_frame_ptr window,
 
 uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 {
-	pf::debug_trace("app_state::on_create ENTERED\n");
-
 	_app_window = window;
 	window->accept_drop_files(true);
 
@@ -1403,7 +1497,6 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 		root = pf::current_directory();
 	remember_root_folder(root);
 
-	pf::debug_trace(std::format("on_create: root='{}'\n", root.view()));
 	if (!root.empty())
 	{
 		refresh_index(root, [this, doc_path]

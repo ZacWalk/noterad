@@ -1,14 +1,14 @@
-# Noterad
+# Rethinkify
 
 [![Build](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml)
 
 A lightweight Windows text editor for working across a folder full of notes, logs and data files. Point it at a folder, search everything in it, and read or edit whatever comes back.
 
-Written in C++ with no dependencies beyond the Win32 API and rendered with plain GDI. It starts instantly and typically uses a few megabytes of memory.
+Written in C++ and rendered with plain GDI. The only dependency is [platform-h](https://github.com/ZacWalk/platform-h), the Win32 abstraction it shares with its sibling apps — nothing third-party. It starts instantly and typically uses a few megabytes of memory.
 
 Still a work in progress. (for about 10 years)
 
-![Noterad screenshot](screenshot.png)
+![Rethinkify screenshot](screenshot.png)
 
 ## Features
 
@@ -38,7 +38,7 @@ The platform layer comes from the separate
 [platform-h](https://github.com/ZacWalk/platform-h) repository via `FetchContent`;
 a sibling `../platform-h` checkout is used automatically when present.
 
-Output is `exe\noterad-64.exe` (Release) or `exe\noterad-64d.exe` (Debug).
+Output is `exe\rethinkify-64.exe` (Release) or `exe\rethinkify-64d.exe` (Debug).
 
 ## Testing
 
@@ -46,7 +46,7 @@ Output is `exe\noterad-64.exe` (Release) or `exe\noterad-64d.exe` (Debug).
 .\dd.ps1 test
 ```
 
-Runs the unit tests to stdout without starting the GUI, exiting 0 on success and 1 on any failure.
+Runs the unit tests to stdout without starting the GUI, exiting 0 on success and 1 on any failure. The platform layer has its own suite in the platform-h repository.
 
 ## Documentation
 

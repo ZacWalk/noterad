@@ -80,13 +80,13 @@ std::vector<command_def> app_state::make_commands()
 		{
 			"Save the current file",
 			"&Save", static_cast<int>(command_id::file_save), {'S', pf::key_mod::ctrl},
-			nullptr, nullptr,
+			[this] { return doc() && !doc()->is_read_only(); }, nullptr,
 			[this] { on_save(); }
 		},
 		{
 			"Save the current file as...",
 			"Save &As...", static_cast<int>(command_id::file_save_as), {},
-			nullptr, nullptr,
+			[this] { return doc() && !doc()->is_read_only(); }, nullptr,
 			[this] { on_save_as(); }
 		},
 		{
@@ -116,7 +116,8 @@ std::vector<command_def> app_state::make_commands()
 					return;
 				}
 				doc()->edit_undo();
-			}
+			},
+			{pf::platform_key::Back, pf::key_mod::alt}
 		},
 		{
 			"Redo the last undone edit",
@@ -153,7 +154,9 @@ std::vector<command_def> app_state::make_commands()
 				const auto view = focused_text_view();
 				if (view && view->cut_text_to_clipboard())
 					invalidate(invalid::doc);
-			}		},
+			},
+			{pf::platform_key::Delete, pf::key_mod::shift}
+		},
 		{
 			"Copy selection or selected path to clipboard",
 			"&Copy", static_cast<int>(command_id::edit_copy), {'C', pf::key_mod::ctrl},
@@ -162,7 +165,8 @@ std::vector<command_def> app_state::make_commands()
 				return can_copy_current_focus();
 			},
 			nullptr,
-			[this] { (void)copy_current_focus_to_clipboard(); }
+			[this] { (void)copy_current_focus_to_clipboard(); },
+			{pf::platform_key::Insert, pf::key_mod::ctrl}
 		},
 		{
 			"Paste from clipboard",
@@ -185,7 +189,8 @@ std::vector<command_def> app_state::make_commands()
 				const auto view = focused_text_view();
 				if (view && view->paste_text_from_clipboard())
 					invalidate(invalid::doc);
-			}
+			},
+			{pf::platform_key::Insert, pf::key_mod::shift}
 		},
 		{
 			"Delete selection or selected file",
@@ -292,16 +297,10 @@ std::vector<command_def> app_state::make_commands()
 			[this] { on_refresh_focused_panel(); }
 		},
 		{
-			"Navigate to next search result, or start a search",
+			"Navigate to next search result",
 			"&Next Result", static_cast<int>(command_id::view_next_result), {pf::platform_key::F8, pf::key_mod::none},
-			nullptr, nullptr,
-			[this]
-			{
-				if (!is_search(get_mode()))
-					toggle_search_mode(); // switches to search mode and focuses the search box
-				else
-					on_navigate_next(true);
-			},
+			[this] { return is_search(get_mode()); }, nullptr,
+			[this] { on_navigate_next(true); },
 			{pf::platform_key::F3, pf::key_mod::none}
 		},
 		{

@@ -2,22 +2,22 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Noterad (Debug x64)",
+            "name": "Rethinkify (Debug x64)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/exe/noterad-64d.exe",
+            "program": "${workspaceFolder}/exe/rethinkify-64d.exe",
             "args": [],
             "cwd": "${workspaceFolder}/exe",
-            "preLaunchTask": "Build Noterad"
+            "preLaunchTask": "Build Rethinkify"
         },
         {
-            "name": "Noterad (Release x64)",
+            "name": "Rethinkify (Release x64)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/exe/noterad-64.exe",
+            "program": "${workspaceFolder}/exe/rethinkify-64.exe",
             "args": [],
             "cwd": "${workspaceFolder}/exe",
-            "preLaunchTask": "Build Noterad (Release)"
+            "preLaunchTask": "Build Rethinkify (Release)"
         }
     ]
 }
