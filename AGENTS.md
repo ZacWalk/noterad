@@ -53,3 +53,9 @@ Global accelerators fire regardless of focus, so a command that acts on "the sel
 All accept `/x` and `--x`. None writes configuration. **Output is only captured when stdout is piped** (`| Out-String`); redirecting to a file yields nothing, because the console binding reopens stdout.
 
 The two agent modes exist because `pf::run_ui` callbacks never drain under `/test` — there is no message loop — so the process and protocol layers cannot be unit tested. Run `/agent:` after changing anything in `agent_host` or the platform's child-process code. Unit tests must never launch a real agent: inject `spawn` and `locate` on `agent_host`, or drive it with a fake transport through `connect`.
+
+## Agent layering
+
+The platform layer only starts the process and moves bytes: `pf::spawn_child_process` creates the pipes, runs a reader thread per pipe, reassembles whole lines with `pf::line_splitter`, and delivers each one on the UI thread. It knows nothing of JSON, ACP or the transcript. Keep it that way — a protocol change must not reach `platform_win.cpp`.
+
+Above it, `child_transport` adapts `pf::child_process::write_line` to `acp::transport`, `acp::client` speaks the protocol, and `agent_host` owns the turn, the question queue and the permission prompts. The agent's file reads and writes go through `agent_host::events`, so they see unsaved work and land in the undo stack; both refuse a path that `pf::is_path_within` says is outside the root.

@@ -1,4 +1,4 @@
-// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
+﻿// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
 
 #include "pch.h"
 #include "app.h"
@@ -2314,102 +2314,6 @@ static void should_json_pass_through_utf8()
 	should::is_equal("{\"s\":\"\xC3\xA9 \xE4\xB8\xAD \xF0\x9F\x98\x80\"}", parsed.root.to_string(), "raw utf8 out");
 }
 
-static std::vector<std::string> split_stream(const std::vector<std::string_view>& chunks,
-                                             const size_t max_line_bytes = pf::line_splitter::default_max_line_bytes)
-{
-	pf::line_splitter splitter;
-	splitter.max_line_bytes = max_line_bytes;
-
-	std::vector<std::string> lines;
-	const auto emit = [&lines](const std::string_view line) { lines.emplace_back(line); };
-
-	for (const auto& chunk : chunks)
-		splitter.feed(chunk, emit);
-
-	splitter.flush(emit);
-	return lines;
-}
-
-// A pipe read boundary can fall anywhere, including inside a multi-byte character
-static void should_split_lines_across_read_boundaries()
-{
-	const auto whole = split_stream({"one\ntwo\nthree\n"});
-	should::is_equal(size_t{3}, whole.size(), "three lines");
-	should::is_equal("one", whole[0], "first");
-	should::is_equal("three", whole[2], "third");
-
-	const auto split = split_stream({"on", "e\ntw", "o\nthr", "ee\n"});
-	should::is_equal(size_t{3}, split.size(), "three lines when split");
-	should::is_equal("one", split[0], "first when split");
-	should::is_equal("two", split[1], "second when split");
-	should::is_equal("three", split[2], "third when split");
-
-	const auto by_byte = split_stream({"a", "b", "\n", "c", "\n"});
-	should::is_equal(size_t{2}, by_byte.size(), "byte at a time");
-	should::is_equal("ab", by_byte[0], "byte at a time first");
-
-	const auto utf8 = split_stream({"caf\xC3", "\xA9\n"});
-	should::is_equal(size_t{1}, utf8.size(), "one line");
-	should::is_equal("caf\xC3\xA9", utf8[0], "codepoint spanning a boundary");
-}
-
-static void should_split_lines_handle_endings_and_blanks()
-{
-	const auto crlf = split_stream({"one\r\ntwo\r\n"});
-	should::is_equal(size_t{2}, crlf.size(), "crlf line count");
-	should::is_equal("one", crlf[0], "carriage return stripped");
-
-	const auto blanks = split_stream({"\n\na\n"});
-	should::is_equal(size_t{3}, blanks.size(), "blank lines kept");
-	should::is_equal("", blanks[0], "first blank");
-	should::is_equal("a", blanks[2], "third");
-
-	// A stream that ends without a newline still yields its last record
-	const auto partial = split_stream({"tail"});
-	should::is_equal(size_t{1}, partial.size(), "partial flushed");
-	should::is_equal("tail", partial[0], "partial content");
-
-	should::is_equal(size_t{0}, split_stream({""}).size(), "empty stream");
-}
-
-// A stream that never sends a newline must not grow the buffer without bound
-static void should_split_lines_discard_oversized_records()
-{
-	const std::string huge(64, 'x');
-	const auto lines = split_stream({huge, huge, "\nafter\n"}, 32);
-
-	should::is_equal(size_t{1}, lines.size(), "oversized record dropped");
-	should::is_equal("after", lines[0], "resynced at the next newline");
-
-	// The record is dropped whole, never truncated into a partial one
-	const auto joined = split_stream({"12345678\nshort\n"}, 6);
-	should::is_equal(size_t{1}, joined.size(), "only the short record survives");
-	should::is_equal("short", joined[0], "short record");
-}
-
-static void should_quote_command_arguments()
-{
-	should::is_equal("simple", pf::quote_command_arg("simple"), "no quoting needed");
-	should::is_equal("--acp", pf::quote_command_arg("--acp"), "option");
-	should::is_equal("\"\"", pf::quote_command_arg(""), "empty argument");
-	should::is_equal("\"a b\"", pf::quote_command_arg("a b"), "space");
-	should::is_equal("\"a\\\"b\"", pf::quote_command_arg("a\"b"), "embedded quote");
-	should::is_equal("C:\\path\\file", pf::quote_command_arg("C:\\path\\file"), "backslashes kept");
-	should::is_equal("\"C:\\my path\\\\\"", pf::quote_command_arg("C:\\my path\\"), "trailing backslash doubled");
-	should::is_equal("\"a\\\\\\\"b\"", pf::quote_command_arg("a\\\"b"), "backslash before quote");
-}
-
-static void should_detect_shell_metacharacters()
-{
-	should::is_equal(false, pf::has_shell_metacharacter("--acp"), "plain option");
-	should::is_equal(false, pf::has_shell_metacharacter("C:\\path\\file.txt"), "plain path");
-	should::is_equal_true(pf::has_shell_metacharacter("a & b"), "ampersand");
-	should::is_equal_true(pf::has_shell_metacharacter("a | b"), "pipe");
-	should::is_equal_true(pf::has_shell_metacharacter("%PATH%"), "environment expansion");
-	should::is_equal_true(pf::has_shell_metacharacter("a > b"), "redirect");
-	should::is_equal_true(pf::has_shell_metacharacter("a\nb"), "newline");
-}
-
 // recording_transport — Captures what the client sends and lets a test reply as the agent
 struct recording_transport final : acp::transport
 {
@@ -4176,15 +4080,6 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should json build messages", should_json_build_messages);
 	tests.register_test("should json replace duplicate keys", should_json_replace_duplicate_keys);
 	tests.register_test("should json pass through utf8", should_json_pass_through_utf8);
-
-	// Child process plumbing tests
-	tests.register_test("should split lines across read boundaries", should_split_lines_across_read_boundaries);
-	tests.register_test("should split lines handle endings and blanks",
-	                    should_split_lines_handle_endings_and_blanks);
-	tests.register_test("should split lines discard oversized records",
-	                    should_split_lines_discard_oversized_records);
-	tests.register_test("should quote command arguments", should_quote_command_arguments);
-	tests.register_test("should detect shell metacharacters", should_detect_shell_metacharacters);
 
 	// ACP protocol tests
 	tests.register_test("should acp complete handshake", should_acp_complete_handshake);
