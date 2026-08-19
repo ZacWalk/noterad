@@ -24,18 +24,26 @@ Open documents are never closed behind your back: unsaved files stay in memory w
 
 ## Building
 
-Open `noterad.sln` in Visual Studio, or:
+From an x64 Developer PowerShell:
 
 ```
-msbuild noterad.sln /p:Configuration=Release /p:Platform=x64
+.\dd.ps1 build
 ```
+
+`dd.ps1` locates Visual Studio, enters the MSVC environment and falls back to the
+CMake and Ninja that ship with it, so nothing extra needs installing. To drive
+CMake directly: `cmake --preset release && cmake --build --preset release`.
+
+The platform layer comes from the separate
+[platform-h](https://github.com/ZacWalk/platform-h) repository via `FetchContent`;
+a sibling `../platform-h` checkout is used automatically when present.
 
 Output is `exe\noterad-64.exe` (Release) or `exe\noterad-64d.exe` (Debug).
 
 ## Testing
 
 ```
-exe\noterad-64d.exe /test
+.\dd.ps1 test
 ```
 
 Runs the unit tests to stdout without starting the GUI, exiting 0 on success and 1 on any failure.

@@ -4,9 +4,9 @@ Noterad is a lightweight Windows text editor for research across folders of text
 
 ## Non-negotiables
 
-1. **Windows-only code lives in `platform_win.cpp`.** Everything above the platform layer talks to `pf::` abstractions declared in `platform.h`. No `windows.h` types, Win32 API calls, `HWND`/`HDC`, or Win32 constants outside `platform.h` / `platform_win.cpp`. If a change needs a new OS capability, add it to `platform.h` first.
-2. **Build with `noterad.sln`.** `msbuild noterad.sln /p:Configuration=Debug /p:Platform=x64 /m`. Do not add build systems or third-party dependencies — the project has none by design.
-3. **Run the tests.** `exe\noterad-64d.exe /test` — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix.
+1. **Windows-only code lives in the platform layer.** Everything in this repo talks to `pf::` abstractions declared in `platform.h`, which now lives in the shared **platform-h** repository along with its Win32 implementation. No `windows.h` types, Win32 API calls, `HWND`/`HDC`, or Win32 constants anywhere in this repo. If a change needs a new OS capability, add it to platform-h first — and remember the other apps build against the same header.
+2. **Build with CMake + Ninja.** `.\dd.ps1 build -Config Debug`, or `cmake --preset debug && cmake --build --preset debug` from an x64 Developer PowerShell. The only dependency is platform-h, pulled in by `FetchContent`; do not add others.
+3. **Run the tests.** `.\dd.ps1 test` (or `exe\noterad-64.exe /test`) — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix.
 4. **Optimise for small and fast.** This is the point of the project. Avoid per-keystroke or per-paint allocation, avoid O(document) work for a local edit, prefer `string_view` and reusable buffers. Delete dead code rather than leaving it.
 5. **Temporary files go in `tmp/`.**
 
@@ -22,7 +22,7 @@ Noterad is a lightweight Windows text editor for research across folders of text
 
 | Area | Files |
 |---|---|
-| Platform abstraction | `platform.h`, `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async) |
+| Platform abstraction | the separate **platform-h** repo: `platform.h` and `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async), shared with the other apps |
 | Application | `app.h`, `app.cpp` (main window, panes, splitter, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (lines, selection, undo, load/save, JSON reformat, sort), `document_syntax.cpp` (C++, Rust, Python, PowerShell, Markdown, hex highlighters) |
@@ -31,7 +31,7 @@ Noterad is a lightweight Windows text editor for research across folders of text
 | Widgets | `ui.h` (colours, `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
 | Utilities | `util.h`/`util.cpp` (string ops, colour), `calc.h` (expression parser for Calculate Selection) |
 | Tests | `test.h` (assertions and runner), `tests.cpp` |
-| Build | `app.vcxproj` (+ `.filters`), `pch.h`, `resource.h` (icon ID only — menus and accelerators are built at runtime), `targetver.h` |
+| Build | `CMakeLists.txt` (declares the app with `platform_add_app()` — icon, manifest and version info are generated, so there is no `.rc`), `CMakePresets.json`, `dd.ps1`, `pch.h`, `targetver.h` |
 
 ## Adding a command
 

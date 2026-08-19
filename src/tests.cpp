@@ -114,6 +114,15 @@ struct stub_window_frame final : pf::window_frame
 	{
 	}
 
+	std::string text_from_clipboard() override { return {}; }
+	bool text_to_clipboard(std::string_view) override { return false; }
+
+	void present_pixels(const uint32_t*, int, int) override
+	{
+	}
+
+	pf::toolbar_frame_ptr create_address_bar(const pf::address_bar_config&) override { return nullptr; }
+
 	int message_box(std::string_view, std::string_view, uint32_t) override { return 0; }
 
 	void set_menu(std::vector<pf::menu_command>) override

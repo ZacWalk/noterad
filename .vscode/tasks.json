@@ -3,32 +3,52 @@
     "tasks": [
         {
             "label": "Build Noterad",
-            "type": "process",
-            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe",
+            "type": "shell",
+            "command": "pwsh",
             "args": [
-                "${workspaceFolder}/noterad.sln",
-                "/p:Configuration=Debug",
-                "/p:Platform=x64",
-                "/m"
+                "-NoProfile",
+                "-File",
+                "${workspaceFolder}/dd.ps1",
+                "build",
+                "-Config",
+                "Debug"
             ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": "$msCompile"
+            "problemMatcher": "$msCompile",
+            "detail": "CMake + Ninja via dd.ps1"
         },
         {
             "label": "Build Noterad (Release)",
-            "type": "process",
-            "command": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe",
+            "type": "shell",
+            "command": "pwsh",
             "args": [
-                "${workspaceFolder}/noterad.sln",
-                "/p:Configuration=Release",
-                "/p:Platform=x64",
-                "/m"
+                "-NoProfile",
+                "-File",
+                "${workspaceFolder}/dd.ps1",
+                "build"
             ],
             "group": "build",
-            "problemMatcher": "$msCompile"
+            "problemMatcher": "$msCompile",
+            "detail": "CMake + Ninja via dd.ps1"
+        },
+        {
+            "label": "Test Noterad",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-File",
+                "${workspaceFolder}/dd.ps1",
+                "test"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
         }
     ]
 }

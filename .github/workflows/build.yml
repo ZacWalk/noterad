@@ -14,20 +14,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up MSBuild
-        uses: microsoft/setup-msbuild@v3
-        with:
-          vs-prerelease: true
-          vs-version: '[18.0,19.0)'
-          msbuild-architecture: x64
-
-      - name: Build solution
-        run: msbuild noterad.sln /p:Configuration=Debug /p:Platform=x64 /m
-
-      - name: Run unit tests
+      # dd.ps1 locates Visual Studio, enters the MSVC environment and falls back
+      # to the CMake and Ninja that ship with it, so there is nothing to install.
+      - name: Build and test
         shell: pwsh
-        run: |
-          & .\exe\noterad-64d.exe /test
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
+        run: .\dd.ps1 test -Config Debug

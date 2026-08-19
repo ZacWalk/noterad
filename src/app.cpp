@@ -1874,6 +1874,8 @@ namespace
 app_init_result app_init(const pf::window_frame_ptr& main_frame,
                          const std::span<const std::string_view> params)
 {
+	pf::config_set_app_name("rethinkify");
+
 	std::string_view file_to_open;
 
 	if (const auto cli = run_cli_mode(params, file_to_open); cli.handled)
